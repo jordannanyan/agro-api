@@ -11,7 +11,7 @@ SET @PW := '$2y$12$e0MYzXyjpJS7Pd0RVvHwHe1DYQyDzYqZ0zK7Yy8mQF3q8m9pC1yfa'; -- "p
 -- Entities (2 PT)
 INSERT INTO `entities` (id, entities_name, location, username, password, is_superadmin, created_at, updated_at) VALUES
 (1, 'PT Sumatra Nature Based Solutions (SNBS)', 'Bengkulu', 'snbs',  @PW, 1, NOW(), NOW()),
-(2, 'PT Jhonlin Nature Based Solutions (JNBS)', 'Lampung',  'jnbs',  @PW, 0, NOW(), NOW());
+(2, 'PT Java Nature Based Solutions (JNBS)', 'Java',  'jnbs',  @PW, 0, NOW(), NOW());
 
 -- Roles (5 staff roles)
 INSERT INTO `roles` (id, role_name, is_cross_entity, created_at, updated_at) VALUES
