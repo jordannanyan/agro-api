@@ -432,8 +432,9 @@ CREATE TABLE `payment_requests` (
   CONSTRAINT `fk_payreq_pr`     FOREIGN KEY (`purchase_request_id`) REFERENCES `purchase_requests`(`id`) ON DELETE SET NULL,
   CONSTRAINT `fk_payreq_po`     FOREIGN KEY (`purchase_order_id`)   REFERENCES `purchase_orders`(`id`) ON DELETE SET NULL,
   CONSTRAINT `fk_payreq_entity` FOREIGN KEY (`entity_id`)           REFERENCES `entities`(`id`),
-  CONSTRAINT `fk_payreq_budget` FOREIGN KEY (`budget_code_id`)      REFERENCES `budget_codes`(`id`) ON DELETE SET NULL,
-  CONSTRAINT `chk_payreq_source` CHECK (`purchase_request_id` IS NOT NULL OR `purchase_order_id` IS NOT NULL)
+  CONSTRAINT `fk_payreq_budget` FOREIGN KEY (`budget_code_id`)      REFERENCES `budget_codes`(`id`) ON DELETE SET NULL
+  -- NOTE: "PR or PO required" is enforced in the API (routes/paymentRequests.ts).
+  -- A CHECK constraint was intentionally omitted for MySQL/MariaDB portability.
 ) ENGINE=InnoDB;
 
 -- -----------------------------------------------------------------------------
