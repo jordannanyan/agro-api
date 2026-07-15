@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.env
+storage/proofs/*
+storage/farmers_photos/*
+storage/trees/*
+storage/tree_monitorings/*
+!storage/**/.gitkeep
+*.log
