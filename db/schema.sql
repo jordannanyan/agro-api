@@ -140,13 +140,16 @@ CREATE TABLE `offtaker` (
 -- CLUSTER: Traceability Core (KTH / Farmers / Plots / Collectors)
 -- -----------------------------------------------------------------------------
 CREATE TABLE `kth` (
-  `id`          INT AUTO_INCREMENT PRIMARY KEY,
-  `kth_name`    VARCHAR(150) NOT NULL,
-  `entities_id` INT NOT NULL,
-  `username`    VARCHAR(100) NULL UNIQUE,
-  `password`    VARCHAR(255) NULL,
-  `created_at`  DATETIME NULL,
-  `updated_at`  DATETIME NULL,
+  `id`                 INT AUTO_INCREMENT PRIMARY KEY,
+  `kth_name`           VARCHAR(255) NULL,
+  `address`            VARCHAR(255) NULL,
+  `regency`            VARCHAR(255) NULL,
+  `partnership_period` VARCHAR(255) NULL,
+  `entities_id`        INT NULL,
+  `username`           VARCHAR(150) NULL UNIQUE,
+  `password`           VARCHAR(255) NULL,
+  `created_at`         DATETIME NULL,
+  `updated_at`         DATETIME NULL,
   CONSTRAINT `fk_kth_entity` FOREIGN KEY (`entities_id`) REFERENCES `entities`(`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB;
 
@@ -160,25 +163,37 @@ CREATE TABLE `warehouse` (
 ) ENGINE=InnoDB;
 
 CREATE TABLE `farmers` (
-  `id`          INT AUTO_INCREMENT PRIMARY KEY,
-  `farmer_name` VARCHAR(150) NOT NULL,
-  `nik`         VARCHAR(32) NULL UNIQUE,
-  `kth_id`      INT NOT NULL,
-  `password`    VARCHAR(255) NULL,
-  `photo`       VARCHAR(255) NULL,
-  `created_at`  DATETIME NULL,
-  `updated_at`  DATETIME NULL,
+  `id`                 INT AUTO_INCREMENT PRIMARY KEY,
+  `farmer_name`        VARCHAR(255) NULL,
+  `number_of_children` INT NULL,
+  `date_of_birth`      DATE NULL,
+  `previous_income`    DOUBLE NULL,
+  `address`            VARCHAR(255) NULL,
+  `kth_id`             INT NULL,
+  `password`           VARCHAR(255) NULL,
+  `no_hp`              VARCHAR(20) NULL,
+  `nik`                VARCHAR(20) NULL,
+  `no_rek`             VARCHAR(50) NULL,
+  `foto`               VARCHAR(255) NULL,
+  `pre_finance`        TINYINT(1) NULL,
+  `created_at`         DATETIME NULL,
+  `updated_at`         DATETIME NULL,
   CONSTRAINT `fk_farmers_kth` FOREIGN KEY (`kth_id`) REFERENCES `kth`(`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB;
 
 -- Kategori/scheme melekat di plot (satu plot = satu skema).
 CREATE TABLE `plot` (
-  `id`         INT AUTO_INCREMENT PRIMARY KEY,
-  `plot_name`  VARCHAR(150) NOT NULL,
-  `farmer_id`  INT NOT NULL,
-  `scheme`     ENUM('BeliPutus','PreFinance','ProfitSharing') NOT NULL DEFAULT 'BeliPutus',
-  `created_at` DATETIME NULL,
-  `updated_at` DATETIME NULL,
+  `id`               INT AUTO_INCREMENT PRIMARY KEY,
+  `plot_name`        VARCHAR(255) NULL,
+  `land_area`        DECIMAL(10,2) NULL,
+  `number_of_plants` INT NULL,
+  `exp_cin_plants`   INT NULL,
+  `latitude`         DECIMAL(10,6) NULL,
+  `longitude`        DECIMAL(10,6) NULL,
+  `farmer_id`        INT NULL,
+  `scheme`           ENUM('BeliPutus','PreFinance','ProfitSharing') NOT NULL DEFAULT 'BeliPutus',
+  `created_at`       DATETIME NULL,
+  `updated_at`       DATETIME NULL,
   CONSTRAINT `fk_plot_farmer` FOREIGN KEY (`farmer_id`) REFERENCES `farmers`(`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB;
 
@@ -278,41 +293,51 @@ CREATE TABLE `selling` (
 CREATE TABLE `trees` (
   `id`           INT AUTO_INCREMENT PRIMARY KEY,
   `plot_id`      INT NOT NULL,
-  `tree_code`    VARCHAR(80) NULL,
-  `commodities_id` INT NULL,
-  `latitude`     DECIMAL(10,7) NULL,
-  `longitude`    DECIMAL(10,7) NULL,
-  `planted_date` DATE NULL,
-  `photo`        VARCHAR(255) NULL,
+  `farmer_id`    INT NULL,
+  `tree_name`    VARCHAR(255) NULL,
+  `species`      VARCHAR(255) NULL,
+  `planting_date` DATE NULL,
+  `qr_code`      VARCHAR(255) NULL,
+  `photo_path`   VARCHAR(255) NULL,
+  `latitude`     DECIMAL(10,6) NULL,
+  `longitude`    DECIMAL(10,6) NULL,
+  `accuracy_m`   DECIMAL(10,2) NULL,
   `created_at`   DATETIME NULL,
   `updated_at`   DATETIME NULL,
-  CONSTRAINT `fk_trees_plot`      FOREIGN KEY (`plot_id`)        REFERENCES `plot`(`id`) ON DELETE CASCADE,
-  CONSTRAINT `fk_trees_commodity` FOREIGN KEY (`commodities_id`) REFERENCES `commodities`(`id`) ON DELETE SET NULL
+  CONSTRAINT `fk_trees_plot`   FOREIGN KEY (`plot_id`)   REFERENCES `plot`(`id`) ON DELETE CASCADE,
+  CONSTRAINT `fk_trees_farmer` FOREIGN KEY (`farmer_id`) REFERENCES `farmers`(`id`) ON DELETE SET NULL
 ) ENGINE=InnoDB;
 
 CREATE TABLE `tree_monitoring` (
-  `id`         INT AUTO_INCREMENT PRIMARY KEY,
-  `tree_id`    INT NOT NULL,
-  `monitor_date` DATE NOT NULL,
-  `height_cm`  DECIMAL(10,2) NULL,
-  `diameter_cm` DECIMAL(10,2) NULL,
-  `health_status` VARCHAR(60) NULL,
-  `note`       TEXT NULL,
-  `photo`      VARCHAR(255) NULL,
-  `created_at` DATETIME NULL,
-  `updated_at` DATETIME NULL,
-  CONSTRAINT `fk_treemon_tree` FOREIGN KEY (`tree_id`) REFERENCES `trees`(`id`) ON DELETE CASCADE
+  `id`               INT AUTO_INCREMENT PRIMARY KEY,
+  `tree_id`          INT NOT NULL,
+  `measured_at`      DATETIME NOT NULL,
+  `circumference_cm` DECIMAL(10,2) NULL,
+  `health_status`    ENUM('Sehat','Tidak Sehat','Mati') NOT NULL DEFAULT 'Sehat',
+  `health_desc`      TEXT NULL,
+  `photo_path`       VARCHAR(255) NULL,
+  `latitude`         DECIMAL(10,6) NULL,
+  `longitude`        DECIMAL(10,6) NULL,
+  `accuracy_m`       DECIMAL(6,1) NULL,
+  `recorded_by_kth_id` INT NULL,
+  `created_at`       DATETIME NULL,
+  `updated_at`       DATETIME NULL,
+  CONSTRAINT `fk_treemon_tree` FOREIGN KEY (`tree_id`) REFERENCES `trees`(`id`) ON DELETE CASCADE,
+  CONSTRAINT `fk_treemon_kth`  FOREIGN KEY (`recorded_by_kth_id`) REFERENCES `kth`(`id`) ON DELETE SET NULL
 ) ENGINE=InnoDB;
 
 CREATE TABLE `plot_polygon_points` (
-  `id`         INT AUTO_INCREMENT PRIMARY KEY,
-  `plot_id`    INT NOT NULL,
-  `seq`        INT NOT NULL DEFAULT 0,
-  `latitude`   DECIMAL(10,7) NOT NULL,
-  `longitude`  DECIMAL(10,7) NOT NULL,
-  `photo`      VARCHAR(255) NULL,
-  `created_at` DATETIME NULL,
-  `updated_at` DATETIME NULL,
+  `id`          INT AUTO_INCREMENT PRIMARY KEY,
+  `plot_id`     INT NOT NULL,
+  `seq`         INT NOT NULL DEFAULT 0,
+  `latitude`    DECIMAL(10,6) NOT NULL,
+  `longitude`   DECIMAL(10,6) NOT NULL,
+  `photo_path`  VARCHAR(512) NULL,
+  `captured_at` DATETIME NULL,
+  `accuracy_m`  DECIMAL(10,2) NULL,
+  `source`      ENUM('mobile','web','import') NOT NULL DEFAULT 'mobile',
+  `created_at`  DATETIME NULL,
+  `updated_at`  DATETIME NULL,
   CONSTRAINT `fk_ppp_plot` FOREIGN KEY (`plot_id`) REFERENCES `plot`(`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB;
 

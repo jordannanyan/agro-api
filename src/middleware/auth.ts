@@ -21,7 +21,7 @@ export async function comparePassword(plain: string, hash: string): Promise<bool
 // JWT auth. Subject kinds: staff `User`, plus `Kth` / `Farmers` for mobile apps.
 // A `jti` row in personal_access_tokens allows server-side revocation (logout).
 // -----------------------------------------------------------------------------
-export type UserKind = 'User' | 'Kth' | 'Farmers';
+export type UserKind = 'User' | 'Entities' | 'Kth' | 'Farmers';
 
 export interface AuthUser {
   id: number;
@@ -52,6 +52,7 @@ const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
 
 const TABLE_BY_KIND: Record<UserKind, string> = {
   User: 'users',
+  Entities: 'entities',
   Kth: 'kth',
   Farmers: 'farmers',
 };

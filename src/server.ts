@@ -22,7 +22,7 @@ import financeRoutes from './routes/finance';
 import dashboardRoutes from './routes/dashboard';
 import profitSharingRoutes from './routes/profitSharing';
 import { distributionsRouter, installmentsRouter, outstandingRouter } from './routes/preFinance';
-import { treesRouter, treeMonitoringRouter, polygonPointsRouter, mapRouter } from './routes/gis';
+import { treesRouter, treeMonSubRouter, treeMonitoringRouter, polygonPointsRouter, mapRouter } from './routes/gis';
 import {
   entitiesRouter, rolesRouter, budgetCodesRouter, unitsRouter, paymentMethodsRouter,
   preFinanceTypesRouter, sapropdiRouter, commoditiesRouter, gradesRouter, offtakersRouter,
@@ -84,6 +84,7 @@ app.use('/api/processing', processingRoutes);
 app.use('/api/selling', sellingRoutes);
 
 // GIS / Map
+app.use('/api/trees/:treeId/monitorings', treeMonSubRouter);
 app.use('/api/trees', treesRouter);
 app.use('/api/tree-monitorings', treeMonitoringRouter);
 app.use('/api/polygon-points', polygonPointsRouter);

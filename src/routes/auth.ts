@@ -30,6 +30,43 @@ router.post('/login', async (req: Request, res: Response) => {
   }
 });
 
+// POST /api/login/entity  — PT/entity login (used by the land+tree app).
+router.post('/login/entity', async (req: Request, res: Response) => {
+  const { username, password } = req.body || {};
+  if (!username || !password) return res.status(422).json({ message: 'username and password required' });
+  try {
+    const [rows] = await pool.query('SELECT * FROM entities WHERE username = ? LIMIT 1', [username]);
+    const list = rows as any[];
+    if (!list.length || !(await comparePassword(password, list[0].password))) {
+      return res.status(401).json({ message: 'Invalid credentials' });
+    }
+    const entity = list[0];
+    delete entity.password;
+    entity.is_superadmin = !!entity.is_superadmin;
+    const token = await issueToken('Entities', entity.id, 'entity-login');
+    return res.json({ message: 'Login successful', token, entity });
+  } catch (err: any) {
+    return res.status(500).json({ message: 'Server error', error: err.message });
+  }
+});
+
+// POST /api/check-token — verify a JWT without consuming it.
+router.post('/check-token', async (req: Request, res: Response) => {
+  const header = req.headers.authorization || '';
+  const fromHeader = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+  const token = (req.body?.token || fromHeader || '').toString().trim();
+  if (!token) return res.status(401).json({ valid: false, message: 'Token not provided.' });
+  try {
+    const jwt = require('jsonwebtoken');
+    const payload = jwt.verify(token, process.env.JWT_SECRET || 'dev-secret') as any;
+    const [tok] = await pool.query('SELECT id FROM personal_access_tokens WHERE jti = ? LIMIT 1', [payload.jti]);
+    if (!(tok as any[]).length) return res.status(401).json({ valid: false, message: 'Token revoked.' });
+    return res.json({ valid: true, tokenable_type: payload.type, tokenable_id: payload.sub });
+  } catch {
+    return res.status(401).json({ valid: false, message: 'Invalid or expired token.' });
+  }
+});
+
 // POST /api/login/kth
 router.post('/login/kth', async (req: Request, res: Response) => {
   const { username, password } = req.body || {};

@@ -50,10 +50,19 @@ router.post('/', authenticate, async (req: Request, res: Response) => {
   try {
     const b = req.body || {};
     if (!b.farmer_name || !b.kth_id) return res.status(422).json({ message: 'farmer_name and kth_id are required' });
+    const numN = (v: any) => (v != null && v !== '' ? Number(v) : null);
     const cols: any = {
       farmer_name: b.farmer_name,
       nik: b.nik ?? null,
       kth_id: Number(b.kth_id),
+      no_hp: b.no_hp ?? null,
+      address: b.address ?? null,
+      date_of_birth: b.date_of_birth || null,
+      number_of_children: numN(b.number_of_children),
+      previous_income: numN(b.previous_income),
+      no_rek: b.no_rek ?? null,
+      foto: b.foto ?? null,
+      pre_finance: b.pre_finance != null ? (b.pre_finance ? 1 : 0) : null,
       password: b.password ? await hashPassword(String(b.password)) : null,
       created_at: new Date(),
       updated_at: new Date(),
@@ -82,6 +91,14 @@ const update = async (req: Request, res: Response) => {
     set('farmer_name', b.farmer_name);
     set('nik', b.nik);
     set('kth_id', b.kth_id != null ? Number(b.kth_id) : undefined);
+    set('no_hp', b.no_hp);
+    set('address', b.address);
+    set('date_of_birth', b.date_of_birth);
+    set('number_of_children', b.number_of_children != null ? Number(b.number_of_children) : undefined);
+    set('previous_income', b.previous_income != null ? Number(b.previous_income) : undefined);
+    set('no_rek', b.no_rek);
+    set('foto', b.foto);
+    if (b.pre_finance !== undefined) updates.pre_finance = b.pre_finance ? 1 : 0;
     if (b.password) updates.password = await hashPassword(String(b.password));
     const keys = Object.keys(updates);
     if (keys.length) {

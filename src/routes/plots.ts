@@ -41,7 +41,10 @@ router.get('/:id', authenticate, async (req: Request, res: Response) => {
   const [rows] = await pool.query(SELECT + ' WHERE p.id = ? LIMIT 1', [req.params.id]);
   const list = rows as any[];
   if (!list.length) return res.status(404).json({ message: 'Plot not found' });
-  return res.json({ data: shape(list[0]) });
+  const data = shape(list[0]);
+  const [pts] = await pool.query('SELECT * FROM plot_polygon_points WHERE plot_id = ? ORDER BY seq', [req.params.id]);
+  data.polygon_points = pts;
+  return res.json({ data });
 });
 
 function validScheme(s: any) { return s === undefined || SCHEMES.includes(s); }
@@ -52,10 +55,16 @@ router.post('/', authenticate, async (req: Request, res: Response) => {
     const b = req.body || {};
     if (!b.plot_name || !b.farmer_id) return res.status(422).json({ message: 'plot_name and farmer_id are required' });
     if (!validScheme(b.scheme)) return res.status(422).json({ message: `Invalid scheme. Allowed: ${SCHEMES.join(', ')}` });
+    const num = (v: any) => (v != null && v !== '' ? Number(v) : null);
     const cols: any = {
       plot_name: b.plot_name,
       farmer_id: Number(b.farmer_id),
       scheme: b.scheme || 'BeliPutus',
+      land_area: num(b.land_area),
+      number_of_plants: num(b.number_of_plants),
+      exp_cin_plants: num(b.exp_cin_plants),
+      latitude: num(b.latitude),
+      longitude: num(b.longitude),
       created_at: new Date(),
       updated_at: new Date(),
     };
@@ -84,6 +93,11 @@ const update = async (req: Request, res: Response) => {
     set('plot_name', b.plot_name);
     set('farmer_id', b.farmer_id != null ? Number(b.farmer_id) : undefined);
     set('scheme', b.scheme);
+    set('land_area', b.land_area != null ? Number(b.land_area) : undefined);
+    set('number_of_plants', b.number_of_plants != null ? Number(b.number_of_plants) : undefined);
+    set('exp_cin_plants', b.exp_cin_plants != null ? Number(b.exp_cin_plants) : undefined);
+    set('latitude', b.latitude != null ? Number(b.latitude) : undefined);
+    set('longitude', b.longitude != null ? Number(b.longitude) : undefined);
     const keys = Object.keys(updates);
     if (keys.length) {
       updates.updated_at = new Date(); keys.push('updated_at');
