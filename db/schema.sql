@@ -190,6 +190,7 @@ CREATE TABLE `plot` (
   `exp_cin_plants`   INT NULL,
   `latitude`         DECIMAL(10,6) NULL,
   `longitude`        DECIMAL(10,6) NULL,
+  `polygon`          GEOMETRY NULL,
   `farmer_id`        INT NULL,
   `scheme`           ENUM('BeliPutus','PreFinance','ProfitSharing') NOT NULL DEFAULT 'BeliPutus',
   `created_at`       DATETIME NULL,

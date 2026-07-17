@@ -100,10 +100,11 @@ export const offtakersRouter = crudRouter({
 
 export const kthRouter = crudRouter({
   table: 'kth',
-  columns: ['kth_name', 'entities_id', 'username', 'password'],
-  required: ['kth_name', 'entities_id'],
+  columns: ['kth_name', 'address', 'regency', 'partnership_period', 'entities_id', 'username', 'password'],
+  required: ['kth_name'],
   numeric: ['entities_id'],
   filterColumns: ['entities_id'],
+  scopeEntityColumn: 'entities_id',
   hashColumns: ['password'],
   hideColumns: ['password'],
   searchColumns: ['kth_name', 'username'],

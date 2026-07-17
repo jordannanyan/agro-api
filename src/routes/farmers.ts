@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import pool from '../db/connection';
 import { authenticate, hashPassword } from '../middleware/auth';
+import { entityScope } from '../utils/entityScope';
 
 export const router = Router();
 
@@ -27,8 +28,9 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
   const where: string[] = [];
   const args: any[] = [];
   if (req.query.kth_id)    { where.push('f.kth_id = ?'); args.push(req.query.kth_id); }
-  if (req.query.entity_id) { where.push('k.entities_id = ?'); args.push(req.query.entity_id); }
   if (req.query.search)    { where.push('(f.farmer_name LIKE ? OR f.nik LIKE ?)'); args.push(`%${req.query.search}%`, `%${req.query.search}%`); }
+  const scope = entityScope(req);
+  if (scope != null) { where.push('k.entities_id = ?'); args.push(scope); }
   const sql = SELECT + (where.length ? ` WHERE ${where.join(' AND ')}` : '') + ' ORDER BY f.farmer_name ASC';
   const [rows] = await pool.query(sql, args);
   return res.json({ data: (rows as any[]).map(shape) });

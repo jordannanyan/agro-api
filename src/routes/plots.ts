@@ -1,15 +1,21 @@
 import { Router, Request, Response } from 'express';
 import pool from '../db/connection';
 import { authenticate } from '../middleware/auth';
+import { entityScope } from '../utils/entityScope';
 
 export const router = Router();
 
 const SCHEMES = ['BeliPutus', 'PreFinance', 'ProfitSharing'] as const;
 
+// Explicit columns (avoid selecting the raw geometry blob); expose polygon as WKT.
 const SELECT = `
-  SELECT p.*, f.farmer_name AS farmer__farmer_name, f.kth_id AS farmer__kth_id
+  SELECT p.id, p.plot_name, p.land_area, p.number_of_plants, p.exp_cin_plants,
+         p.latitude, p.longitude, p.farmer_id, p.scheme, p.created_at, p.updated_at,
+         ST_AsText(p.polygon) AS polygon_wkt,
+         f.farmer_name AS farmer__farmer_name, f.kth_id AS farmer__kth_id
   FROM plot p
   LEFT JOIN farmers f ON f.id = p.farmer_id
+  LEFT JOIN kth k     ON k.id = f.kth_id
 `;
 
 function shape(row: any) {
@@ -31,6 +37,8 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
   if (req.query.scheme)    { where.push('p.scheme = ?'); args.push(req.query.scheme); }
   if (req.query.kth_id)    { where.push('f.kth_id = ?'); args.push(req.query.kth_id); }
   if (req.query.search)    { where.push('p.plot_name LIKE ?'); args.push(`%${req.query.search}%`); }
+  const scope = entityScope(req);
+  if (scope != null) { where.push('k.entities_id = ?'); args.push(scope); }
   const sql = SELECT + (where.length ? ` WHERE ${where.join(' AND ')}` : '') + ' ORDER BY p.plot_name ASC';
   const [rows] = await pool.query(sql, args);
   return res.json({ data: (rows as any[]).map(shape) });

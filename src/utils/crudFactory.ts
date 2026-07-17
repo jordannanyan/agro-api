@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import pool from '../db/connection';
 import { authenticate, hashPassword } from '../middleware/auth';
+import { entityScope } from './entityScope';
 
 export interface CrudConfig {
   table: string;
@@ -24,6 +25,8 @@ export interface CrudConfig {
   hashColumns?: string[];
   /** Columns to strip from every response row (e.g. password). */
   hideColumns?: string[];
+  /** If set, list is auto-filtered by entity scope on this column (e.g. entities_id). */
+  scopeEntityColumn?: string;
   /** Human label for messages. Default = table. */
   label?: string;
 }
@@ -70,6 +73,10 @@ export function crudRouter(cfg: CrudConfig): Router {
         const ors = cfg.searchColumns.map((c) => `\`${c}\` LIKE ?`);
         where.push(`(${ors.join(' OR ')})`);
         cfg.searchColumns.forEach(() => args.push(`%${search}%`));
+      }
+      if (cfg.scopeEntityColumn) {
+        const scope = entityScope(req);
+        if (scope != null) { where.push(`\`${cfg.scopeEntityColumn}\` = ?`); args.push(scope); }
       }
 
       const sql =

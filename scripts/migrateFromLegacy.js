@@ -21,7 +21,7 @@ const TABLES = [
   { name: 'entities', cols: ['id', 'entities_name', 'location', 'username', 'is_superadmin', 'password', 'created_at', 'updated_at'] },
   { name: 'kth', cols: ['id', 'kth_name', 'address', 'regency', 'partnership_period', 'entities_id', 'username', 'password', 'created_at', 'updated_at'] },
   { name: 'farmers', cols: ['id', 'farmer_name', 'number_of_children', 'date_of_birth', 'previous_income', 'address', 'kth_id', 'password', 'no_hp', 'nik', 'no_rek', 'foto', 'pre_finance', 'created_at', 'updated_at'] },
-  { name: 'plot', cols: ['id', 'plot_name', 'land_area', 'number_of_plants', 'exp_cin_plants', 'latitude', 'longitude', 'farmer_id', 'created_at', 'updated_at'] },
+  { name: 'plot', cols: ['id', 'plot_name', 'land_area', 'number_of_plants', 'exp_cin_plants', 'latitude', 'longitude', 'polygon', 'farmer_id', 'created_at', 'updated_at'] },
   { name: 'plot_polygon_points', cols: ['id', 'plot_id', 'seq', 'latitude', 'longitude', 'photo_path', 'captured_at', 'accuracy_m', 'source', 'created_at', 'updated_at'] },
   { name: 'trees', cols: ['id', 'plot_id', 'farmer_id', 'tree_name', 'species', 'planting_date', 'qr_code', 'photo_path', 'latitude', 'longitude', 'accuracy_m', 'created_at', 'updated_at'] },
   { name: 'tree_monitoring', cols: ['id', 'tree_id', 'measured_at', 'circumference_cm', 'health_status', 'health_desc', 'photo_path', 'latitude', 'longitude', 'accuracy_m', 'recorded_by_kth_id', 'created_at', 'updated_at'] },
@@ -62,6 +62,14 @@ async function run() {
     console.log(`✓ ${t.name}: ${r.affectedRows} rows upserted`);
   }
   await conn.query('SET FOREIGN_KEY_CHECKS = 1');
+
+  // Map legacy farmer.pre_finance flag → plot.scheme enum (scheme lives on the plot now).
+  const [r] = await conn.query(
+    `UPDATE \`${TARGET}\`.plot p JOIN \`${TARGET}\`.farmers f ON f.id = p.farmer_id
+     SET p.scheme = 'PreFinance' WHERE f.pre_finance = 1`
+  );
+  console.log(`✓ scheme: ${r.affectedRows} plots set to PreFinance (from farmer.pre_finance)`);
+
   await conn.end();
   console.log('✓ Legacy migration complete.');
 }

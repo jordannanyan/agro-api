@@ -3,6 +3,7 @@ import pool from '../db/connection';
 import { authenticate } from '../middleware/auth';
 import { upload, fileToPath } from '../middleware/upload';
 import { compressImages } from '../services/imageProcessor';
+import { entityScope } from '../utils/entityScope';
 
 // =============================================================================
 // Land & Tree management (used by app-traceability-fairventures).
@@ -19,8 +20,10 @@ export const treesRouter = Router();
 const TREE_SELECT = `
   SELECT t.*, p.plot_name AS plot__plot_name, f.farmer_name AS farmer__farmer_name
   FROM trees t
-  LEFT JOIN plot p    ON p.id = t.plot_id
-  LEFT JOIN farmers f ON f.id = t.farmer_id
+  LEFT JOIN plot p     ON p.id = t.plot_id
+  LEFT JOIN farmers f  ON f.id = t.farmer_id
+  LEFT JOIN farmers pf ON pf.id = p.farmer_id
+  LEFT JOIN kth pk     ON pk.id = pf.kth_id
 `;
 function shapeTree(row: any) {
   const out: any = {}; const plot: any = {}; const farmer: any = {};
@@ -40,6 +43,8 @@ treesRouter.get('/', authenticate, async (req: Request, res: Response) => {
   if (req.query.farmer_id) { where.push('t.farmer_id = ?'); args.push(req.query.farmer_id); }
   if (req.query.search)    { where.push('(t.tree_name LIKE ? OR t.species LIKE ? OR t.qr_code LIKE ?)');
     args.push(`%${req.query.search}%`, `%${req.query.search}%`, `%${req.query.search}%`); }
+  const scope = entityScope(req);
+  if (scope != null) { where.push('pk.entities_id = ?'); args.push(scope); }
   const sql = TREE_SELECT + (where.length ? ` WHERE ${where.join(' AND ')}` : '') + ' ORDER BY t.id DESC';
   const [rows] = await pool.query(sql, args);
   return res.json({ data: (rows as any[]).map(shapeTree) });
@@ -247,8 +252,9 @@ mapRouter.get('/', authenticate, async (req: Request, res: Response) => {
   try {
     const where: string[] = []; const args: any[] = [];
     if (req.query.kth_id)    { where.push('f.kth_id = ?'); args.push(req.query.kth_id); }
-    if (req.query.entity_id) { where.push('k.entities_id = ?'); args.push(req.query.entity_id); }
     if (req.query.scheme)    { where.push('p.scheme = ?'); args.push(req.query.scheme); }
+    const scope = entityScope(req);
+    if (scope != null) { where.push('k.entities_id = ?'); args.push(scope); }
     const [plots] = await pool.query(
       `SELECT p.id, p.plot_name, p.scheme, p.latitude, p.longitude, p.land_area, p.farmer_id,
               f.farmer_name, f.kth_id, k.entities_id
