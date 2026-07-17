@@ -72,6 +72,7 @@ app.use('/api/grades', gradesRouter);
 app.use('/api/offtakers', offtakersRouter);
 app.use('/api/kth', kthRouter);
 app.use('/api/warehouses', warehousesRouter);
+app.use('/api/warehouse', warehousesRouter); // singular alias (Flutter app)
 app.use('/api/collectors', collectorsRouter);
 app.use('/api/vendors', vendorsRouter);
 app.use('/api/approval-routes', approvalRoutesRouter);

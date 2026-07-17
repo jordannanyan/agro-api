@@ -44,6 +44,23 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
   return res.json({ data: (rows as any[]).map(shape) });
 });
 
+// Compatibility (Flutter app path-style filters).
+// GET /api/plots/farmer/:farmer_id
+router.get('/farmer/:farmer_id', authenticate, async (req: Request, res: Response) => {
+  const [rows] = await pool.query(SELECT + ' WHERE p.farmer_id = ? ORDER BY p.plot_name', [req.params.farmer_id]);
+  return res.json({ data: (rows as any[]).map(shape) });
+});
+// GET /api/plots/kth/:kth_id
+router.get('/kth/:kth_id', authenticate, async (req: Request, res: Response) => {
+  const [rows] = await pool.query(SELECT + ' WHERE f.kth_id = ? ORDER BY p.plot_name', [req.params.kth_id]);
+  return res.json({ data: (rows as any[]).map(shape) });
+});
+// GET /api/plots/:id/polygon-points
+router.get('/:id/polygon-points', authenticate, async (req: Request, res: Response) => {
+  const [rows] = await pool.query('SELECT * FROM plot_polygon_points WHERE plot_id = ? ORDER BY seq', [req.params.id]);
+  return res.json({ data: rows });
+});
+
 // GET /api/plots/:id
 router.get('/:id', authenticate, async (req: Request, res: Response) => {
   const [rows] = await pool.query(SELECT + ' WHERE p.id = ? LIMIT 1', [req.params.id]);

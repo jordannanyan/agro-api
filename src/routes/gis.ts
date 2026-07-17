@@ -153,6 +153,10 @@ async function insertMonitoring(treeId: number, b: any, f: any) {
 
 // Sub-router: /api/trees/:treeId/monitorings
 export const treeMonSubRouter = Router({ mergeParams: true });
+treeMonSubRouter.get('/latest', authenticate, async (req: Request, res: Response) => {
+  const [rows] = await pool.query('SELECT * FROM tree_monitoring WHERE tree_id = ? ORDER BY measured_at DESC, id DESC LIMIT 1', [req.params.treeId]);
+  return res.json({ data: (rows as any[])[0] ?? null });
+});
 treeMonSubRouter.get('/', authenticate, async (req: Request, res: Response) => {
   const [rows] = await pool.query('SELECT * FROM tree_monitoring WHERE tree_id = ? ORDER BY measured_at DESC, id DESC', [req.params.treeId]);
   return res.json({ data: rows });
@@ -187,6 +191,35 @@ treeMonitoringRouter.post('/', authenticate, monUpload, async (req: Request, res
     const row = await insertMonitoring(Number(req.body.tree_id), req.body, f);
     return res.status(201).json({ message: 'Monitoring recorded', data: row });
   } catch (e: any) { return res.status(500).json({ message: 'Server error', error: e.message }); }
+});
+const updateMonitoring = async (req: Request, res: Response) => {
+  try {
+    const id = req.params.id;
+    const [ex] = await pool.query('SELECT id FROM tree_monitoring WHERE id = ? LIMIT 1', [id]);
+    if (!(ex as any[]).length) return res.status(404).json({ message: 'Monitoring not found' });
+    const f = req.files as any;
+    await compressImages([f?.photo?.[0]?.path, f?.photo_path?.[0]?.path]);
+    const cols = monCols(req.body || {}, f);
+    const b = req.body || {};
+    const updates: any = {};
+    for (const k of Object.keys(cols)) {
+      if (k === 'tree_id') continue;
+      if (k === 'photo_path') { if (cols.photo_path) updates.photo_path = cols.photo_path; continue; }
+      if (b[k] !== undefined) updates[k] = (cols as any)[k];
+    }
+    const keys = Object.keys(updates);
+    if (keys.length) {
+      updates.updated_at = new Date(); keys.push('updated_at');
+      await pool.query(`UPDATE tree_monitoring SET ${keys.map((k) => `\`${k}\` = ?`).join(', ')} WHERE id = ?`, [...keys.map((k) => updates[k]), id]);
+    }
+    const [rows] = await pool.query('SELECT * FROM tree_monitoring WHERE id = ? LIMIT 1', [id]);
+    return res.json({ message: 'Monitoring updated', data: (rows as any[])[0] });
+  } catch (e: any) { return res.status(500).json({ message: 'Server error', error: e.message }); }
+};
+treeMonitoringRouter.put('/:id', authenticate, monUpload, updateMonitoring);
+treeMonitoringRouter.post('/:id', authenticate, monUpload, (req, res) => {
+  if (String(req.body?._method || req.query?._method || '').toUpperCase() === 'PUT') return updateMonitoring(req, res);
+  return res.status(404).json({ message: `Not found: POST ${req.originalUrl}` });
 });
 treeMonitoringRouter.delete('/:id', authenticate, async (req, res) => {
   const [r] = await pool.query('DELETE FROM tree_monitoring WHERE id = ?', [req.params.id]);

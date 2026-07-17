@@ -1,4 +1,6 @@
 import { crudRouter } from '../utils/crudFactory';
+import pool from '../db/connection';
+import { authenticate } from '../middleware/auth';
 
 // Simple master-data tables, all standard CRUD behind JWT auth.
 
@@ -120,6 +122,12 @@ export const warehousesRouter = crudRouter({
   searchColumns: ['warehouse_name'],
   orderBy: 'warehouse_name ASC',
   label: 'Warehouse',
+});
+
+// Compatibility (Flutter app): GET /warehouse[s]/kth/:kth_id
+warehousesRouter.get('/kth/:kth_id', authenticate, async (req, res) => {
+  const [rows] = await pool.query('SELECT * FROM warehouse WHERE kth_id = ? ORDER BY warehouse_name', [req.params.kth_id]);
+  return res.json({ data: rows });
 });
 
 export const collectorsRouter = crudRouter({
