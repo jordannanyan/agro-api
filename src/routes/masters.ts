@@ -64,7 +64,7 @@ export const preFinanceTypesRouter = crudRouter({
 
 export const sapropdiRouter = crudRouter({
   table: 'sapropdi',
-  columns: ['sapropdi_name', 'unit_id'],
+  columns: ['sapropdi_name', 'unit_id', 'unit'],
   required: ['sapropdi_name'],
   numeric: ['unit_id'],
   searchColumns: ['sapropdi_name'],
@@ -91,7 +91,7 @@ export const gradesRouter = crudRouter({
 
 export const offtakersRouter = crudRouter({
   table: 'offtaker',
-  columns: ['offtaker_name', 'entities_id'],
+  columns: ['offtaker_name', 'location', 'entities_id'],
   required: ['offtaker_name'],
   numeric: ['entities_id'],
   filterColumns: ['entities_id'],
@@ -115,7 +115,7 @@ export const kthRouter = crudRouter({
 
 export const warehousesRouter = crudRouter({
   table: 'warehouse',
-  columns: ['warehouse_name', 'kth_id'],
+  columns: ['warehouse_name', 'address', 'kth_id'],
   required: ['warehouse_name'],
   numeric: ['kth_id'],
   filterColumns: ['kth_id'],

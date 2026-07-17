@@ -108,6 +108,7 @@ CREATE TABLE `sapropdi` (
   `id`            INT AUTO_INCREMENT PRIMARY KEY,
   `sapropdi_name` VARCHAR(150) NOT NULL,
   `unit_id`       INT NULL,
+  `unit`          VARCHAR(60) NULL,
   `created_at`    DATETIME NULL,
   `updated_at`    DATETIME NULL,
   CONSTRAINT `fk_sapropdi_unit` FOREIGN KEY (`unit_id`) REFERENCES `units`(`id`) ON DELETE SET NULL
@@ -130,6 +131,7 @@ CREATE TABLE `grade` (
 CREATE TABLE `offtaker` (
   `id`            INT AUTO_INCREMENT PRIMARY KEY,
   `offtaker_name` VARCHAR(150) NOT NULL,
+  `location`      VARCHAR(255) NULL,
   `entities_id`   INT NULL,
   `created_at`    DATETIME NULL,
   `updated_at`    DATETIME NULL,
@@ -156,6 +158,7 @@ CREATE TABLE `kth` (
 CREATE TABLE `warehouse` (
   `id`             INT AUTO_INCREMENT PRIMARY KEY,
   `warehouse_name` VARCHAR(150) NOT NULL,
+  `address`        VARCHAR(255) NULL,
   `kth_id`         INT NULL,
   `created_at`     DATETIME NULL,
   `updated_at`     DATETIME NULL,
