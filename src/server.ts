@@ -45,10 +45,12 @@ app.use((req, _res, next) => {
   next();
 });
 
-// Static uploads
+// Static uploads. Serve the whole storage root at /storage so both new uploads
+// (/storage/proofs/*) and migrated legacy media (/storage/trees, /storage/farmers_photos,
+// /storage/tree_monitorings, /storage/plot_polygon_points, ...) resolve.
 const uploadPath = process.env.UPLOAD_PATH || './storage/proofs';
-const publicBase = process.env.PUBLIC_UPLOAD_BASE || '/storage/proofs';
-app.use(publicBase, express.static(path.resolve(uploadPath)));
+const storageRoot = path.resolve(uploadPath, '..'); // → ./storage
+app.use('/storage', express.static(storageRoot));
 
 // Health
 app.get('/health', (_req, res) => res.json({ status: 'ok', service: 'agro-supply-api', ts: new Date().toISOString() }));
