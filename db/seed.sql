@@ -13,21 +13,31 @@ INSERT INTO `entities` (id, entities_name, location, username, password, is_supe
 (1, 'PT Sumatra Nature Based Solutions (SNBS)', 'Bengkulu', 'snbs',  @PW, 1, NOW(), NOW()),
 (2, 'PT Java Nature Based Solutions (JNBS)', 'Java',  'jnbs',  @PW, 0, NOW(), NOW());
 
--- Roles (5 staff roles)
+-- Roles (5 staff roles + Admin full-access)
 INSERT INTO `roles` (id, role_name, is_cross_entity, created_at, updated_at) VALUES
 (1, 'Intern',   0, NOW(), NOW()),
 (2, 'PM',       0, NOW(), NOW()),
 (3, 'Head',     0, NOW(), NOW()),
 (4, 'Finance',  1, NOW(), NOW()),
-(5, 'Director', 1, NOW(), NOW());
+(5, 'Director', 1, NOW(), NOW()),
+(6, 'Admin',    1, NOW(), NOW());
 
--- Users (staff login)
+-- Users (staff login) — full matrix: SNBS (entity 1) & JNBS (entity 2) × all 5 roles.
 INSERT INTO `users` (id, entity_id, role_id, name, username, email, password, position, is_active, created_at, updated_at) VALUES
-(1, 1, 4, 'Ahmad Fauzi',     'finance01',  'finance01@agro.id',  @PW, 'Finance Officer', 1, NOW(), NOW()),
-(2, 1, 1, 'Dika Pratama',    'intern01',   'intern01@agro.id',   @PW, 'Intern',          1, NOW(), NOW()),
-(3, 2, 2, 'Sari Indah',      'pm01',       'pm01@agro.id',       @PW, 'Project Manager', 1, NOW(), NOW()),
-(4, 2, 3, 'Budi Santoso',    'head01',     'head01@agro.id',     @PW, 'Head of Ops',     1, NOW(), NOW()),
-(5, NULL, 5, 'Direktur Utama','director01', 'director01@agro.id', @PW, 'Director',        1, NOW(), NOW());
+-- SNBS
+(1,  1, 1, 'SNBS Intern',   'snbs_intern',   'snbs_intern@agro.id',   @PW, 'Intern',          1, NOW(), NOW()),
+(2,  1, 2, 'SNBS PM',       'snbs_pm',       'snbs_pm@agro.id',       @PW, 'Project Manager', 1, NOW(), NOW()),
+(3,  1, 3, 'SNBS Head',     'snbs_head',     'snbs_head@agro.id',     @PW, 'Head of Ops',     1, NOW(), NOW()),
+(4,  1, 4, 'SNBS Finance',  'snbs_finance',  'snbs_finance@agro.id',  @PW, 'Finance Officer', 1, NOW(), NOW()),
+(5,  1, 5, 'SNBS Director', 'snbs_director', 'snbs_director@agro.id', @PW, 'Director',        1, NOW(), NOW()),
+-- JNBS
+(6,  2, 1, 'JNBS Intern',   'jnbs_intern',   'jnbs_intern@agro.id',   @PW, 'Intern',          1, NOW(), NOW()),
+(7,  2, 2, 'JNBS PM',       'jnbs_pm',       'jnbs_pm@agro.id',       @PW, 'Project Manager', 1, NOW(), NOW()),
+(8,  2, 3, 'JNBS Head',     'jnbs_head',     'jnbs_head@agro.id',     @PW, 'Head of Ops',     1, NOW(), NOW()),
+(9,  2, 4, 'JNBS Finance',  'jnbs_finance',  'jnbs_finance@agro.id',  @PW, 'Finance Officer', 1, NOW(), NOW()),
+(10, 2, 5, 'JNBS Director', 'jnbs_director', 'jnbs_director@agro.id', @PW, 'Director',        1, NOW(), NOW()),
+-- Administrator (cross-entity, full access incl. user management)
+(11, NULL, 6, 'Administrator', 'admin', 'admin@agro.id', @PW, 'System Administrator', 1, NOW(), NOW());
 
 -- Master lookups
 INSERT INTO `budget_codes` (id, code, name, is_active) VALUES

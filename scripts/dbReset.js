@@ -32,7 +32,7 @@ async function run() {
   console.log('→ Running views.sql ...');
   await conn.query(views);
   await conn.end();
-  console.log('✓ Database reset complete. Login: finance01 / password');
+  console.log('✓ Database reset complete. Login: admin / password (full access), or <entity>_<role> e.g. snbs_finance / password');
 }
 
 run().catch((e) => { console.error('✗ db reset failed:', e.message); process.exit(1); });

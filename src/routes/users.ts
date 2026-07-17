@@ -36,7 +36,7 @@ router.get('/:id', authenticate, async (req: Request, res: Response) => {
 });
 
 // POST /api/users  (Finance/Director manage staff)
-router.post('/', authenticate, requireRole('Finance', 'Director'), async (req: Request, res: Response) => {
+router.post('/', authenticate, requireRole('Finance', 'Director', 'Admin'), async (req: Request, res: Response) => {
   try {
     const b = req.body || {};
     for (const k of ['name', 'username', 'role_id', 'password']) {
@@ -95,14 +95,14 @@ const update = async (req: Request, res: Response) => {
     return res.status(500).json({ message: 'Server error', error: err.message });
   }
 };
-router.put('/:id', authenticate, requireRole('Finance', 'Director'), update);
-router.post('/:id', authenticate, requireRole('Finance', 'Director'), (req, res) => {
+router.put('/:id', authenticate, requireRole('Finance', 'Director', 'Admin'), update);
+router.post('/:id', authenticate, requireRole('Finance', 'Director', 'Admin'), (req, res) => {
   if (String(req.body?._method || req.query?._method || '').toUpperCase() === 'PUT') return update(req, res);
   return res.status(404).json({ message: `Not found: POST ${req.originalUrl}` });
 });
 
 // DELETE /api/users/:id
-router.delete('/:id', authenticate, requireRole('Finance', 'Director'), async (req: Request, res: Response) => {
+router.delete('/:id', authenticate, requireRole('Finance', 'Director', 'Admin'), async (req: Request, res: Response) => {
   const [result] = await pool.query('DELETE FROM users WHERE id = ?', [req.params.id]);
   if (!(result as any).affectedRows) return res.status(404).json({ message: 'User not found' });
   return res.json({ message: 'User deleted' });

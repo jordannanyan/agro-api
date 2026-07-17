@@ -74,7 +74,7 @@ router.get('/:id', authenticate, async (req: Request, res: Response) => {
 });
 
 // POST /api/purchase-orders  body: {..., items:[{pr_item_id,order_qty,unit_price}], extra_costs:[{description,amount}]}
-router.post('/', authenticate, requireRole('PM', 'Head', 'Finance', 'Director'), async (req: Request, res: Response) => {
+router.post('/', authenticate, requireRole('PM', 'Head', 'Finance', 'Director', 'Admin'), async (req: Request, res: Response) => {
   const conn = await pool.getConnection();
   try {
     const b = req.body || {};

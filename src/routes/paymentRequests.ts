@@ -66,7 +66,7 @@ function bodyToCols(b: any) {
 }
 
 // POST /api/payment-requests  (CHECK: PR or PO source required)
-router.post('/', authenticate, requireRole('Head', 'Finance', 'Director'), async (req: Request, res: Response) => {
+router.post('/', authenticate, requireRole('Head', 'Finance', 'Director', 'Admin'), async (req: Request, res: Response) => {
   try {
     const b = req.body || {};
     if (!b.entity_id) return res.status(422).json({ message: 'entity_id is required' });
