@@ -39,6 +39,22 @@ router.post('/:type/:id/approvals/:stepId/action', authenticate, async (req: Req
   const status = map[String(action)];
   if (!status) return res.status(422).json({ message: 'action must be approve | reject | revision' });
   const user = req.user!;
+
+  // RBAC: only a staff user whose role matches the step's role may act (Director may act on any step).
+  if (user.type !== 'User') return res.status(403).json({ message: 'Staff access only.' });
+  const [stepRows] = await pool.query(
+    `SELECT da.role_id, r.role_name FROM document_approvals da
+     LEFT JOIN roles r ON r.id = da.role_id
+     WHERE da.id = ? AND da.document_type = ? AND da.document_id = ? LIMIT 1`,
+    [req.params.stepId, req.params.type, req.params.id]
+  );
+  const step = (stepRows as any[])[0];
+  if (!step) return res.status(404).json({ message: 'Approval step not found.' });
+  const stepRole = step.role_name as string | null;
+  if (user.role !== 'Director' && (!stepRole || user.role !== stepRole)) {
+    return res.status(403).json({ message: `Only ${stepRole || 'the assigned role'} may act on this step.` });
+  }
+
   await pool.query(
     `UPDATE document_approvals
      SET status = ?, user_id = ?, name = ?, position = ?, note = ?, action_date = CURDATE(), updated_at = NOW()

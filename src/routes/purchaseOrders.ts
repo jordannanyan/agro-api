@@ -1,6 +1,6 @@
 import { Router, Request, Response } from 'express';
 import pool from '../db/connection';
-import { authenticate } from '../middleware/auth';
+import { authenticate, requireRole } from '../middleware/auth';
 import { nextDocNumber } from '../utils/docNumber';
 import { seedApprovalSteps } from './documents';
 
@@ -74,7 +74,7 @@ router.get('/:id', authenticate, async (req: Request, res: Response) => {
 });
 
 // POST /api/purchase-orders  body: {..., items:[{pr_item_id,order_qty,unit_price}], extra_costs:[{description,amount}]}
-router.post('/', authenticate, async (req: Request, res: Response) => {
+router.post('/', authenticate, requireRole('PM', 'Head', 'Finance', 'Director'), async (req: Request, res: Response) => {
   const conn = await pool.getConnection();
   try {
     const b = req.body || {};
