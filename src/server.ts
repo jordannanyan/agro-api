@@ -21,6 +21,7 @@ import warehouseStockRoutes from './routes/warehouseStock';
 import financeRoutes from './routes/finance';
 import dashboardRoutes from './routes/dashboard';
 import profitSharingRoutes from './routes/profitSharing';
+import distributedSaprodiRoutes from './routes/distributedSaprodi';
 import { distributionsRouter, installmentsRouter, outstandingRouter } from './routes/preFinance';
 import { treesRouter, treeMonSubRouter, treeMonitoringRouter, polygonPointsRouter, mapRouter } from './routes/gis';
 import {
@@ -107,6 +108,9 @@ app.use('/api/warehouse-stock', warehouseStockRoutes);
 app.use('/api/pre-finance/distributions', distributionsRouter);
 app.use('/api/pre-finance/installments', installmentsRouter);
 app.use('/api/pre-finance/outstanding', outstandingRouter);
+
+// Distributed saprodi (per plot) — read by the mobile app.
+app.use('/api/distributed-sapropdi', distributedSaprodiRoutes);
 
 // Profit sharing / Finance / Dashboard
 app.use('/api/profit-sharing', profitSharingRoutes);
