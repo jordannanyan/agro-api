@@ -64,6 +64,37 @@ async function run() {
     const [r] = await conn.query(sql);
     console.log(`✓ ${t.name}: ${r.affectedRows} rows upserted`);
   }
+
+  // Legacy `distributed_sapropdi` (per-plot saprodi handout) maps onto the unified
+  // pre-finance model: pre_finance_distributions with type=Saprodi. farmer_id is
+  // derived from the plot; legacy ids are preserved (target is empty on a clean
+  // build, so no collision — auto-increment continues past the max legacy id).
+  const [dsExists] = await conn.query(
+    'SELECT COUNT(*) AS n FROM information_schema.tables WHERE table_schema = ? AND table_name = ?',
+    [SOURCE, 'distributed_sapropdi']
+  );
+  if (dsExists[0].n) {
+    const [ds] = await conn.query(
+      `INSERT INTO \`${TARGET}\`.pre_finance_distributions
+         (id, pre_finance_type_id, date, farmer_id, plot_id, commodities_id, sapropdi_id,
+          quantity, price_per_unit, total_amount, upload_proof, created_at, updated_at)
+       SELECT d.id,
+              (SELECT id FROM \`${TARGET}\`.pre_finance_types WHERE type_name = 'Saprodi' LIMIT 1),
+              d.date, p.farmer_id, d.plot_id, d.commodities_id, d.sapropdi_id,
+              d.quantity, d.price_per_unit, d.total_price, d.upload_proof, d.created_at, d.updated_at
+       FROM \`${SOURCE}\`.distributed_sapropdi d
+       JOIN \`${TARGET}\`.plot p ON p.id = d.plot_id
+       ON DUPLICATE KEY UPDATE
+         pre_finance_type_id = VALUES(pre_finance_type_id), date = VALUES(date),
+         farmer_id = VALUES(farmer_id), plot_id = VALUES(plot_id),
+         commodities_id = VALUES(commodities_id), sapropdi_id = VALUES(sapropdi_id),
+         quantity = VALUES(quantity), price_per_unit = VALUES(price_per_unit),
+         total_amount = VALUES(total_amount), upload_proof = VALUES(upload_proof),
+         updated_at = VALUES(updated_at)`
+    );
+    console.log(`✓ distributed_sapropdi → pre_finance_distributions (Saprodi): ${ds.affectedRows} rows`);
+  }
+
   await conn.query('SET FOREIGN_KEY_CHECKS = 1');
 
   // Map legacy farmer.pre_finance flag → plot.scheme enum (scheme lives on the plot now).
