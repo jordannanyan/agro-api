@@ -28,7 +28,6 @@ const TABLES = [
   { name: 'plot_polygon_points', cols: ['id', 'plot_id', 'seq', 'latitude', 'longitude', 'photo_path', 'captured_at', 'accuracy_m', 'source', 'created_at', 'updated_at'] },
   { name: 'trees', cols: ['id', 'plot_id', 'farmer_id', 'tree_name', 'species', 'planting_date', 'qr_code', 'photo_path', 'latitude', 'longitude', 'accuracy_m', 'created_at', 'updated_at'] },
   { name: 'tree_monitoring', cols: ['id', 'tree_id', 'measured_at', 'circumference_cm', 'health_status', 'health_desc', 'photo_path', 'latitude', 'longitude', 'accuracy_m', 'recorded_by_kth_id', 'created_at', 'updated_at'] },
-  { name: 'distributed_sapropdi', cols: ['id', 'date', 'plot_id', 'commodities_id', 'sapropdi_id', 'quantity', 'price_per_unit', 'total_price', 'upload_proof', 'created_at', 'updated_at'] },
 ];
 
 async function run() {

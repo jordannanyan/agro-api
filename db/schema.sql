@@ -345,26 +345,6 @@ CREATE TABLE `plot_polygon_points` (
   CONSTRAINT `fk_ppp_plot` FOREIGN KEY (`plot_id`) REFERENCES `plot`(`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB;
 
--- Saprodi distributed to a plot (pre-finance in-kind input), read per plot by
--- the mobile app. Mirrors the legacy `distributed_sapropdi` table.
-CREATE TABLE `distributed_sapropdi` (
-  `id`             INT AUTO_INCREMENT PRIMARY KEY,
-  `date`           DATE NULL,
-  `plot_id`        INT NULL,
-  `commodities_id` INT NULL,
-  `sapropdi_id`    INT NULL,
-  `quantity`       INT NULL,
-  `price_per_unit` DECIMAL(10,2) NULL,
-  `total_price`    DECIMAL(10,2) NULL,
-  `upload_proof`   VARCHAR(255) NULL,
-  `created_at`     DATETIME NULL,
-  `updated_at`     DATETIME NULL,
-  CONSTRAINT `fk_dsap_plot`      FOREIGN KEY (`plot_id`)        REFERENCES `plot`(`id`)        ON DELETE CASCADE,
-  CONSTRAINT `fk_dsap_commodity` FOREIGN KEY (`commodities_id`) REFERENCES `commodities`(`id`) ON DELETE SET NULL,
-  CONSTRAINT `fk_dsap_sapropdi`  FOREIGN KEY (`sapropdi_id`)    REFERENCES `sapropdi`(`id`)    ON DELETE SET NULL,
-  KEY `idx_dsap_plot` (`plot_id`)
-) ENGINE=InnoDB;
-
 -- -----------------------------------------------------------------------------
 -- CLUSTER: Procurement (PR -> PO? -> PayReq)
 -- -----------------------------------------------------------------------------
