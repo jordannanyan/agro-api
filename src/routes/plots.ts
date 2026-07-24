@@ -93,10 +93,17 @@ router.post('/', authenticate, async (req: Request, res: Response) => {
       created_at: new Date(),
       updated_at: new Date(),
     };
+    // Polygon geometry arrives as a WKT string (e.g. POLYGON((lng lat, ...)))
+    // from the mobile app. Store it via ST_GeomFromText so it reads back through
+    // the SELECT's `ST_AsText(p.polygon) AS polygon_wkt`.
+    const wkt = typeof b.polygon === 'string' && b.polygon.trim() ? b.polygon.trim() : null;
     const keys = Object.keys(cols);
+    const colSql = keys.map((k) => `\`${k}\``).concat(wkt ? ['`polygon`'] : []).join(',');
+    const valSql = keys.map(() => '?').concat(wkt ? ['ST_GeomFromText(?)'] : []).join(',');
+    const vals = keys.map((k) => cols[k]).concat(wkt ? [wkt] : []);
     const [result] = await pool.query(
-      `INSERT INTO plot (${keys.map((k) => `\`${k}\``).join(',')}) VALUES (${keys.map(() => '?').join(',')})`,
-      keys.map((k) => cols[k])
+      `INSERT INTO plot (${colSql}) VALUES (${valSql})`,
+      vals
     );
     const [rows] = await pool.query(SELECT + ' WHERE p.id = ? LIMIT 1', [(result as any).insertId]);
     return res.status(201).json({ message: 'Plot created', data: shape((rows as any[])[0]) });
@@ -124,9 +131,21 @@ const update = async (req: Request, res: Response) => {
     set('latitude', b.latitude != null ? Number(b.latitude) : undefined);
     set('longitude', b.longitude != null ? Number(b.longitude) : undefined);
     const keys = Object.keys(updates);
-    if (keys.length) {
-      updates.updated_at = new Date(); keys.push('updated_at');
-      await pool.query(`UPDATE plot SET ${keys.map((k) => `\`${k}\` = ?`).join(', ')} WHERE id = ?`, [...keys.map((k) => updates[k]), id]);
+    const assignments = keys.map((k) => `\`${k}\` = ?`);
+    const args: any[] = keys.map((k) => updates[k]);
+    // Polygon WKT: absent → leave untouched; empty string → clear; else ST_GeomFromText.
+    if (b.polygon !== undefined) {
+      const wkt = typeof b.polygon === 'string' && b.polygon.trim() ? b.polygon.trim() : null;
+      if (wkt === null) {
+        assignments.push('`polygon` = NULL');
+      } else {
+        assignments.push('`polygon` = ST_GeomFromText(?)');
+        args.push(wkt);
+      }
+    }
+    if (assignments.length) {
+      assignments.push('`updated_at` = ?'); args.push(new Date());
+      await pool.query(`UPDATE plot SET ${assignments.join(', ')} WHERE id = ?`, [...args, id]);
     }
     const [rows] = await pool.query(SELECT + ' WHERE p.id = ? LIMIT 1', [id]);
     return res.json({ message: 'Plot updated', data: shape((rows as any[])[0]) });
