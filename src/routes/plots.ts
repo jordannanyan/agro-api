@@ -1,6 +1,8 @@
 import { Router, Request, Response } from 'express';
 import pool from '../db/connection';
 import { authenticate } from '../middleware/auth';
+import { upload, fileToPath } from '../middleware/upload';
+import { compressImages } from '../services/imageProcessor';
 import { entityScope } from '../utils/entityScope';
 
 export const router = Router();
@@ -59,6 +61,77 @@ router.get('/kth/:kth_id', authenticate, async (req: Request, res: Response) => 
 router.get('/:id/polygon-points', authenticate, async (req: Request, res: Response) => {
   const [rows] = await pool.query('SELECT * FROM plot_polygon_points WHERE plot_id = ? ORDER BY seq', [req.params.id]);
   return res.json({ data: rows });
+});
+
+// PUT /api/plots/:id/polygon-points — replace all points for a plot (used by the
+// Flutter offline outbox). Also keeps `plot.polygon` geometry in sync with the
+// points so the map (which reads ST_AsText(p.polygon)) stays consistent.
+router.put('/:id/polygon-points', authenticate, async (req: Request, res: Response) => {
+  const plotId = Number(req.params.id);
+  const points = Array.isArray(req.body?.points) ? req.body.points : [];
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    await conn.query('DELETE FROM plot_polygon_points WHERE plot_id = ?', [plotId]);
+    let auto = 0;
+    for (const p of points) {
+      await conn.query(
+        `INSERT INTO plot_polygon_points
+           (plot_id, seq, latitude, longitude, captured_at, accuracy_m, source, created_at, updated_at)
+         VALUES (?,?,?,?,?,?,?,NOW(),NOW())`,
+        [
+          plotId,
+          p.seq != null ? Number(p.seq) : ++auto,
+          Number(p.latitude),
+          Number(p.longitude),
+          p.captured_at ? new Date(p.captured_at) : null,
+          p.accuracy_m != null && p.accuracy_m !== '' ? Number(p.accuracy_m) : null,
+          p.source || 'mobile',
+        ]
+      );
+    }
+    // Rebuild plot.polygon from the points (closed ring, x=lng y=lat) when there
+    // are at least 3 vertices; otherwise clear it.
+    if (points.length >= 3) {
+      const ring = points.map((p: any) => `${Number(p.longitude)} ${Number(p.latitude)}`);
+      ring.push(`${Number(points[0].longitude)} ${Number(points[0].latitude)}`);
+      await conn.query('UPDATE plot SET polygon = ST_GeomFromText(?), updated_at = NOW() WHERE id = ?',
+        [`POLYGON((${ring.join(', ')}))`, plotId]);
+    } else {
+      await conn.query('UPDATE plot SET polygon = NULL, updated_at = NOW() WHERE id = ?', [plotId]);
+    }
+    await conn.commit();
+  } catch (e: any) {
+    await conn.rollback();
+    return res.status(500).json({ message: 'Server error', error: e.message });
+  } finally {
+    conn.release();
+  }
+  const [rows] = await pool.query('SELECT * FROM plot_polygon_points WHERE plot_id = ? ORDER BY seq', [plotId]);
+  return res.json({ message: 'Polygon points replaced', data: rows });
+});
+
+// POST /api/plots/:id/polygon-points/:seq/photo — attach a photo to one vertex
+// (multipart field `photo`), matching the Flutter per-point photo upload.
+router.post('/:id/polygon-points/:seq/photo', authenticate, upload.single('photo'), async (req: Request, res: Response) => {
+  try {
+    const plotId = Number(req.params.id);
+    const seq = Number(req.params.seq);
+    const file = req.file as Express.Multer.File | undefined;
+    if (!file) return res.status(422).json({ message: 'photo file is required' });
+    await compressImages([file.path]);
+    const photoPath = fileToPath(file);
+    const [r] = await pool.query(
+      'UPDATE plot_polygon_points SET photo_path = ?, updated_at = NOW() WHERE plot_id = ? AND seq = ?',
+      [photoPath, plotId, seq]
+    );
+    if (!(r as any).affectedRows) {
+      return res.status(404).json({ message: 'Polygon point not found for that plot/seq' });
+    }
+    return res.json({ message: 'Photo uploaded', data: { plot_id: plotId, seq, photo_path: photoPath } });
+  } catch (e: any) {
+    return res.status(500).json({ message: 'Server error', error: e.message });
+  }
 });
 
 // GET /api/plots/:id
