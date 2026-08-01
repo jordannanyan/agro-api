@@ -36,13 +36,21 @@ router.get('/stock-card', authenticate, async (req: Request, res: Response) => {
      FROM stock_in_items sii JOIN stock_in si ON si.id = sii.stock_in_id
      WHERE ${inWhere}`, inArgs);
 
-  // Distributions are not warehouse-scoped in schema; filter by sapropdi only.
+  // Distributions carry their own warehouse, so OUT filters exactly like IN. Before
+  // that column existed this query fell back to sapropdi alone, which meant asking
+  // for one warehouse still returned every warehouse's issues.
+  const outArgs: any[] = [sapropdiId];
+  let outWhere = "d.sapropdi_id = ? AND t.type_name = 'Saprodi'";
+  if (warehouseId) { outWhere += ' AND d.warehouse_id = ?'; outArgs.push(warehouseId); }
+
   const [outs] = await pool.query(
     `SELECT d.date AS date, 'Distribution' AS type, CONCAT('DIST-', d.id) AS ref,
-            0 AS qty_in, d.quantity AS qty_out, NULL AS warehouse_id
+            0 AS qty_in, d.quantity AS qty_out, d.warehouse_id,
+            COALESCE(pl.scheme, 'BeliPutus') AS scheme
      FROM pre_finance_distributions d
      JOIN pre_finance_types t ON t.id = d.pre_finance_type_id
-     WHERE d.sapropdi_id = ? AND t.type_name = 'Saprodi'`, [sapropdiId]);
+     LEFT JOIN plot pl        ON pl.id = d.plot_id
+     WHERE ${outWhere}`, outArgs);
 
   const rows = [...(ins as any[]), ...(outs as any[])]
     .sort((a, b) => String(a.date).localeCompare(String(b.date)));

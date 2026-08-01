@@ -5,17 +5,20 @@ import { nextDocNumber } from '../utils/docNumber';
 import { seedApprovalSteps } from './documents';
 import { ROLE } from '../utils/roles';
 import { resolveWriteEntity } from '../utils/entityScope';
+import { PENDING_STEP_COLUMNS, pendingStepJoin } from '../utils/pendingStep';
 
 export const router = Router();
 
 const SELECT = `
   SELECT po.*, v.vendor_name, e.entities_name AS entity_name, bc.code AS budget_code,
-         pr.pr_number
+         pr.pr_number,
+${PENDING_STEP_COLUMNS}
   FROM purchase_orders po
   LEFT JOIN vendors v          ON v.id = po.vendor_id
   LEFT JOIN entities e         ON e.id = po.entity_id
   LEFT JOIN budget_codes bc    ON bc.id = po.budget_code_id
   LEFT JOIN purchase_requests pr ON pr.id = po.purchase_request_id
+${pendingStepJoin('PO', 'po')}
 `;
 
 async function loadItems(poId: number) {

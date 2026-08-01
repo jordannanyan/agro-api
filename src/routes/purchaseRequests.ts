@@ -4,6 +4,7 @@ import { authenticate } from '../middleware/auth';
 import { nextDocNumber } from '../utils/docNumber';
 import { seedApprovalSteps } from './documents';
 import { resolveWriteEntity } from '../utils/entityScope';
+import { PENDING_STEP_COLUMNS, pendingStepJoin } from '../utils/pendingStep';
 
 export const router = Router();
 
@@ -21,10 +22,12 @@ async function loadItems(prId: number) {
 }
 
 const SELECT = `
-  SELECT pr.*, e.entities_name AS entity_name, u.name AS requested_by_name
+  SELECT pr.*, e.entities_name AS entity_name, u.name AS requested_by_name,
+${PENDING_STEP_COLUMNS}
   FROM purchase_requests pr
   LEFT JOIN entities e ON e.id = pr.entity_id
   LEFT JOIN users u    ON u.id = pr.requested_by_user_id
+${pendingStepJoin('PR', 'pr')}
 `;
 
 // GET /api/purchase-requests?entity_id=&status=&search=

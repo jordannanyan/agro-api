@@ -9,14 +9,20 @@ import { compressImages } from '../services/imageProcessor';
 // -----------------------------------------------------------------------------
 export const distributionsRouter = Router();
 
+// `scheme` is derived from the plot, never stored here — same rule as purchasing.
+// A distribution with no plot cannot be attributed to a scheme, so it reads as
+// BeliPutus, which is the scheme that carries no farmer obligation.
 const DIST_SELECT = `
-  SELECT d.*, t.type_name, f.farmer_name, p.plot_name, s.sapropdi_name, u.unit_name
+  SELECT d.*, t.type_name, f.farmer_name, p.plot_name, s.sapropdi_name, u.unit_name,
+         w.warehouse_name,
+         COALESCE(p.scheme, 'BeliPutus') AS scheme
   FROM pre_finance_distributions d
   LEFT JOIN pre_finance_types t ON t.id = d.pre_finance_type_id
   LEFT JOIN farmers f           ON f.id = d.farmer_id
   LEFT JOIN plot p              ON p.id = d.plot_id
   LEFT JOIN sapropdi s          ON s.id = d.sapropdi_id
   LEFT JOIN units u             ON u.id = d.unit_id
+  LEFT JOIN warehouse w         ON w.id = d.warehouse_id
 `;
 
 const distFiles = upload.fields([
@@ -29,6 +35,9 @@ distributionsRouter.get('/', authenticate, async (req: Request, res: Response) =
   const args: any[] = [];
   if (req.query.farmer_id)           { where.push('d.farmer_id = ?'); args.push(req.query.farmer_id); }
   if (req.query.pre_finance_type_id) { where.push('d.pre_finance_type_id = ?'); args.push(req.query.pre_finance_type_id); }
+  if (req.query.warehouse_id)        { where.push('d.warehouse_id = ?'); args.push(req.query.warehouse_id); }
+  if (req.query.plot_id)             { where.push('d.plot_id = ?'); args.push(req.query.plot_id); }
+  if (req.query.scheme)              { where.push("COALESCE(p.scheme, 'BeliPutus') = ?"); args.push(req.query.scheme); }
   const sql = DIST_SELECT + (where.length ? ` WHERE ${where.join(' AND ')}` : '') + ' ORDER BY d.date DESC, d.id DESC';
   const [rows] = await pool.query(sql, args);
   return res.json({ data: rows });
@@ -48,6 +57,18 @@ distributionsRouter.post('/', authenticate, distFiles, async (req: Request, res:
     if (!b.pre_finance_type_id || !b.farmer_id || !b.date) {
       return res.status(422).json({ message: 'pre_finance_type_id, farmer_id, date are required' });
     }
+
+    // A saprodi distribution is a stock-out event, so it has to say which warehouse
+    // it left. Without that the quantity cannot be subtracted from anything and the
+    // stock report silently reads high — the exact drift this column was added to end.
+    const warehouseId = b.warehouse_id != null && b.warehouse_id !== '' ? Number(b.warehouse_id) : null;
+    const [typeRow] = await pool.query(
+      'SELECT type_name FROM pre_finance_types WHERE id = ? LIMIT 1', [Number(b.pre_finance_type_id)]);
+    const isSaprodi = (typeRow as any[])[0]?.type_name === 'Saprodi';
+    if (isSaprodi && !warehouseId) {
+      return res.status(422).json({ message: 'warehouse_id is required for a Saprodi distribution — it is a stock-out.' });
+    }
+
     await compressImages([f?.upload_proof?.[0]?.path, f?.delivery_proof?.[0]?.path]);
 
     const qty = b.quantity != null && b.quantity !== '' ? Number(b.quantity) : null;
@@ -64,6 +85,7 @@ distributionsRouter.post('/', authenticate, distFiles, async (req: Request, res:
       plot_id: b.plot_id != null && b.plot_id !== '' ? Number(b.plot_id) : null,
       commodities_id: b.commodities_id != null && b.commodities_id !== '' ? Number(b.commodities_id) : null,
       sapropdi_id: b.sapropdi_id != null && b.sapropdi_id !== '' ? Number(b.sapropdi_id) : null,
+      warehouse_id: warehouseId,
       quantity: qty,
       unit_id: b.unit_id != null && b.unit_id !== '' ? Number(b.unit_id) : null,
       price_per_unit: price,

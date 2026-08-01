@@ -5,18 +5,21 @@ import { nextDocNumber } from '../utils/docNumber';
 import { seedApprovalSteps } from './documents';
 import { ROLE, PAYMENT_EXECUTOR_ROLES } from '../utils/roles';
 import { resolveWriteEntity } from '../utils/entityScope';
+import { PENDING_STEP_COLUMNS, pendingStepJoin } from '../utils/pendingStep';
 
 export const router = Router();
 
 const SELECT = `
   SELECT pay.*, e.entities_name AS entity_name, bc.code AS budget_code,
          pr.pr_number, po.po_number,
-         CASE WHEN pay.purchase_order_id IS NOT NULL THEN 'via_po' ELSE 'direct' END AS route
+         CASE WHEN pay.purchase_order_id IS NOT NULL THEN 'via_po' ELSE 'direct' END AS route,
+${PENDING_STEP_COLUMNS}
   FROM payment_requests pay
   LEFT JOIN entities e            ON e.id = pay.entity_id
   LEFT JOIN budget_codes bc       ON bc.id = pay.budget_code_id
   LEFT JOIN purchase_requests pr  ON pr.id = pay.purchase_request_id
   LEFT JOIN purchase_orders po    ON po.id = pay.purchase_order_id
+${pendingStepJoin('PayReq', 'pay')}
 `;
 
 // GET /api/payment-requests?entity_id=&status=&route=
@@ -79,6 +82,12 @@ router.post('/', authenticate, requireRole(
     if (!b.purchase_request_id && !b.purchase_order_id) {
       return res.status(422).json({ message: 'Either purchase_request_id or purchase_order_id is required' });
     }
+    // Called "Project Code" on a PayReq and "Budget Code" on a PR/PO, but it is the
+    // same budget_codes list. Optional upstream, mandatory here: this is the document
+    // that moves cash, so the spend has to land against a code.
+    if (b.budget_code_id == null || b.budget_code_id === '') {
+      return res.status(422).json({ message: 'budget_code_id (Project Code) is required on a payment request' });
+    }
     const c: any = bodyToCols(b);
     c.entity_id = scoped.entityId;
     const payreqNumber = b.payreq_number || await nextDocNumber('payment_requests', 'payreq_number', 'PAY');
@@ -108,6 +117,10 @@ const update = async (req: Request, res: Response) => {
     // otherwise the generic update would be a way to walk straight past that gate.
     if (String(b.status || '') === 'Paid') {
       return res.status(422).json({ message: "Use POST /api/payment-requests/:id/pay to mark a payment as paid." });
+    }
+    // Editing may leave the code alone, but it may not clear it.
+    if (b.budget_code_id !== undefined && (b.budget_code_id === null || b.budget_code_id === '')) {
+      return res.status(422).json({ message: 'budget_code_id (Project Code) cannot be cleared' });
     }
     const c: any = bodyToCols(b);
     // Only set provided fields.
