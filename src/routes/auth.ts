@@ -24,9 +24,11 @@ router.post('/login', async (req: Request, res: Response) => {
     }
     const u = list[0];
     delete u.password;
-    const [r] = await pool.query('SELECT role_code, role_name FROM roles WHERE id = ? LIMIT 1', [u.role_id]);
+    const [r] = await pool.query(
+      'SELECT role_code, role_name, is_cross_entity FROM roles WHERE id = ? LIMIT 1', [u.role_id]);
     const role = (r as any[])[0]?.role_name ?? null;
     const role_code = (r as any[])[0]?.role_code ?? null;
+    const role_cross_entity = !!(r as any[])[0]?.is_cross_entity;
     let entity = null;
     if (u.entity_id) {
       const [e] = await pool.query(
@@ -34,7 +36,7 @@ router.post('/login', async (req: Request, res: Response) => {
       entity = (e as any[])[0] ?? null;
     }
     const token = await issueToken('User', u.id, 'staff-login');
-    return res.json({ message: 'Login successful', token, user: { ...u, role, role_code, entity } });
+    return res.json({ message: 'Login successful', token, user: { ...u, role, role_code, role_cross_entity, entity } });
   } catch (err: any) {
     return res.status(500).json({ message: 'Server error', error: err.message });
   }

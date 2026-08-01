@@ -4,6 +4,7 @@ import { authenticate, requireRole } from '../middleware/auth';
 import { nextDocNumber } from '../utils/docNumber';
 import { seedApprovalSteps } from './documents';
 import { ROLE } from '../utils/roles';
+import { resolveWriteEntity } from '../utils/entityScope';
 
 export const router = Router();
 
@@ -81,7 +82,11 @@ router.post('/', authenticate, requireRole(
   const conn = await pool.getConnection();
   try {
     const b = req.body || {};
-    if (!b.vendor_id || !b.entity_id || !b.order_date) return res.status(422).json({ message: 'vendor_id, entity_id, order_date are required' });
+    if (!b.vendor_id || !b.order_date) return res.status(422).json({ message: 'vendor_id and order_date are required' });
+    // Entity-bound staff get their own entity; they never pick one.
+    const scoped = resolveWriteEntity(req, b.entity_id);
+    if ('error' in scoped) return res.status(422).json({ message: scoped.error });
+    const entityId = scoped.entityId;
 
     await conn.beginTransaction();
     const poNumber = b.po_number || await nextDocNumber('purchase_orders', 'po_number', 'PO');
@@ -90,7 +95,7 @@ router.post('/', authenticate, requireRole(
        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NOW(),NOW())`,
       [poNumber,
        b.purchase_request_id != null && b.purchase_request_id !== '' ? Number(b.purchase_request_id) : null,
-       Number(b.vendor_id), Number(b.entity_id),
+       Number(b.vendor_id), entityId,
        b.budget_code_id != null && b.budget_code_id !== '' ? Number(b.budget_code_id) : null,
        b.order_date, b.due_date || null, b.payment_terms || null, b.delivery_address || null,
        b.is_tax_included ? 1 : 0, b.tax_rate != null ? Number(b.tax_rate) : 11, b.status || 'Draft']
@@ -112,7 +117,7 @@ router.post('/', authenticate, requireRole(
 
     if ((b.status || 'Draft') !== 'Draft') {
       const totals = await computeTotals(id);
-      await seedApprovalSteps('PO', id, Number(b.entity_id), totals.grand_total);
+      await seedApprovalSteps('PO', id, entityId, totals.grand_total);
     }
 
     const [rows] = await pool.query(SELECT + ' WHERE po.id = ? LIMIT 1', [id]);

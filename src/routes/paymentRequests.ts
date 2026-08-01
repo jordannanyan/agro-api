@@ -4,6 +4,7 @@ import { authenticate, requireRole } from '../middleware/auth';
 import { nextDocNumber } from '../utils/docNumber';
 import { seedApprovalSteps } from './documents';
 import { ROLE, PAYMENT_EXECUTOR_ROLES } from '../utils/roles';
+import { resolveWriteEntity } from '../utils/entityScope';
 
 export const router = Router();
 
@@ -72,11 +73,14 @@ router.post('/', authenticate, requireRole(
 ), async (req: Request, res: Response) => {
   try {
     const b = req.body || {};
-    if (!b.entity_id) return res.status(422).json({ message: 'entity_id is required' });
+    // Entity-bound staff get their own entity; they never pick one.
+    const scoped = resolveWriteEntity(req, b.entity_id);
+    if ('error' in scoped) return res.status(422).json({ message: scoped.error });
     if (!b.purchase_request_id && !b.purchase_order_id) {
       return res.status(422).json({ message: 'Either purchase_request_id or purchase_order_id is required' });
     }
     const c: any = bodyToCols(b);
+    c.entity_id = scoped.entityId;
     const payreqNumber = b.payreq_number || await nextDocNumber('payment_requests', 'payreq_number', 'PAY');
     const cols = { payreq_number: payreqNumber, ...c, created_at: new Date(), updated_at: new Date() };
     const keys = Object.keys(cols);

@@ -3,6 +3,7 @@ import pool from '../db/connection';
 import { authenticate } from '../middleware/auth';
 import { nextDocNumber } from '../utils/docNumber';
 import { seedApprovalSteps } from './documents';
+import { resolveWriteEntity } from '../utils/entityScope';
 
 export const router = Router();
 
@@ -68,8 +69,12 @@ router.post('/', authenticate, async (req: Request, res: Response) => {
   const conn = await pool.getConnection();
   try {
     const b = req.body || {};
-    if (!b.entity_id || !b.request_date) return res.status(422).json({ message: 'entity_id and request_date are required' });
+    if (!b.request_date) return res.status(422).json({ message: 'request_date is required' });
     if (b.status && !STATUSES.includes(b.status)) return res.status(422).json({ message: 'Invalid status' });
+    // Entity-bound staff get their own entity; they never pick one.
+    const scoped = resolveWriteEntity(req, b.entity_id);
+    if ('error' in scoped) return res.status(422).json({ message: scoped.error });
+    const entityId = scoped.entityId;
     const items = Array.isArray(b.items) ? b.items : [];
     const grandTotal = items.reduce((s: number, it: any) => s + Number(it.quantity || 0) * Number(it.unit_cost || 0), 0);
 
@@ -78,7 +83,7 @@ router.post('/', authenticate, async (req: Request, res: Response) => {
     const [result] = await conn.query(
       `INSERT INTO purchase_requests (pr_number, entity_id, requested_by_user_id, request_date, date_required, status, grand_total, created_at, updated_at)
        VALUES (?,?,?,?,?,?,?,NOW(),NOW())`,
-      [prNumber, Number(b.entity_id), req.user?.type === 'User' ? req.user.id : null,
+      [prNumber, entityId, req.user?.type === 'User' ? req.user.id : null,
        b.request_date, b.date_required || null, b.status || 'Draft', grandTotal]
     );
     const id = (result as any).insertId;
@@ -94,7 +99,7 @@ router.post('/', authenticate, async (req: Request, res: Response) => {
 
     // Seed approval workflow when submitted (not Draft).
     if ((b.status || 'Draft') !== 'Draft') {
-      await seedApprovalSteps('PR', id, Number(b.entity_id), grandTotal);
+      await seedApprovalSteps('PR', id, entityId, grandTotal);
     }
 
     const [rows] = await pool.query(SELECT + ' WHERE pr.id = ? LIMIT 1', [id]);

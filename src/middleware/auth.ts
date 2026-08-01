@@ -30,6 +30,8 @@ export interface AuthUser {
   role?: string | null;
   /** Stable slug — this is what all authorization checks compare against. */
   roleCode?: string | null;
+  /** True when the role serves every operational entity (Procurement, Finance, Director). */
+  roleCrossEntity?: boolean;
   roleId?: number | null;
   entityId?: number | null;
   data: any;
@@ -112,10 +114,13 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
 
     let role: string | null = null;
     let roleCode: string | null = null;
+    let roleCrossEntity = false;
     if (payload.type === 'User') {
-      const [r] = await pool.query('SELECT role_code, role_name FROM roles WHERE id = ? LIMIT 1', [u.role_id]);
+      const [r] = await pool.query(
+        'SELECT role_code, role_name, is_cross_entity FROM roles WHERE id = ? LIMIT 1', [u.role_id]);
       role = (r as any[])[0]?.role_name ?? null;
       roleCode = (r as any[])[0]?.role_code ?? null;
+      roleCrossEntity = !!(r as any[])[0]?.is_cross_entity;
     }
 
     req.jti = payload.jti;
@@ -124,6 +129,7 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
       type: payload.type,
       role,
       roleCode,
+      roleCrossEntity,
       roleId: u.role_id ?? null,
       entityId: u.entity_id ?? null,
       data: u,
