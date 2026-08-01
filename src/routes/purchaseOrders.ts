@@ -3,6 +3,7 @@ import pool from '../db/connection';
 import { authenticate, requireRole } from '../middleware/auth';
 import { nextDocNumber } from '../utils/docNumber';
 import { seedApprovalSteps } from './documents';
+import { ROLE } from '../utils/roles';
 
 export const router = Router();
 
@@ -74,7 +75,9 @@ router.get('/:id', authenticate, async (req: Request, res: Response) => {
 });
 
 // POST /api/purchase-orders  body: {..., items:[{pr_item_id,order_qty,unit_price}], extra_costs:[{description,amount}]}
-router.post('/', authenticate, requireRole('PM', 'Head', 'Finance', 'Director', 'Admin'), async (req: Request, res: Response) => {
+router.post('/', authenticate, requireRole(
+  ROLE.PROCUREMENT, ROLE.PROJECT_MANAGER, ROLE.FINANCE_MANAGER, ROLE.DIRECTOR, ROLE.SUPER_ADMIN, ROLE.ADMIN,
+), async (req: Request, res: Response) => {
   const conn = await pool.getConnection();
   try {
     const b = req.body || {};

@@ -3,6 +3,7 @@ import pool from '../db/connection';
 import { authenticate, requireRole } from '../middleware/auth';
 import { nextDocNumber } from '../utils/docNumber';
 import { seedApprovalSteps } from './documents';
+import { ROLE, PAYMENT_EXECUTOR_ROLES } from '../utils/roles';
 
 export const router = Router();
 
@@ -38,7 +39,7 @@ router.get('/:id', authenticate, async (req: Request, res: Response) => {
   if (!list.length) return res.status(404).json({ message: 'Payment request not found' });
   const data = list[0];
   const [appr] = await pool.query(
-    `SELECT da.*, r.role_name FROM document_approvals da LEFT JOIN roles r ON r.id = da.role_id
+    `SELECT da.*, r.role_code, r.role_name FROM document_approvals da LEFT JOIN roles r ON r.id = da.role_id
      WHERE da.document_type='PayReq' AND da.document_id=? ORDER BY da.step_order`, [req.params.id]);
   data.approvals = appr;
   return res.json({ data });
@@ -66,7 +67,9 @@ function bodyToCols(b: any) {
 }
 
 // POST /api/payment-requests  (CHECK: PR or PO source required)
-router.post('/', authenticate, requireRole('Head', 'Finance', 'Director', 'Admin'), async (req: Request, res: Response) => {
+router.post('/', authenticate, requireRole(
+  ROLE.PROCUREMENT, ROLE.FINANCE_MANAGER, ROLE.DIRECTOR, ROLE.SUPER_ADMIN, ROLE.ADMIN,
+), async (req: Request, res: Response) => {
   try {
     const b = req.body || {};
     if (!b.entity_id) return res.status(422).json({ message: 'entity_id is required' });
@@ -97,6 +100,11 @@ const update = async (req: Request, res: Response) => {
     const [ex] = await pool.query('SELECT id FROM payment_requests WHERE id = ? LIMIT 1', [id]);
     if (!(ex as any[]).length) return res.status(404).json({ message: 'Payment request not found' });
     const b = req.body || {};
+    // 'Paid' is reserved for POST /:id/pay, which checks the approval chain first —
+    // otherwise the generic update would be a way to walk straight past that gate.
+    if (String(b.status || '') === 'Paid') {
+      return res.status(422).json({ message: "Use POST /api/payment-requests/:id/pay to mark a payment as paid." });
+    }
     const c: any = bodyToCols(b);
     // Only set provided fields.
     const updates: Record<string, any> = {};
@@ -116,6 +124,75 @@ router.put('/:id', authenticate, update);
 router.post('/:id', authenticate, (req, res) => {
   if (String(req.body?._method || req.query?._method || '').toUpperCase() === 'PUT') return update(req, res);
   return res.status(404).json({ message: `Not found: POST ${req.originalUrl}` });
+});
+
+// POST /api/payment-requests/:id/pay — record the actual cash disbursement (step 5).
+//
+// This is deliberately NOT an approval action: the approval chain ends with the
+// Director acknowledging. Finance then executes, and both the Finance Manager and
+// the Finance Staff may do it (per the 2026-08 role documentation, the Finance Staff
+// is the one who normally keys the payment in).
+router.post('/:id/pay', authenticate, requireRole(...PAYMENT_EXECUTOR_ROLES), async (req: Request, res: Response) => {
+  try {
+    const id = Number(req.params.id);
+    const user = req.user!;
+    const b = req.body || {};
+
+    const [ex] = await pool.query('SELECT id, status FROM payment_requests WHERE id = ? LIMIT 1', [id]);
+    const payreq = (ex as any[])[0];
+    if (!payreq) return res.status(404).json({ message: 'Payment request not found' });
+    if (payreq.status === 'Paid') return res.status(409).json({ message: 'This payment request is already paid.' });
+
+    // Gate: every approval step must be Approved before cash can move.
+    const [steps] = await pool.query(
+      `SELECT da.step_order, da.status, r.role_name
+       FROM document_approvals da
+       LEFT JOIN roles r ON r.id = da.role_id
+       WHERE da.document_type = 'PayReq' AND da.document_id = ?
+         AND COALESCE(da.step_label, '') <> 'Payment'
+       ORDER BY da.step_order ASC`,
+      [id]
+    );
+    const chain = steps as any[];
+    if (!chain.length) {
+      return res.status(409).json({ message: 'This payment request has no approval chain yet.' });
+    }
+    const outstanding = chain.find((s) => s.status !== 'Approved');
+    if (outstanding) {
+      return res.status(409).json({
+        message: `Cannot pay yet — step ${outstanding.step_order} (${outstanding.role_name ?? 'unassigned'}) is ${outstanding.status}.`,
+      });
+    }
+
+    const releasedDate = b.released_pay_date || new Date().toISOString().slice(0, 10);
+    await pool.query(
+      `UPDATE payment_requests
+       SET status = 'Paid', released_pay_date = ?, payment_method_id = ?, paid_by_user_id = ?, updated_at = NOW()
+       WHERE id = ?`,
+      [releasedDate, b.payment_method_id != null && b.payment_method_id !== '' ? Number(b.payment_method_id) : null,
+       user.id, id]
+    );
+
+    // Leave a trace on the timeline so the 5-step view in the UI is complete.
+    const nextOrder = Math.max(...chain.map((s) => Number(s.step_order))) + 1;
+    await pool.query(
+      `INSERT INTO document_approvals
+         (document_type, document_id, step_order, step_label, role_id, user_id, name, position, action_date, note, status, created_at, updated_at)
+       VALUES ('PayReq', ?, ?, 'Payment', ?, ?, ?, ?, ?, ?, 'Approved', NOW(), NOW())`,
+      [id, nextOrder, user.roleId ?? null, user.id, user.data?.name ?? null, user.data?.position ?? null,
+       releasedDate, b.note ?? null]
+    );
+    await pool.query(
+      `INSERT INTO document_activities (document_type, document_id, action, user_id, note, created_at)
+       VALUES ('PayReq', ?, 'Payment released', ?, ?, NOW())`,
+      [id, user.id, b.note ?? null]
+    );
+
+    const [rows] = await pool.query(SELECT + ' WHERE pay.id = ? LIMIT 1', [id]);
+    return res.json({ message: 'Payment recorded', data: (rows as any[])[0] });
+  } catch (err: any) {
+    return res.status(500).json({ message: 'Server error', error: err.message });
+  }
 });
 
 // DELETE /api/payment-requests/:id

@@ -46,7 +46,7 @@ router.get('/:id', authenticate, async (req: Request, res: Response) => {
   const data = list[0];
   data.items = await loadItems(Number(req.params.id));
   const [appr] = await pool.query(
-    `SELECT da.*, r.role_name FROM document_approvals da LEFT JOIN roles r ON r.id = da.role_id
+    `SELECT da.*, r.role_code, r.role_name FROM document_approvals da LEFT JOIN roles r ON r.id = da.role_id
      WHERE da.document_type='PR' AND da.document_id=? ORDER BY da.step_order`, [req.params.id]);
   data.approvals = appr;
   return res.json({ data });

@@ -2,12 +2,21 @@ import { Router, Request, Response } from 'express';
 import pool from '../db/connection';
 import { authenticate } from '../middleware/auth';
 import { upload, fileToPath } from '../middleware/upload';
+import { SYSTEM_ADMIN_ROLES } from '../utils/roles';
 
 // Polymorphic document layer: approvals / attachments / activities.
 // Mounted at /api/documents/:type/:id/(approvals|attachments|activities)
 export const router = Router({ mergeParams: true });
 
 const DOC_TYPES = ['PR', 'PO', 'PayReq'] as const;
+export type DocType = (typeof DOC_TYPES)[number];
+
+/** Where each document type keeps its own status column. */
+const DOC_TABLE: Record<DocType, string> = {
+  PR: 'purchase_requests',
+  PO: 'purchase_orders',
+  PayReq: 'payment_requests',
+};
 
 function checkType(req: Request, res: Response): boolean {
   if (!DOC_TYPES.includes(req.params.type as any)) {
@@ -21,7 +30,7 @@ function checkType(req: Request, res: Response): boolean {
 router.get('/:type/:id/approvals', authenticate, async (req, res) => {
   if (!checkType(req, res)) return;
   const [rows] = await pool.query(
-    `SELECT da.*, r.role_name, u.name AS user_name
+    `SELECT da.*, r.role_code, r.role_name, u.name AS user_name
      FROM document_approvals da
      LEFT JOIN roles r ON r.id = da.role_id
      LEFT JOIN users u ON u.id = da.user_id
@@ -34,26 +43,70 @@ router.get('/:type/:id/approvals', authenticate, async (req, res) => {
 // Act on an approval step: approve / reject / revision.
 router.post('/:type/:id/approvals/:stepId/action', authenticate, async (req: Request, res: Response) => {
   if (!checkType(req, res)) return;
+  const docType = req.params.type as DocType;
+  const docId = Number(req.params.id);
   const { action, note } = req.body || {};
   const map: Record<string, string> = { approve: 'Approved', reject: 'Rejected', revision: 'Revision' };
   const status = map[String(action)];
   if (!status) return res.status(422).json({ message: 'action must be approve | reject | revision' });
   const user = req.user!;
 
-  // RBAC: only a staff user whose role matches the step's role may act (Director/Admin may act on any step).
   if (user.type !== 'User') return res.status(403).json({ message: 'Staff access only.' });
   const [stepRows] = await pool.query(
-    `SELECT da.role_id, r.role_name FROM document_approvals da
+    `SELECT da.id, da.step_order, da.step_label, da.status, da.role_id, r.role_code, r.role_name
+     FROM document_approvals da
      LEFT JOIN roles r ON r.id = da.role_id
      WHERE da.id = ? AND da.document_type = ? AND da.document_id = ? LIMIT 1`,
-    [req.params.stepId, req.params.type, req.params.id]
+    [req.params.stepId, docType, docId]
   );
   const step = (stepRows as any[])[0];
   if (!step) return res.status(404).json({ message: 'Approval step not found.' });
-  const stepRole = step.role_name as string | null;
-  const isSuperRole = user.role === 'Director' || user.role === 'Admin';
-  if (!isSuperRole && (!stepRole || user.role !== stepRole)) {
-    return res.status(403).json({ message: `Only ${stepRole || 'the assigned role'} may act on this step.` });
+
+  // The Payment step is an execution record, not an approval — it is written by
+  // POST /api/payment-requests/:id/pay, never through this endpoint.
+  if (step.step_label === 'Payment') {
+    return res.status(409).json({ message: 'The payment step is recorded by the payment endpoint, not by approving.' });
+  }
+
+  // RBAC: only a staff user holding the step's role may act. System admins may override.
+  // Note: Director no longer bypasses other roles' steps — with the 2026-08 flow the
+  // Director owns explicit steps on PO and PayReq, so a blanket bypass would hollow out
+  // exactly the control the flow is meant to enforce.
+  const isSystemAdmin = SYSTEM_ADMIN_ROLES.includes(user.roleCode as any);
+  if (!isSystemAdmin && (!step.role_code || user.roleCode !== step.role_code)) {
+    return res.status(403).json({ message: `Only ${step.role_name || 'the assigned role'} may act on this step.` });
+  }
+
+  // Holding the right role is not enough — it has to be the right role *for this
+  // entity*. SNBS and JNBS each have their own Project Manager and Field Admin, so
+  // without this the JNBS PM could sign off an SNBS document. Roles flagged
+  // is_cross_entity (Procurement, Finance, Director) legitimately serve both PTs.
+  if (!isSystemAdmin) {
+    const [docRows] = await pool.query(
+      `SELECT d.entity_id, r.is_cross_entity
+       FROM ${DOC_TABLE[docType]} d
+       JOIN roles r ON r.id = ?
+       WHERE d.id = ? LIMIT 1`,
+      [user.roleId, docId]
+    );
+    const doc = (docRows as any[])[0];
+    if (doc && !doc.is_cross_entity && doc.entity_id != null && user.entityId !== doc.entity_id) {
+      return res.status(403).json({ message: 'This document belongs to another entity.' });
+    }
+  }
+
+  // Steps must be taken in order: every earlier step has to be Approved first.
+  const [pendingBefore] = await pool.query(
+    `SELECT step_order FROM document_approvals
+     WHERE document_type = ? AND document_id = ? AND step_order < ? AND status <> 'Approved'
+     ORDER BY step_order ASC LIMIT 1`,
+    [docType, docId, step.step_order]
+  );
+  const blocker = (pendingBefore as any[])[0];
+  if (blocker) {
+    return res.status(409).json({
+      message: `Step ${step.step_order} cannot be actioned yet — step ${blocker.step_order} is still outstanding.`,
+    });
   }
 
   await pool.query(
@@ -61,15 +114,19 @@ router.post('/:type/:id/approvals/:stepId/action', authenticate, async (req: Req
      SET status = ?, user_id = ?, name = ?, position = ?, note = ?, action_date = CURDATE(), updated_at = NOW()
      WHERE id = ? AND document_type = ? AND document_id = ?`,
     [status, user.id, user.data?.name ?? null, user.data?.position ?? null, note ?? null,
-     req.params.stepId, req.params.type, req.params.id]
+     req.params.stepId, docType, docId]
   );
   await pool.query(
     `INSERT INTO document_activities (document_type, document_id, action, user_id, note, created_at)
      VALUES (?, ?, ?, ?, ?, NOW())`,
-    [req.params.type, req.params.id, `${status} (step ${req.params.stepId})`, user.id, note ?? null]
+    [docType, docId, `${status} (step ${step.step_order}${isSystemAdmin && user.roleCode !== step.role_code ? ', admin override' : ''})`,
+     user.id, note ?? null]
   );
+
+  const documentStatus = await syncDocumentStatus(docType, docId);
+
   const [rows] = await pool.query('SELECT * FROM document_approvals WHERE id = ? LIMIT 1', [req.params.stepId]);
-  return res.json({ message: `Step ${status}`, data: (rows as any[])[0] });
+  return res.json({ message: `Step ${status}`, data: (rows as any[])[0], document_status: documentStatus });
 });
 
 // ---- Attachments ----
@@ -117,24 +174,81 @@ router.get('/:type/:id/activities', authenticate, async (req, res) => {
 export default router;
 
 // -----------------------------------------------------------------------------
+// Helper: keep the document's own status column in step with its approval chain.
+//
+// Without this the approval rows moved to Approved but purchase_requests.status /
+// purchase_orders.status / payment_requests.status stayed 'Pending' forever, so a
+// fully signed-off document still looked outstanding in every list and dashboard.
+//
+// Rules: any Rejected step  -> Rejected
+//        any Revision step  -> Revision
+//        all approval steps Approved -> Approved
+//        otherwise                   -> Pending
+// The Payment step is excluded — payment execution is tracked by payment_requests
+// (status 'Paid' + released_pay_date), not by the approval chain. The comparison is
+// COALESCE'd because rows migrated from before step_label existed have it NULL, and
+// `NULL <> 'Payment'` is NULL, not true — a plain <> would silently drop them and
+// declare a half-approved document fully approved.
+// -----------------------------------------------------------------------------
+export async function syncDocumentStatus(docType: DocType, docId: number): Promise<string | null> {
+  const [rows] = await pool.query(
+    `SELECT status FROM document_approvals
+     WHERE document_type = ? AND document_id = ?
+       AND COALESCE(step_label, '') <> 'Payment'`,
+    [docType, docId]
+  );
+  const steps = rows as { status: string }[];
+  if (!steps.length) return null;
+
+  let status: string;
+  if (steps.some((s) => s.status === 'Rejected')) status = 'Rejected';
+  else if (steps.some((s) => s.status === 'Revision')) status = 'Revision';
+  else if (steps.every((s) => s.status === 'Approved')) status = 'Approved';
+  else status = 'Pending';
+
+  // A PayReq already marked Paid must not be dragged back to Approved.
+  const table = DOC_TABLE[docType];
+  if (docType === 'PayReq') {
+    const [cur] = await pool.query(`SELECT status FROM ${table} WHERE id = ? LIMIT 1`, [docId]);
+    if ((cur as any[])[0]?.status === 'Paid') return 'Paid';
+  }
+
+  await pool.query(`UPDATE ${table} SET status = ?, updated_at = NOW() WHERE id = ?`, [status, docId]);
+  return status;
+}
+
+// -----------------------------------------------------------------------------
 // Helper: seed approval steps for a freshly created document from approval_routes.
 // Used by PR/PO/PayReq create handlers.
 // -----------------------------------------------------------------------------
-export async function seedApprovalSteps(docType: 'PR' | 'PO' | 'PayReq', docId: number, entityId: number | null, amount: number) {
-  const [routes] = await pool.query(
+export async function seedApprovalSteps(docType: DocType, docId: number, entityId: number | null, amount: number) {
+  // Entity-specific routes win outright; the entity-agnostic rows (entity_id IS NULL)
+  // are only a fallback for entities that have no route of their own. Merging both
+  // sets — as this used to — produced duplicate steps at the same step_order whenever
+  // an entity-specific route and a global route coexisted.
+  const [entityRows] = await pool.query(
     `SELECT * FROM approval_routes
-     WHERE document_type = ? AND (entity_id = ? OR entity_id IS NULL)
-     ORDER BY step_order ASC`,
+     WHERE document_type = ? AND entity_id = ? ORDER BY step_order ASC`,
     [docType, entityId]
   );
-  for (const r of routes as any[]) {
-    // Amount thresholds (e.g. Director only when >= min_amount).
+  let routes = entityRows as any[];
+  if (!routes.length) {
+    const [globalRows] = await pool.query(
+      `SELECT * FROM approval_routes
+       WHERE document_type = ? AND entity_id IS NULL ORDER BY step_order ASC`,
+      [docType]
+    );
+    routes = globalRows as any[];
+  }
+
+  for (const r of routes) {
+    // Amount thresholds (e.g. a step that only applies above a certain value).
     if (r.min_amount != null && amount < Number(r.min_amount)) continue;
     if (r.max_amount != null && amount > Number(r.max_amount)) continue;
     await pool.query(
-      `INSERT INTO document_approvals (document_type, document_id, step_order, role_id, status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, 'Pending', NOW(), NOW())`,
-      [docType, docId, r.step_order, r.role_id]
+      `INSERT INTO document_approvals (document_type, document_id, step_order, step_label, role_id, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, 'Pending', NOW(), NOW())`,
+      [docType, docId, r.step_order, r.step_label, r.role_id]
     );
   }
 }

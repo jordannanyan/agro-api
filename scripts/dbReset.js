@@ -11,6 +11,9 @@ async function run() {
   const dir = path.resolve(__dirname, '..', 'db');
   const schema = fs.readFileSync(path.join(dir, 'schema.sql'), 'utf8');
   let seed = fs.readFileSync(path.join(dir, 'seed.sql'), 'utf8');
+  // Saprodi master is a separate file so it can also be applied on its own to an
+  // existing database; it must run after seed.sql because it references `units`.
+  const seedSaprodi = fs.readFileSync(path.join(dir, 'seed_saprodi.sql'), 'utf8');
   const views = fs.readFileSync(path.join(dir, 'views.sql'), 'utf8');
 
   // Replace the seed @PW placeholder with a freshly computed valid hash of "password".
@@ -29,10 +32,17 @@ async function run() {
   await conn.query(schema);
   console.log('→ Running seed.sql ...');
   await conn.query(seed);
+  console.log('→ Running seed_saprodi.sql ...');
+  await conn.query(seedSaprodi);
   console.log('→ Running views.sql ...');
   await conn.query(views);
   await conn.end();
-  console.log('✓ Database reset complete. Login: admin / password (full access), or <entity>_<role> e.g. snbs_finance / password');
+  console.log('✓ Database reset complete.');
+  console.log('  Login accepts username OR email, password "password". Examples:');
+  console.log('    jordan.nanyan   (Super Admin)      elma.aryanti  (Field Admin SNBS)');
+  console.log('    putri.gandini   (Procurement)      edo.santeyo   (Project Manager SNBS)');
+  console.log('    nyi.arum        (Finance Manager)  saskia.vianacika (Finance Staff)');
+  console.log('    rizky.sudirman  (Director)');
 }
 
 run().catch((e) => { console.error('✗ db reset failed:', e.message); process.exit(1); });

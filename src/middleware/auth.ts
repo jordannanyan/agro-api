@@ -26,7 +26,10 @@ export type UserKind = 'User' | 'Entities' | 'Kth' | 'Farmers';
 export interface AuthUser {
   id: number;
   type: UserKind;
+  /** Display name of the role (may be renamed by admins — never compare against this). */
   role?: string | null;
+  /** Stable slug — this is what all authorization checks compare against. */
+  roleCode?: string | null;
   roleId?: number | null;
   entityId?: number | null;
   data: any;
@@ -108,9 +111,11 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
     delete u.password;
 
     let role: string | null = null;
+    let roleCode: string | null = null;
     if (payload.type === 'User') {
-      const [r] = await pool.query('SELECT role_name FROM roles WHERE id = ? LIMIT 1', [u.role_id]);
+      const [r] = await pool.query('SELECT role_code, role_name FROM roles WHERE id = ? LIMIT 1', [u.role_id]);
       role = (r as any[])[0]?.role_name ?? null;
+      roleCode = (r as any[])[0]?.role_code ?? null;
     }
 
     req.jti = payload.jti;
@@ -118,6 +123,7 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
       id: u.id,
       type: payload.type,
       role,
+      roleCode,
       roleId: u.role_id ?? null,
       entityId: u.entity_id ?? null,
       data: u,
@@ -140,14 +146,14 @@ export function requireUser(req: Request, res: Response, next: NextFunction) {
   next();
 }
 
-// Restrict to specific roles (staff).
-export function requireRole(...roles: string[]) {
+// Restrict to specific roles (staff). Compares `role_code`, not the display name.
+export function requireRole(...roleCodes: string[]) {
   return (req: Request, res: Response, next: NextFunction) => {
     if (!req.user || req.user.type !== 'User') {
       return res.status(403).json({ message: 'Staff access only.' });
     }
-    if (roles.length && (!req.user.role || !roles.includes(req.user.role))) {
-      return res.status(403).json({ message: `Requires role: ${roles.join(', ')}` });
+    if (roleCodes.length && (!req.user.roleCode || !roleCodes.includes(req.user.roleCode))) {
+      return res.status(403).json({ message: `Requires role: ${roleCodes.join(', ')}` });
     }
     next();
   };

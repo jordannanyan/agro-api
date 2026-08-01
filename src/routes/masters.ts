@@ -1,26 +1,45 @@
+import { Router, Request, Response, NextFunction } from 'express';
 import { crudRouter } from '../utils/crudFactory';
 import pool from '../db/connection';
 import { authenticate } from '../middleware/auth';
 
 // Simple master-data tables, all standard CRUD behind JWT auth.
 
-export const entitiesRouter = crudRouter({
+const entitiesCrud = crudRouter({
   table: 'entities',
-  columns: ['entities_name', 'location', 'username', 'password', 'is_superadmin'],
+  columns: ['entities_name', 'location', 'username', 'password', 'is_superadmin', 'entity_type'],
   required: ['entities_name', 'username'],
   boolean: ['is_superadmin'],
   hashColumns: ['password'],
   hideColumns: ['password'],
+  filterColumns: ['entity_type'],
   searchColumns: ['entities_name', 'location', 'username'],
   label: 'Entity',
 });
 
+// WLI (Support) and NBSV (System) are org units that hold staff — they own no land,
+// plots or trees. Listing them alongside the operational PTs would pollute the entity
+// pickers in the land+tree app and the Flutter app, so the list defaults to
+// Operational only. Pass ?type=all (or an explicit ?entity_type=) to see the rest.
+function defaultOperationalOnly(req: Request, _res: Response, next: NextFunction) {
+  const q = req.query as Record<string, unknown>;
+  const type = String(q.type ?? '').toLowerCase();
+  if (type === 'all') delete q.entity_type;
+  else if (!q.entity_type) q.entity_type = type ? String(q.type) : 'Operational';
+  delete q.type;
+  next();
+}
+
+export const entitiesRouter = Router();
+entitiesRouter.get('/', defaultOperationalOnly);
+entitiesRouter.use(entitiesCrud);
+
 export const rolesRouter = crudRouter({
   table: 'roles',
-  columns: ['role_name', 'is_cross_entity'],
-  required: ['role_name'],
+  columns: ['role_code', 'role_name', 'is_cross_entity'],
+  required: ['role_code', 'role_name'],
   boolean: ['is_cross_entity'],
-  searchColumns: ['role_name'],
+  searchColumns: ['role_code', 'role_name'],
   orderBy: 'id ASC',
   label: 'Role',
 });
@@ -64,10 +83,11 @@ export const preFinanceTypesRouter = crudRouter({
 
 export const sapropdiRouter = crudRouter({
   table: 'sapropdi',
-  columns: ['sapropdi_name', 'unit_id', 'unit'],
+  columns: ['item_code', 'short_code', 'category', 'legacy_no', 'sapropdi_name', 'unit_id', 'unit'],
   required: ['sapropdi_name'],
-  numeric: ['unit_id'],
-  searchColumns: ['sapropdi_name'],
+  numeric: ['unit_id', 'legacy_no'],
+  filterColumns: ['category'],
+  searchColumns: ['item_code', 'sapropdi_name', 'short_code'],
   orderBy: 'sapropdi_name ASC',
   label: 'Sapropdi',
 });

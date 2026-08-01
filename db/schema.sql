@@ -16,6 +16,10 @@ SET FOREIGN_KEY_CHECKS = 0;
 -- -----------------------------------------------------------------------------
 -- CLUSTER: Auth & Approval
 -- -----------------------------------------------------------------------------
+-- `entity_type` separates the operational PTs (SNBS, JNBS — they own land, plots, trees)
+-- from org units that only hold staff: WLI (Support: Procurement & Finance) and
+-- NBSV (System: Super Admin & Admin). GET /api/entities returns Operational only by
+-- default so the land+tree and Flutter apps keep seeing exactly what they saw before.
 CREATE TABLE `entities` (
   `id`             INT AUTO_INCREMENT PRIMARY KEY,
   `entities_name`  VARCHAR(150) NOT NULL,
@@ -23,12 +27,17 @@ CREATE TABLE `entities` (
   `username`       VARCHAR(100) NOT NULL UNIQUE,
   `password`       VARCHAR(255) NOT NULL,
   `is_superadmin`  TINYINT(1) NOT NULL DEFAULT 0,
+  `entity_type`    ENUM('Operational','Support','System') NOT NULL DEFAULT 'Operational',
   `created_at`     DATETIME NULL,
-  `updated_at`     DATETIME NULL
+  `updated_at`     DATETIME NULL,
+  KEY `idx_entities_type` (`entity_type`)
 ) ENGINE=InnoDB;
 
+-- `role_code` is the stable slug the CODE compares against (requireRole, RBAC checks).
+-- `role_name` is a display label users may freely rename in Settings without breaking anything.
 CREATE TABLE `roles` (
   `id`               INT AUTO_INCREMENT PRIMARY KEY,
+  `role_code`        VARCHAR(40) NOT NULL UNIQUE,
   `role_name`        VARCHAR(80) NOT NULL UNIQUE,
   `is_cross_entity`  TINYINT(1) NOT NULL DEFAULT 0,
   `created_at`       DATETIME NULL,
@@ -49,7 +58,9 @@ CREATE TABLE `users` (
   `created_at`  DATETIME NULL,
   `updated_at`  DATETIME NULL,
   CONSTRAINT `fk_users_entity` FOREIGN KEY (`entity_id`) REFERENCES `entities`(`id`) ON DELETE SET NULL,
-  CONSTRAINT `fk_users_role`   FOREIGN KEY (`role_id`)   REFERENCES `roles`(`id`)
+  CONSTRAINT `fk_users_role`   FOREIGN KEY (`role_id`)   REFERENCES `roles`(`id`),
+  -- Login accepts username OR email, so email must be unique and indexed too.
+  UNIQUE KEY `uq_users_email` (`email`)
 ) ENGINE=InnoDB;
 
 -- Approval routing config (per document type, per entity, per step).
@@ -58,7 +69,10 @@ CREATE TABLE `approval_routes` (
   `document_type`  ENUM('PR','PO','PayReq') NOT NULL,
   `entity_id`      INT NULL,                          -- NULL = berlaku semua entitas
   `step_order`     INT NOT NULL,
-  `step_label`     ENUM('Requested','Approved','Acknowledged') NOT NULL,
+  -- 'Payment' is the cash-execution step (PayReq step 5). It is not an approval:
+  -- it is written by POST /api/payment-requests/:id/pay, and it is excluded when
+  -- deriving the document's own status.
+  `step_label`     ENUM('Requested','Approved','Acknowledged','Payment') NOT NULL,
   `role_id`        INT NOT NULL,
   `min_amount`     DECIMAL(18,2) NULL,
   `max_amount`     DECIMAL(18,2) NULL,
@@ -104,14 +118,23 @@ CREATE TABLE `pre_finance_types` (
   `updated_at` DATETIME NULL
 ) ENGINE=InnoDB;
 
+-- `item_code` (BA001, UR006, …) is the real unique key for a saprodi item.
+-- `short_code` is the 2-letter prefix and is deliberately NOT unique: MA is shared by
+-- Mango / Manure / Manzate / Machine Sprayer, BA by Banana / Bambu / Balsa / Bayclin.
+-- `legacy_no` keeps the original spreadsheet row number, which has gaps (3 -> 5, …).
 CREATE TABLE `sapropdi` (
   `id`            INT AUTO_INCREMENT PRIMARY KEY,
+  `item_code`     VARCHAR(16) NULL UNIQUE,
+  `short_code`    VARCHAR(4) NULL,
+  `category`      ENUM('Seedlings','Fertilizer','Herbicide','Insecticide','Fungicide','Equipment','Others') NULL,
+  `legacy_no`     INT NULL,
   `sapropdi_name` VARCHAR(150) NOT NULL,
   `unit_id`       INT NULL,
   `unit`          VARCHAR(60) NULL,
   `created_at`    DATETIME NULL,
   `updated_at`    DATETIME NULL,
-  CONSTRAINT `fk_sapropdi_unit` FOREIGN KEY (`unit_id`) REFERENCES `units`(`id`) ON DELETE SET NULL
+  CONSTRAINT `fk_sapropdi_unit` FOREIGN KEY (`unit_id`) REFERENCES `units`(`id`) ON DELETE SET NULL,
+  KEY `idx_sapropdi_category` (`category`)
 ) ENGINE=InnoDB;
 
 CREATE TABLE `commodities` (
@@ -456,12 +479,19 @@ CREATE TABLE `payment_requests` (
   `bank_account`        VARCHAR(60) NULL,
   `beneficiary_name`    VARCHAR(150) NULL,
   `status`              VARCHAR(40) NOT NULL DEFAULT 'Draft',
+  -- Payment execution (step 5). Written by POST /api/payment-requests/:id/pay,
+  -- which only Finance Manager / Finance Staff may call, and only once the
+  -- Director's Acknowledged step is done.
+  `payment_method_id`   INT NULL,
+  `paid_by_user_id`     INT NULL,
   `created_at`          DATETIME NULL,
   `updated_at`          DATETIME NULL,
   CONSTRAINT `fk_payreq_pr`     FOREIGN KEY (`purchase_request_id`) REFERENCES `purchase_requests`(`id`) ON DELETE SET NULL,
   CONSTRAINT `fk_payreq_po`     FOREIGN KEY (`purchase_order_id`)   REFERENCES `purchase_orders`(`id`) ON DELETE SET NULL,
   CONSTRAINT `fk_payreq_entity` FOREIGN KEY (`entity_id`)           REFERENCES `entities`(`id`),
-  CONSTRAINT `fk_payreq_budget` FOREIGN KEY (`budget_code_id`)      REFERENCES `budget_codes`(`id`) ON DELETE SET NULL
+  CONSTRAINT `fk_payreq_budget` FOREIGN KEY (`budget_code_id`)      REFERENCES `budget_codes`(`id`) ON DELETE SET NULL,
+  CONSTRAINT `fk_payreq_method` FOREIGN KEY (`payment_method_id`)   REFERENCES `payment_methods`(`id`) ON DELETE SET NULL,
+  CONSTRAINT `fk_payreq_paidby` FOREIGN KEY (`paid_by_user_id`)     REFERENCES `users`(`id`) ON DELETE SET NULL
   -- NOTE: "PR or PO required" is enforced in the API (routes/paymentRequests.ts).
   -- A CHECK constraint was intentionally omitted for MySQL/MariaDB portability.
 ) ENGINE=InnoDB;
@@ -474,6 +504,7 @@ CREATE TABLE `document_approvals` (
   `document_type` ENUM('PR','PO','PayReq') NOT NULL,
   `document_id`   INT NOT NULL,
   `step_order`    INT NOT NULL,
+  `step_label`    ENUM('Requested','Approved','Acknowledged','Payment') NULL,
   `role_id`       INT NULL,
   `user_id`       INT NULL,                  -- NULL sebelum ditindak
   `name`          VARCHAR(150) NULL,

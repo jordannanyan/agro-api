@@ -1,12 +1,18 @@
 import { Router, Request, Response } from 'express';
 import pool from '../db/connection';
 import { authenticate, requireRole, hashPassword } from '../middleware/auth';
+import { ROLE } from '../utils/roles';
 
 export const router = Router();
+
+// Managing staff accounts is system administration, not a business-flow action —
+// restricted to Super Admin / Admin (previously Finance could do it, which was wrong).
+const canManageUsers = requireRole(ROLE.SUPER_ADMIN, ROLE.ADMIN);
 
 const SELECT = `
   SELECT u.id, u.entity_id, u.role_id, u.name, u.username, u.email, u.position, u.is_active,
          u.created_at, u.updated_at,
+         r.role_code AS role_code,
          r.role_name AS role_name,
          e.entities_name AS entity_name
   FROM users u
@@ -36,7 +42,7 @@ router.get('/:id', authenticate, async (req: Request, res: Response) => {
 });
 
 // POST /api/users  (Finance/Director manage staff)
-router.post('/', authenticate, requireRole('Finance', 'Director', 'Admin'), async (req: Request, res: Response) => {
+router.post('/', authenticate, canManageUsers, async (req: Request, res: Response) => {
   try {
     const b = req.body || {};
     for (const k of ['name', 'username', 'role_id', 'password']) {
@@ -95,14 +101,14 @@ const update = async (req: Request, res: Response) => {
     return res.status(500).json({ message: 'Server error', error: err.message });
   }
 };
-router.put('/:id', authenticate, requireRole('Finance', 'Director', 'Admin'), update);
-router.post('/:id', authenticate, requireRole('Finance', 'Director', 'Admin'), (req, res) => {
+router.put('/:id', authenticate, canManageUsers, update);
+router.post('/:id', authenticate, canManageUsers, (req, res) => {
   if (String(req.body?._method || req.query?._method || '').toUpperCase() === 'PUT') return update(req, res);
   return res.status(404).json({ message: `Not found: POST ${req.originalUrl}` });
 });
 
 // DELETE /api/users/:id
-router.delete('/:id', authenticate, requireRole('Finance', 'Director', 'Admin'), async (req: Request, res: Response) => {
+router.delete('/:id', authenticate, canManageUsers, async (req: Request, res: Response) => {
   const [result] = await pool.query('DELETE FROM users WHERE id = ?', [req.params.id]);
   if (!(result as any).affectedRows) return res.status(404).json({ message: 'User not found' });
   return res.json({ message: 'User deleted' });

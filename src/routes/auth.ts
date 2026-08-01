@@ -5,26 +5,36 @@ import { authenticate, issueToken, comparePassword, hashPassword } from '../midd
 export const router = Router();
 
 // POST /api/login  — staff login (users + roles). Main dashboard entry.
+// The `username` field accepts either a username or an email address; the request
+// shape is unchanged so existing clients keep working.
 router.post('/login', async (req: Request, res: Response) => {
   const { username, password } = req.body || {};
   if (!username || !password) return res.status(422).json({ message: 'username and password required' });
   try {
-    const [rows] = await pool.query('SELECT * FROM users WHERE username = ? AND is_active = 1 LIMIT 1', [username]);
+    const [rows] = await pool.query(
+      `SELECT * FROM users
+       WHERE (username = ? OR email = ?) AND is_active = 1
+       ORDER BY (username = ?) DESC
+       LIMIT 1`,
+      [username, username, username]
+    );
     const list = rows as any[];
     if (!list.length || !(await comparePassword(password, list[0].password))) {
       return res.status(401).json({ message: 'Invalid credentials' });
     }
     const u = list[0];
     delete u.password;
-    const [r] = await pool.query('SELECT role_name FROM roles WHERE id = ? LIMIT 1', [u.role_id]);
+    const [r] = await pool.query('SELECT role_code, role_name FROM roles WHERE id = ? LIMIT 1', [u.role_id]);
     const role = (r as any[])[0]?.role_name ?? null;
+    const role_code = (r as any[])[0]?.role_code ?? null;
     let entity = null;
     if (u.entity_id) {
-      const [e] = await pool.query('SELECT id, entities_name FROM entities WHERE id = ? LIMIT 1', [u.entity_id]);
+      const [e] = await pool.query(
+        'SELECT id, entities_name, entity_type FROM entities WHERE id = ? LIMIT 1', [u.entity_id]);
       entity = (e as any[])[0] ?? null;
     }
     const token = await issueToken('User', u.id, 'staff-login');
-    return res.json({ message: 'Login successful', token, user: { ...u, role, entity } });
+    return res.json({ message: 'Login successful', token, user: { ...u, role, role_code, entity } });
   } catch (err: any) {
     return res.status(500).json({ message: 'Server error', error: err.message });
   }
