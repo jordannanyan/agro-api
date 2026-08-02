@@ -4,7 +4,7 @@ import { authenticate, requireRole } from '../middleware/auth';
 import { nextDocNumber } from '../utils/docNumber';
 import { seedApprovalSteps } from './documents';
 import { ROLE, PAYMENT_EXECUTOR_ROLES } from '../utils/roles';
-import { resolveWriteEntity } from '../utils/entityScope';
+import { inheritEntity } from '../utils/entityScope';
 import { PENDING_STEP_COLUMNS, pendingStepJoin } from '../utils/pendingStep';
 
 export const router = Router();
@@ -49,6 +49,41 @@ router.get('/:id', authenticate, async (req: Request, res: Response) => {
   return res.json({ data });
 });
 
+/**
+ * Read the entity off whichever document this payment descends from.
+ *
+ * A PayReq always follows a PR or a PO, so the entity is already decided upstream.
+ * Taking it from the request body instead let a payment be filed against a PT that
+ * never asked for the spend — and Procurement serves every PT, so no role check
+ * would have noticed.
+ */
+async function entityFromSource(b: any): Promise<{ entityId: number } | { error: string }> {
+  const prId = b.purchase_request_id != null && b.purchase_request_id !== '' ? Number(b.purchase_request_id) : null;
+  const poId = b.purchase_order_id != null && b.purchase_order_id !== '' ? Number(b.purchase_order_id) : null;
+
+  let prEntity: number | null = null;
+  let poEntity: number | null = null;
+  if (prId != null) {
+    const [r] = await pool.query('SELECT entity_id FROM purchase_requests WHERE id = ? LIMIT 1', [prId]);
+    if (!(r as any[]).length) return { error: 'Purchase request not found' };
+    prEntity = Number((r as any[])[0].entity_id);
+  }
+  if (poId != null) {
+    const [r] = await pool.query('SELECT entity_id FROM purchase_orders WHERE id = ? LIMIT 1', [poId]);
+    if (!(r as any[]).length) return { error: 'Purchase order not found' };
+    poEntity = Number((r as any[])[0].entity_id);
+  }
+  // Older POs predate entity inheritance, so a PR and PO named together can still
+  // disagree. That is a contradiction about who is paying, not something to resolve
+  // by preferring one of them.
+  if (prEntity != null && poEntity != null && prEntity !== poEntity) {
+    return { error: 'The purchase request and purchase order belong to different entities.' };
+  }
+  const entityId = poEntity ?? prEntity;
+  if (entityId == null) return { error: 'Either purchase_request_id or purchase_order_id is required' };
+  return { entityId };
+}
+
 function bodyToCols(b: any) {
   return {
     purchase_request_id: b.purchase_request_id != null && b.purchase_request_id !== '' ? Number(b.purchase_request_id) : null,
@@ -76,12 +111,14 @@ router.post('/', authenticate, requireRole(
 ), async (req: Request, res: Response) => {
   try {
     const b = req.body || {};
-    // Entity-bound staff get their own entity; they never pick one.
-    const scoped = resolveWriteEntity(req, b.entity_id);
-    if ('error' in scoped) return res.status(422).json({ message: scoped.error });
     if (!b.purchase_request_id && !b.purchase_order_id) {
       return res.status(422).json({ message: 'Either purchase_request_id or purchase_order_id is required' });
     }
+    // The source document decides the entity; entity_id in the body is ignored.
+    const source = await entityFromSource(b);
+    if ('error' in source) return res.status(422).json({ message: source.error });
+    const scoped = inheritEntity(req, source.entityId);
+    if ('error' in scoped) return res.status(422).json({ message: scoped.error });
     // Called "Project Code" on a PayReq and "Budget Code" on a PR/PO, but it is the
     // same budget_codes list. Optional upstream, mandatory here: this is the document
     // that moves cash, so the spend has to land against a code.
@@ -126,6 +163,23 @@ const update = async (req: Request, res: Response) => {
     // Only set provided fields.
     const updates: Record<string, any> = {};
     for (const k of Object.keys(c)) if (b[k.replace(/_id$/, '_id')] !== undefined || b[k] !== undefined) updates[k] = c[k];
+
+    // Entity follows the source document, never the body. Moving a payment onto a
+    // different PR or PO moves it to that document's entity as well.
+    delete updates.entity_id;
+    if (b.purchase_request_id !== undefined || b.purchase_order_id !== undefined) {
+      const [cur] = await pool.query(
+        'SELECT purchase_request_id, purchase_order_id FROM payment_requests WHERE id = ? LIMIT 1', [id]);
+      const prev = (cur as any[])[0] ?? {};
+      const source = await entityFromSource({
+        purchase_request_id: b.purchase_request_id !== undefined ? b.purchase_request_id : prev.purchase_request_id,
+        purchase_order_id: b.purchase_order_id !== undefined ? b.purchase_order_id : prev.purchase_order_id,
+      });
+      if ('error' in source) return res.status(422).json({ message: source.error });
+      const scoped = inheritEntity(req, source.entityId);
+      if ('error' in scoped) return res.status(422).json({ message: scoped.error });
+      updates.entity_id = scoped.entityId;
+    }
     const keys = Object.keys(updates);
     if (keys.length) {
       updates.updated_at = new Date(); keys.push('updated_at');
