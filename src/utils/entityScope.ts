@@ -51,3 +51,30 @@ export function resolveWriteEntity(
   if (asked == null) return { error: 'entity_id is required' };
   return { entityId: asked };
 }
+
+/**
+ * Decide which entity a document belongs to when it descends from another one.
+ *
+ * A PO is always raised against a purchase request, so the entity is already
+ * settled — asking again only creates a way for the two to disagree. Procurement
+ * serves every PT, so nothing about the account narrows it either; the parent
+ * document is the only honest source.
+ *
+ * Entity-bound staff are still held to their own PT, so a Project Manager cannot
+ * work a request belonging to another one.
+ */
+export function inheritEntity(
+  req: Request,
+  parentEntityId: number | null | undefined,
+): { entityId: number } | { error: string } {
+  const u = req.user as any;
+  if (parentEntityId == null) {
+    return { error: 'The source document has no entity, so this one cannot inherit it.' };
+  }
+  const parent = Number(parentEntityId);
+
+  if (u?.type === 'User' && !u.roleCrossEntity && u.entityId != null && u.entityId !== parent) {
+    return { error: 'That source document belongs to another entity.' };
+  }
+  return { entityId: parent };
+}

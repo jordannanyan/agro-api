@@ -4,7 +4,7 @@ import { authenticate, requireRole } from '../middleware/auth';
 import { nextDocNumber } from '../utils/docNumber';
 import { seedApprovalSteps } from './documents';
 import { ROLE } from '../utils/roles';
-import { resolveWriteEntity } from '../utils/entityScope';
+import { inheritEntity } from '../utils/entityScope';
 import { PENDING_STEP_COLUMNS, pendingStepJoin } from '../utils/pendingStep';
 
 export const router = Router();
@@ -86,8 +86,20 @@ router.post('/', authenticate, requireRole(
   try {
     const b = req.body || {};
     if (!b.vendor_id || !b.order_date) return res.status(422).json({ message: 'vendor_id and order_date are required' });
-    // Entity-bound staff get their own entity; they never pick one.
-    const scoped = resolveWriteEntity(req, b.entity_id);
+
+    // Every route into a PO starts at a purchase request, so the request is what
+    // says which PT is buying. Taking entity_id from the caller instead let the two
+    // disagree — Procurement serves both PTs, so nothing would have caught it.
+    if (b.purchase_request_id == null || b.purchase_request_id === '') {
+      return res.status(422).json({ message: 'purchase_request_id is required — a PO always follows a purchase request' });
+    }
+    const prId = Number(b.purchase_request_id);
+    const [prRows] = await conn.query(
+      'SELECT id, entity_id FROM purchase_requests WHERE id = ? LIMIT 1', [prId]);
+    const pr = (prRows as any[])[0];
+    if (!pr) return res.status(422).json({ message: 'Purchase request not found' });
+
+    const scoped = inheritEntity(req, pr.entity_id);
     if ('error' in scoped) return res.status(422).json({ message: scoped.error });
     const entityId = scoped.entityId;
 
@@ -96,8 +108,7 @@ router.post('/', authenticate, requireRole(
     const [result] = await conn.query(
       `INSERT INTO purchase_orders (po_number, purchase_request_id, vendor_id, entity_id, budget_code_id, order_date, due_date, payment_terms, delivery_address, is_tax_included, tax_rate, status, created_at, updated_at)
        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NOW(),NOW())`,
-      [poNumber,
-       b.purchase_request_id != null && b.purchase_request_id !== '' ? Number(b.purchase_request_id) : null,
+      [poNumber, prId,
        Number(b.vendor_id), entityId,
        b.budget_code_id != null && b.budget_code_id !== '' ? Number(b.budget_code_id) : null,
        b.order_date, b.due_date || null, b.payment_terms || null, b.delivery_address || null,
@@ -143,15 +154,36 @@ const update = async (req: Request, res: Response) => {
   try {
     const id = req.params.id;
     const [ex] = await conn.query('SELECT * FROM purchase_orders WHERE id = ? LIMIT 1', [id]);
-    if (!(ex as any[]).length) { conn.release(); return res.status(404).json({ message: 'PO not found' }); }
+    // `finally` releases the connection; releasing here as well would return it to
+    // the pool twice.
+    if (!(ex as any[]).length) return res.status(404).json({ message: 'PO not found' });
     const b = req.body || {};
+
+    // Resolved before the transaction opens, so a rejection needs no rollback.
+    // Re-pointing a PO at a different request moves it to that request's entity;
+    // entity_id is never taken from the caller here either — see the POST.
+    let inherited: { prId: number; entityId: number } | null = null;
+    if (b.purchase_request_id !== undefined) {
+      if (b.purchase_request_id === '' || b.purchase_request_id === null) {
+        return res.status(422).json({ message: 'purchase_request_id cannot be cleared — a PO always follows a purchase request' });
+      }
+      const newPrId = Number(b.purchase_request_id);
+      const [prRows] = await conn.query('SELECT id, entity_id FROM purchase_requests WHERE id = ? LIMIT 1', [newPrId]);
+      const pr = (prRows as any[])[0];
+      if (!pr) return res.status(422).json({ message: 'Purchase request not found' });
+      const scoped = inheritEntity(req, pr.entity_id);
+      if ('error' in scoped) return res.status(422).json({ message: scoped.error });
+      inherited = { prId: newPrId, entityId: scoped.entityId };
+    }
 
     await conn.beginTransaction();
     const updates: Record<string, any> = {};
     const set = (k: string, v: any) => { if (v !== undefined) updates[k] = v; };
-    set('purchase_request_id', b.purchase_request_id !== undefined ? (b.purchase_request_id === '' || b.purchase_request_id === null ? null : Number(b.purchase_request_id)) : undefined);
+    if (inherited) {
+      set('purchase_request_id', inherited.prId);
+      set('entity_id', inherited.entityId);
+    }
     set('vendor_id', b.vendor_id != null ? Number(b.vendor_id) : undefined);
-    set('entity_id', b.entity_id != null ? Number(b.entity_id) : undefined);
     set('budget_code_id', b.budget_code_id !== undefined ? (b.budget_code_id === '' || b.budget_code_id === null ? null : Number(b.budget_code_id)) : undefined);
     set('order_date', b.order_date);
     set('due_date', b.due_date);
