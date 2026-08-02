@@ -7,3 +7,6 @@ storage/trees/*
 storage/tree_monitorings/*
 !storage/**/.gitkeep
 *.log
+
+# Database dumps -- never belong in the repo
+*.sql
