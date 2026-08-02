@@ -16,6 +16,7 @@ import purchaseRequestsRoutes from './routes/purchaseRequests';
 import purchaseOrdersRoutes from './routes/purchaseOrders';
 import paymentRequestsRoutes from './routes/paymentRequests';
 import stockInRoutes from './routes/stockIn';
+import stockOutRoutes from './routes/stockOut';
 import documentsRoutes from './routes/documents';
 import warehouseStockRoutes from './routes/warehouseStock';
 import financeRoutes from './routes/finance';
@@ -99,6 +100,7 @@ app.use('/api/purchase-requests', purchaseRequestsRoutes);
 app.use('/api/purchase-orders', purchaseOrdersRoutes);
 app.use('/api/payment-requests', paymentRequestsRoutes);
 app.use('/api/stock-in', stockInRoutes);
+app.use('/api/stock-out', stockOutRoutes);
 app.use('/api/documents', documentsRoutes);
 
 // Warehouse (calculated stock)
