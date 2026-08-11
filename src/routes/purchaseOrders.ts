@@ -2,9 +2,9 @@ import { Router, Request, Response } from 'express';
 import pool from '../db/connection';
 import { authenticate, requireRole } from '../middleware/auth';
 import { nextDocNumber } from '../utils/docNumber';
-import { seedApprovalSteps } from './documents';
+import { seedApprovalSteps, syncDocumentStatus, resetRevisionSteps, guardEdit, guardRequester } from './documents';
 import { ROLE } from '../utils/roles';
-import { inheritEntity } from '../utils/entityScope';
+import { inheritEntity, entityScope, canSeeEntity } from '../utils/entityScope';
 import { PENDING_STEP_COLUMNS, pendingStepJoin } from '../utils/pendingStep';
 
 export const router = Router();
@@ -57,7 +57,9 @@ async function computeTotals(poId: number) {
 router.get('/', authenticate, async (req: Request, res: Response) => {
   const where: string[] = [];
   const args: any[] = [];
-  if (req.query.entity_id) { where.push('po.entity_id = ?'); args.push(req.query.entity_id); }
+  // Same rule as the purchase requests: entity-bound staff see their own PT only.
+  const scope = entityScope(req);
+  if (scope != null) { where.push('po.entity_id = ?'); args.push(scope); }
   if (req.query.vendor_id) { where.push('po.vendor_id = ?'); args.push(req.query.vendor_id); }
   if (req.query.status)    { where.push('po.status = ?'); args.push(req.query.status); }
   if (req.query.search)    { where.push('po.po_number LIKE ?'); args.push(`%${req.query.search}%`); }
@@ -72,6 +74,9 @@ router.get('/:id', authenticate, async (req: Request, res: Response) => {
   const list = rows as any[];
   if (!list.length) return res.status(404).json({ message: 'PO not found' });
   const data = list[0];
+  if (!canSeeEntity(req, data.entity_id)) {
+    return res.status(403).json({ message: 'This purchase order belongs to another entity.' });
+  }
   data.items = await loadItems(Number(req.params.id));
   data.extra_costs = await loadExtras(Number(req.params.id));
   data.totals = await computeTotals(Number(req.params.id));
@@ -157,7 +162,17 @@ const update = async (req: Request, res: Response) => {
     // `finally` releases the connection; releasing here as well would return it to
     // the pool twice.
     if (!(ex as any[]).length) return res.status(404).json({ message: 'PO not found' });
+    const prev = (ex as any[])[0];
     const b = req.body || {};
+
+    const denied = guardEdit(req.user, prev, b.status);
+    if (denied) return res.status(403).json({ message: denied });
+
+    const resubmitting = b.status === 'Pending' && prev.status === 'Revision';
+    if (resubmitting) {
+      const noRight = await guardRequester(req.user!, 'PO', Number(id), prev);
+      if (noRight) return res.status(403).json({ message: noRight });
+    }
 
     // Resolved before the transaction opens, so a rejection needs no rollback.
     // Re-pointing a PO at a different request moves it to that request's entity;
@@ -213,6 +228,20 @@ const update = async (req: Request, res: Response) => {
     }
     await conn.commit();
 
+    // Submitting a saved draft has to seed the approval chain, exactly as creating
+    // it already Pending does. Without this the PO left Draft with no steps at all:
+    // its status read "Pending" while the timeline stayed empty and no approver was
+    // ever asked — the "PO cannot be submitted for approval" report.
+    if (b.status && b.status !== 'Draft' && prev.status === 'Draft') {
+      const [cnt] = await pool.query('SELECT COUNT(*) AS n FROM document_approvals WHERE document_type=? AND document_id=?', ['PO', id]);
+      if (!Number((cnt as any[])[0].n)) {
+        const totals = await computeTotals(Number(id));
+        await seedApprovalSteps('PO', Number(id), Number(updates.entity_id ?? prev.entity_id), totals.grand_total);
+      }
+    }
+    if (resubmitting) await resetRevisionSteps('PO', Number(id), req.user!);
+    if (b.status && b.status !== 'Draft') await syncDocumentStatus('PO', Number(id));
+
     const [rows] = await pool.query(SELECT + ' WHERE po.id = ? LIMIT 1', [id]);
     const data = (rows as any[])[0];
     data.items = await loadItems(Number(id));
@@ -226,8 +255,11 @@ const update = async (req: Request, res: Response) => {
     conn.release();
   }
 };
-router.put('/:id', authenticate, update);
-router.post('/:id', authenticate, (req, res) => {
+// Editing a PO is bounded by the same roles that may raise one — a Field Admin
+// files requests, not orders.
+const PO_WRITERS = [ROLE.PROCUREMENT, ROLE.PROJECT_MANAGER, ROLE.FINANCE_MANAGER, ROLE.DIRECTOR, ROLE.SUPER_ADMIN, ROLE.ADMIN];
+router.put('/:id', authenticate, requireRole(...PO_WRITERS), update);
+router.post('/:id', authenticate, requireRole(...PO_WRITERS), (req, res) => {
   if (String(req.body?._method || req.query?._method || '').toUpperCase() === 'PUT') return update(req, res);
   return res.status(404).json({ message: `Not found: POST ${req.originalUrl}` });
 });

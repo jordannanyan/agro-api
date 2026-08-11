@@ -2,8 +2,8 @@ import { Router, Request, Response } from 'express';
 import pool from '../db/connection';
 import { authenticate } from '../middleware/auth';
 import { nextDocNumber } from '../utils/docNumber';
-import { seedApprovalSteps } from './documents';
-import { resolveWriteEntity } from '../utils/entityScope';
+import { seedApprovalSteps, syncDocumentStatus, resetRevisionSteps, guardEdit, guardRequester } from './documents';
+import { resolveWriteEntity, entityScope, canSeeEntity } from '../utils/entityScope';
 import { PENDING_STEP_COLUMNS, pendingStepJoin } from '../utils/pendingStep';
 
 export const router = Router();
@@ -34,7 +34,11 @@ ${pendingStepJoin('PR', 'pr')}
 router.get('/', authenticate, async (req: Request, res: Response) => {
   const where: string[] = [];
   const args: any[] = [];
-  if (req.query.entity_id) { where.push('pr.entity_id = ?'); args.push(req.query.entity_id); }
+  // Staff bound to one PT see only that PT's requests. The cross-entity roles
+  // (Procurement, Finance, Director) and the system admins see everything, and for
+  // them ?entity_id narrows the list instead of being ignored.
+  const scope = entityScope(req);
+  if (scope != null) { where.push('pr.entity_id = ?'); args.push(scope); }
   if (req.query.status)    { where.push('pr.status = ?'); args.push(req.query.status); }
   if (req.query.search)    { where.push('pr.pr_number LIKE ?'); args.push(`%${req.query.search}%`); }
   const sql = SELECT + (where.length ? ` WHERE ${where.join(' AND ')}` : '') + ' ORDER BY pr.id DESC';
@@ -48,6 +52,9 @@ router.get('/:id', authenticate, async (req: Request, res: Response) => {
   const list = rows as any[];
   if (!list.length) return res.status(404).json({ message: 'PR not found' });
   const data = list[0];
+  if (!canSeeEntity(req, data.entity_id)) {
+    return res.status(403).json({ message: 'This purchase request belongs to another entity.' });
+  }
   data.items = await loadItems(Number(req.params.id));
   const [appr] = await pool.query(
     `SELECT da.*, r.role_code, r.role_name FROM document_approvals da LEFT JOIN roles r ON r.id = da.role_id
@@ -122,11 +129,27 @@ const update = async (req: Request, res: Response) => {
   const conn = await pool.getConnection();
   try {
     const id = req.params.id;
+    // `finally` releases the connection; releasing on these early returns as well
+    // would hand the same connection back to the pool twice.
     const [ex] = await conn.query('SELECT * FROM purchase_requests WHERE id = ? LIMIT 1', [id]);
-    if (!(ex as any[]).length) { conn.release(); return res.status(404).json({ message: 'PR not found' }); }
+    if (!(ex as any[]).length) return res.status(404).json({ message: 'PR not found' });
     const prev = (ex as any[])[0];
     const b = req.body || {};
-    if (b.status && !STATUSES.includes(b.status)) { conn.release(); return res.status(422).json({ message: 'Invalid status' }); }
+    if (b.status && !STATUSES.includes(b.status)) return res.status(422).json({ message: 'Invalid status' });
+
+    // Only the requester's own statuses (Draft / Revision) may be rewritten, and
+    // only from within the owning entity — otherwise an edit could quietly change
+    // what an approver has already signed.
+    const denied = guardEdit(req.user, prev, b.status);
+    if (denied) return res.status(403).json({ message: denied });
+
+    // Pushing a revised request back into the chain is the requester's move, so it
+    // is held to the requester's role, not merely to "can edit".
+    const resubmitting = b.status === 'Pending' && prev.status === 'Revision';
+    if (resubmitting) {
+      const noRight = await guardRequester(req.user!, 'PR', Number(id), prev);
+      if (noRight) return res.status(403).json({ message: noRight });
+    }
 
     await conn.beginTransaction();
     let grandTotal: number | undefined;
@@ -145,7 +168,12 @@ const update = async (req: Request, res: Response) => {
     }
     const updates: Record<string, any> = {};
     const set = (k: string, v: any) => { if (v !== undefined) updates[k] = v; };
-    set('entity_id', b.entity_id != null ? Number(b.entity_id) : undefined);
+    // Entity-bound staff cannot move a request to another PT, on create or on edit.
+    if (b.entity_id != null && b.entity_id !== '') {
+      const scoped = resolveWriteEntity(req, b.entity_id);
+      if ('error' in scoped) { await conn.rollback(); return res.status(422).json({ message: scoped.error }); }
+      set('entity_id', scoped.entityId);
+    }
     set('request_date', b.request_date);
     set('date_required', b.date_required);
     set('status', b.status);
@@ -164,6 +192,11 @@ const update = async (req: Request, res: Response) => {
         await seedApprovalSteps('PR', Number(id), Number(updates.entity_id ?? prev.entity_id), Number(grandTotal ?? prev.grand_total));
       }
     }
+    // Resubmitting after a revision: the steps already exist, so hand the document
+    // back to the approver who asked for the change rather than seeding a new chain.
+    if (resubmitting) await resetRevisionSteps('PR', Number(id), req.user!);
+    // The chain, not the request body, decides the status once a chain exists.
+    if (b.status && b.status !== 'Draft') await syncDocumentStatus('PR', Number(id));
 
     const [rows] = await pool.query(SELECT + ' WHERE pr.id = ? LIMIT 1', [id]);
     const data = (rows as any[])[0];

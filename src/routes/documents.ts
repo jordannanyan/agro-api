@@ -1,6 +1,6 @@
 import { Router, Request, Response } from 'express';
 import pool from '../db/connection';
-import { authenticate } from '../middleware/auth';
+import { authenticate, AuthUser } from '../middleware/auth';
 import { upload, fileToPath } from '../middleware/upload';
 import { SYSTEM_ADMIN_ROLES } from '../utils/roles';
 
@@ -129,6 +129,37 @@ router.post('/:type/:id/approvals/:stepId/action', authenticate, async (req: Req
   return res.json({ message: `Step ${status}`, data: (rows as any[])[0], document_status: documentStatus });
 });
 
+// Resubmit a document that an approver sent back for revision.
+//
+// A "Revision" verdict is not a dead end: it hands the document back to whoever
+// filed it, who fixes it and pushes it into the same chain again. Without this the
+// document sat in Revision forever — every approver's step was already actioned,
+// so the timeline offered nobody anything to do.
+//
+// Steps that were already Approved stay approved: the document returns to the
+// approver who asked for the change, not to the very beginning.
+router.post('/:type/:id/resubmit', authenticate, async (req: Request, res: Response) => {
+  if (!checkType(req, res)) return;
+  const docType = req.params.type as DocType;
+  const docId = Number(req.params.id);
+  const user = req.user!;
+  if (user.type !== 'User') return res.status(403).json({ message: 'Staff access only.' });
+
+  const [docRows] = await pool.query(`SELECT * FROM ${DOC_TABLE[docType]} WHERE id = ? LIMIT 1`, [docId]);
+  const doc = (docRows as any[])[0];
+  if (!doc) return res.status(404).json({ message: 'Document not found.' });
+  if (doc.status !== 'Revision') {
+    return res.status(409).json({ message: `Only a document sent back for revision can be resubmitted (this one is ${doc.status}).` });
+  }
+
+  const denied = await guardRequester(user, docType, docId, doc);
+  if (denied) return res.status(403).json({ message: denied });
+
+  const reset = await resetRevisionSteps(docType, docId, user);
+  const documentStatus = await syncDocumentStatus(docType, docId);
+  return res.json({ message: 'Document resubmitted for approval', steps_reset: reset, document_status: documentStatus });
+});
+
 // ---- Attachments ----
 router.get('/:type/:id/attachments', authenticate, async (req, res) => {
   if (!checkType(req, res)) return;
@@ -172,6 +203,112 @@ router.get('/:type/:id/activities', authenticate, async (req, res) => {
 });
 
 export default router;
+
+// -----------------------------------------------------------------------------
+// Editing rules shared by the PR / PO / PayReq update handlers.
+//
+// A document may only be rewritten while it is still the requester's to hold:
+// as a Draft, or after an approver sent it back for revision. Once it is in the
+// chain (Pending), signed off (Approved), refused (Rejected) or paid, changing
+// its contents would silently invalidate signatures already given.
+// -----------------------------------------------------------------------------
+export const EDITABLE_STATUSES = ['Draft', 'Revision'];
+
+function isSystemAdmin(user: AuthUser): boolean {
+  return SYSTEM_ADMIN_ROLES.includes(user.roleCode as any);
+}
+
+/**
+ * May this caller rewrite this document? Returns a message to send as 403, or
+ * null when the edit is allowed.
+ *
+ * System admins are exempt: they are the documented override path for stuck
+ * documents, and the override is recorded in document_activities.
+ */
+export function guardEdit(
+  user: AuthUser | undefined,
+  doc: { status: string; entity_id?: number | null },
+  nextStatus?: string,
+): string | null {
+  if (!user || user.type !== 'User') return 'Staff access only.';
+  // A document already in the chain must not be pushed back to Draft: its steps
+  // would stay behind in Revision while the document claimed to be unsubmitted.
+  if (nextStatus === 'Draft' && doc.status === 'Revision') {
+    return 'A document in revision cannot be moved back to draft — edit it and resubmit.';
+  }
+  if (isSystemAdmin(user)) return null;
+  if (!user.roleCrossEntity && doc.entity_id != null && user.entityId !== doc.entity_id) {
+    return 'This document belongs to another entity.';
+  }
+  if (!EDITABLE_STATUSES.includes(doc.status)) {
+    return `A document with status ${doc.status} can no longer be edited. Only Draft and Revision documents are editable.`;
+  }
+  return null;
+}
+
+/**
+ * The role that files this kind of document, read off its own approval chain
+ * rather than hard-coded: the chain comes from `approval_routes`, which an admin
+ * may re-point from Settings, and a hard-coded map would quietly disagree with it.
+ */
+async function requesterRoleCode(docType: DocType, docId: number): Promise<string | null> {
+  const [rows] = await pool.query(
+    `SELECT r.role_code FROM document_approvals da
+     JOIN roles r ON r.id = da.role_id
+     WHERE da.document_type = ? AND da.document_id = ?
+     ORDER BY (COALESCE(da.step_label, '') = 'Requested') DESC, da.step_order ASC
+     LIMIT 1`,
+    [docType, docId]
+  );
+  return (rows as any[])[0]?.role_code ?? null;
+}
+
+/**
+ * May this caller act *as the requester* of this document — edit it during a
+ * revision and push it back into the chain? Returns a 403 message or null.
+ */
+export async function guardRequester(
+  user: AuthUser,
+  docType: DocType,
+  docId: number,
+  doc: { entity_id?: number | null; requested_by_user_id?: number | null },
+): Promise<string | null> {
+  if (isSystemAdmin(user)) return null;
+  if (!user.roleCrossEntity && doc.entity_id != null && user.entityId !== doc.entity_id) {
+    return 'This document belongs to another entity.';
+  }
+  // Whoever filed it may always take it back, even if their role has since changed.
+  if (doc.requested_by_user_id != null && doc.requested_by_user_id === user.id) return null;
+  const owner = await requesterRoleCode(docType, docId);
+  if (owner && user.roleCode !== owner) {
+    return `Only ${owner} may resubmit this document.`;
+  }
+  return null;
+}
+
+/**
+ * Hand a revised document back to the approver who asked for the change: every
+ * step still marked Revision returns to Pending. The reviewer's note is kept on
+ * the step so the reason stays visible, but their name and date are cleared —
+ * they have not acted on this round yet.
+ */
+export async function resetRevisionSteps(docType: DocType, docId: number, user: AuthUser): Promise<number> {
+  const [result] = await pool.query(
+    `UPDATE document_approvals
+     SET status = 'Pending', user_id = NULL, name = NULL, position = NULL, action_date = NULL, updated_at = NOW()
+     WHERE document_type = ? AND document_id = ? AND status = 'Revision'`,
+    [docType, docId]
+  );
+  const n = Number((result as any).affectedRows || 0);
+  if (n) {
+    await pool.query(
+      `INSERT INTO document_activities (document_type, document_id, action, user_id, note, created_at)
+       VALUES (?, ?, 'Resubmitted after revision', ?, NULL, NOW())`,
+      [docType, docId, user.id]
+    );
+  }
+  return n;
+}
 
 // -----------------------------------------------------------------------------
 // Helper: keep the document's own status column in step with its approval chain.

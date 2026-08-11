@@ -26,6 +26,23 @@ export function entityScope(req: Request): number | null {
 }
 
 /**
+ * May the caller see a document belonging to `entityId`?
+ *
+ * The mirror of {@link entityScope} for single-record reads: a list is filtered by
+ * the scope, and a detail page has to be refused by the same rule — otherwise the
+ * scoping is only cosmetic and a Field Admin reaches another PT's document simply
+ * by typing its id into the URL.
+ *
+ * A null scope means "every entity" (system admins and the cross-entity roles).
+ */
+export function canSeeEntity(req: Request, entityId: number | null | undefined): boolean {
+  const scope = entityScope(req);
+  if (scope == null) return true;
+  if (entityId == null) return true; // no owner recorded — nothing to hide behind
+  return Number(entityId) === scope;
+}
+
+/**
  * Decide which entity a newly created document belongs to.
  *
  * Entity-bound staff (Field Admin, Project Manager) never choose: the entity comes

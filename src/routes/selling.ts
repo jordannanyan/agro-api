@@ -1,6 +1,8 @@
 import { Router, Request, Response } from 'express';
 import pool from '../db/connection';
 import { authenticate } from '../middleware/auth';
+import { entityScope } from '../utils/entityScope';
+import { ENTITY_COL, sellingScope } from '../utils/farmScope';
 
 export const router = Router();
 
@@ -39,14 +41,21 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
   const args: any[] = [];
   if (req.query.processing_id) { where.push('s.processing_id = ?'); args.push(req.query.processing_id); }
   if (req.query.offtaker_id)   { where.push('s.offtaker_id = ?'); args.push(req.query.offtaker_id); }
-  const sql = SELECT + (where.length ? ` WHERE ${where.join(' AND ')}` : '') + ' ORDER BY s.date DESC, s.id DESC';
+  // Same entity rule as purchasing — see utils/farmScope for how a sale reaches its PT.
+  const scope = entityScope(req);
+  if (scope != null) { where.push(`${ENTITY_COL} = ?`); args.push(scope); }
+  const sql = SELECT + sellingScope('s')
+    + (where.length ? ` WHERE ${where.join(' AND ')}` : '') + ' ORDER BY s.date DESC, s.id DESC';
   const [rows] = await pool.query(sql, args);
   return res.json({ data: (rows as any[]).map(shape) });
 });
 
 // GET /api/selling/:id
 router.get('/:id', authenticate, async (req: Request, res: Response) => {
-  const [rows] = await pool.query(SELECT + ' WHERE s.id = ? LIMIT 1', [req.params.id]);
+  const scope = entityScope(req);
+  const sql = SELECT + sellingScope('s')
+    + ` WHERE s.id = ?${scope != null ? ` AND ${ENTITY_COL} = ?` : ''} LIMIT 1`;
+  const [rows] = await pool.query(sql, scope != null ? [req.params.id, scope] : [req.params.id]);
   const list = rows as any[];
   if (!list.length) return res.status(404).json({ message: 'Selling not found' });
   return res.json({ data: shape(list[0]) });

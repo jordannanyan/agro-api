@@ -3,6 +3,8 @@ import pool from '../db/connection';
 import { authenticate } from '../middleware/auth';
 import { upload, fileToPath } from '../middleware/upload';
 import { compressImages } from '../services/imageProcessor';
+import { entityScope } from '../utils/entityScope';
+import { ENTITY_COL, purchasingScope } from '../utils/farmScope';
 
 export const router = Router();
 
@@ -65,14 +67,23 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
   if (req.query.supplier_type)  { where.push('p.supplier_type = ?'); args.push(req.query.supplier_type); }
   if (req.query.payment_status) { where.push('p.payment_status = ?'); args.push(req.query.payment_status); }
   if (req.query.scheme)         { where.push("COALESCE(pl.scheme,'BeliPutus') = ?"); args.push(req.query.scheme); }
-  const sql = SELECT + (where.length ? ` WHERE ${where.join(' AND ')}` : '') + ' ORDER BY p.date DESC, p.id DESC';
+  // Staff bound to one PT see only that PT's purchases — the same rule the
+  // dashboard counts by, so the KPI and this table cannot disagree.
+  const scope = entityScope(req);
+  if (scope != null) { where.push(`${ENTITY_COL} = ?`); args.push(scope); }
+  const sql = SELECT + purchasingScope('p')
+    + (where.length ? ` WHERE ${where.join(' AND ')}` : '') + ' ORDER BY p.date DESC, p.id DESC';
   const [rows] = await pool.query(sql, args);
   return res.json({ data: (rows as any[]).map(shape) });
 });
 
 // GET /api/purchasing/:id
 router.get('/:id', authenticate, async (req: Request, res: Response) => {
-  const [rows] = await pool.query(SELECT + ' WHERE p.id = ? LIMIT 1', [req.params.id]);
+  // Scoped here too: filtering only the list leaves the record one guessed id away.
+  const scope = entityScope(req);
+  const sql = SELECT + purchasingScope('p')
+    + ` WHERE p.id = ?${scope != null ? ` AND ${ENTITY_COL} = ?` : ''} LIMIT 1`;
+  const [rows] = await pool.query(sql, scope != null ? [req.params.id, scope] : [req.params.id]);
   const list = rows as any[];
   if (!list.length) return res.status(404).json({ message: 'Purchasing not found' });
   return res.json({ data: shape(list[0]) });

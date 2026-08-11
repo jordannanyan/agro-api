@@ -2,9 +2,9 @@ import { Router, Request, Response } from 'express';
 import pool from '../db/connection';
 import { authenticate, requireRole } from '../middleware/auth';
 import { nextDocNumber } from '../utils/docNumber';
-import { seedApprovalSteps } from './documents';
+import { seedApprovalSteps, syncDocumentStatus, resetRevisionSteps, guardEdit, guardRequester } from './documents';
 import { ROLE, PAYMENT_EXECUTOR_ROLES } from '../utils/roles';
-import { inheritEntity } from '../utils/entityScope';
+import { inheritEntity, entityScope, canSeeEntity } from '../utils/entityScope';
 import { PENDING_STEP_COLUMNS, pendingStepJoin } from '../utils/pendingStep';
 
 export const router = Router();
@@ -26,7 +26,9 @@ ${pendingStepJoin('PayReq', 'pay')}
 router.get('/', authenticate, async (req: Request, res: Response) => {
   const where: string[] = [];
   const args: any[] = [];
-  if (req.query.entity_id) { where.push('pay.entity_id = ?'); args.push(req.query.entity_id); }
+  // Same rule as PR and PO: entity-bound staff see their own PT only.
+  const scope = entityScope(req);
+  if (scope != null) { where.push('pay.entity_id = ?'); args.push(scope); }
   if (req.query.status)    { where.push('pay.status = ?'); args.push(req.query.status); }
   if (req.query.route === 'via_po')  where.push('pay.purchase_order_id IS NOT NULL');
   if (req.query.route === 'direct')  where.push('pay.purchase_order_id IS NULL');
@@ -42,6 +44,9 @@ router.get('/:id', authenticate, async (req: Request, res: Response) => {
   const list = rows as any[];
   if (!list.length) return res.status(404).json({ message: 'Payment request not found' });
   const data = list[0];
+  if (!canSeeEntity(req, data.entity_id)) {
+    return res.status(403).json({ message: 'This payment request belongs to another entity.' });
+  }
   const [appr] = await pool.query(
     `SELECT da.*, r.role_code, r.role_name FROM document_approvals da LEFT JOIN roles r ON r.id = da.role_id
      WHERE da.document_type='PayReq' AND da.document_id=? ORDER BY da.step_order`, [req.params.id]);
@@ -147,13 +152,23 @@ router.post('/', authenticate, requireRole(
 const update = async (req: Request, res: Response) => {
   try {
     const id = req.params.id;
-    const [ex] = await pool.query('SELECT id FROM payment_requests WHERE id = ? LIMIT 1', [id]);
+    const [ex] = await pool.query('SELECT * FROM payment_requests WHERE id = ? LIMIT 1', [id]);
     if (!(ex as any[]).length) return res.status(404).json({ message: 'Payment request not found' });
+    const prev = (ex as any[])[0];
     const b = req.body || {};
     // 'Paid' is reserved for POST /:id/pay, which checks the approval chain first —
     // otherwise the generic update would be a way to walk straight past that gate.
     if (String(b.status || '') === 'Paid') {
       return res.status(422).json({ message: "Use POST /api/payment-requests/:id/pay to mark a payment as paid." });
+    }
+
+    const denied = guardEdit(req.user, prev, b.status);
+    if (denied) return res.status(403).json({ message: denied });
+
+    const resubmitting = b.status === 'Pending' && prev.status === 'Revision';
+    if (resubmitting) {
+      const noRight = await guardRequester(req.user!, 'PayReq', Number(id), prev);
+      if (noRight) return res.status(403).json({ message: noRight });
     }
     // Editing may leave the code alone, but it may not clear it.
     if (b.budget_code_id !== undefined && (b.budget_code_id === null || b.budget_code_id === '')) {
@@ -185,14 +200,30 @@ const update = async (req: Request, res: Response) => {
       updates.updated_at = new Date(); keys.push('updated_at');
       await pool.query(`UPDATE payment_requests SET ${keys.map((k) => `\`${k}\` = ?`).join(', ')} WHERE id = ?`, [...keys.map((k) => updates[k]), id]);
     }
+
+    // Submitting a saved draft seeds the approval chain, as creating one already
+    // Pending does — otherwise the request left Draft with nobody assigned to it.
+    if (b.status && b.status !== 'Draft' && prev.status === 'Draft') {
+      const [cnt] = await pool.query('SELECT COUNT(*) AS n FROM document_approvals WHERE document_type=? AND document_id=?', ['PayReq', id]);
+      if (!Number((cnt as any[])[0].n)) {
+        await seedApprovalSteps('PayReq', Number(id),
+          Number(updates.entity_id ?? prev.entity_id),
+          Number(updates.amount ?? prev.amount));
+      }
+    }
+    if (resubmitting) await resetRevisionSteps('PayReq', Number(id), req.user!);
+    if (b.status && b.status !== 'Draft') await syncDocumentStatus('PayReq', Number(id));
+
     const [rows] = await pool.query(SELECT + ' WHERE pay.id = ? LIMIT 1', [id]);
     return res.json({ message: 'Payment request updated', data: (rows as any[])[0] });
   } catch (err: any) {
     return res.status(500).json({ message: 'Server error', error: err.message });
   }
 };
-router.put('/:id', authenticate, update);
-router.post('/:id', authenticate, (req, res) => {
+// Editing a payment request is bounded by the same roles that may raise one.
+const PAYREQ_WRITERS = [ROLE.PROCUREMENT, ROLE.FINANCE_MANAGER, ROLE.DIRECTOR, ROLE.SUPER_ADMIN, ROLE.ADMIN];
+router.put('/:id', authenticate, requireRole(...PAYREQ_WRITERS), update);
+router.post('/:id', authenticate, requireRole(...PAYREQ_WRITERS), (req, res) => {
   if (String(req.body?._method || req.query?._method || '').toUpperCase() === 'PUT') return update(req, res);
   return res.status(404).json({ message: `Not found: POST ${req.originalUrl}` });
 });

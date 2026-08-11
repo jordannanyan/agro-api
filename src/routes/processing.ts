@@ -1,6 +1,8 @@
 import { Router, Request, Response } from 'express';
 import pool from '../db/connection';
 import { authenticate } from '../middleware/auth';
+import { entityScope } from '../utils/entityScope';
+import { ENTITY_COL, processingScope } from '../utils/farmScope';
 
 export const router = Router();
 
@@ -44,14 +46,21 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
   const args: any[] = [];
   if (req.query.status)         { where.push('pr.status = ?'); args.push(req.query.status); }
   if (req.query.commodities_id) { where.push('pr.commodities_id = ?'); args.push(req.query.commodities_id); }
-  const sql = SELECT + (where.length ? ` WHERE ${where.join(' AND ')}` : '') + ' ORDER BY pr.date DESC, pr.id DESC';
+  // Same entity rule as purchasing — see utils/farmScope for how a run reaches its PT.
+  const scope = entityScope(req);
+  if (scope != null) { where.push(`${ENTITY_COL} = ?`); args.push(scope); }
+  const sql = SELECT + processingScope('pr')
+    + (where.length ? ` WHERE ${where.join(' AND ')}` : '') + ' ORDER BY pr.date DESC, pr.id DESC';
   const [rows] = await pool.query(sql, args);
   return res.json({ data: (rows as any[]).map(shape) });
 });
 
 // GET /api/processing/:id  (with contributing purchasings)
 router.get('/:id', authenticate, async (req: Request, res: Response) => {
-  const [rows] = await pool.query(SELECT + ' WHERE pr.id = ? LIMIT 1', [req.params.id]);
+  const scope = entityScope(req);
+  const sql = SELECT + processingScope('pr')
+    + ` WHERE pr.id = ?${scope != null ? ` AND ${ENTITY_COL} = ?` : ''} LIMIT 1`;
+  const [rows] = await pool.query(sql, scope != null ? [req.params.id, scope] : [req.params.id]);
   const list = rows as any[];
   if (!list.length) return res.status(404).json({ message: 'Processing not found' });
   const data = shape(list[0]);
