@@ -1,5 +1,6 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { crudRouter } from '../utils/crudFactory';
+import { warehouseEntityPredicate } from '../utils/farmScope';
 import pool from '../db/connection';
 import { authenticate } from '../middleware/auth';
 
@@ -142,6 +143,11 @@ export const warehousesRouter = crudRouter({
   searchColumns: ['warehouse_name'],
   orderBy: 'warehouse_name ASC',
   label: 'Warehouse',
+  // A warehouse belongs to a KTH, and the KTH to a PT. Scoping the list keeps
+  // another PT's warehouse out of the pickers on the stock-in / stock-out forms.
+  // The column is table-qualified: bare `id` would be ambiguous against the `id`
+  // of the warehouse row the subquery itself reads.
+  scopeSql: warehouseEntityPredicate('`warehouse`.`id`'),
 });
 
 // Compatibility (Flutter app): GET /warehouse[s]/kth/:kth_id
@@ -159,6 +165,7 @@ export const collectorsRouter = crudRouter({
   searchColumns: ['collector_name'],
   orderBy: 'collector_name ASC',
   label: 'Collector',
+  scopeSql: '(SELECT k.entities_id FROM kth k WHERE k.id = `collectors`.`kth_id`) = ?',
 });
 
 export const vendorsRouter = crudRouter({

@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express';
 import pool from '../db/connection';
 import { authenticate, AuthUser } from '../middleware/auth';
 import { upload, fileToPath } from '../middleware/upload';
-import { SYSTEM_ADMIN_ROLES } from '../utils/roles';
+import { SYSTEM_ADMIN_ROLES, ROLE } from '../utils/roles';
 
 // Polymorphic document layer: approvals / attachments / activities.
 // Mounted at /api/documents/:type/:id/(approvals|attachments|activities)
@@ -26,9 +26,37 @@ function checkType(req: Request, res: Response): boolean {
   return true;
 }
 
+/**
+ * Load the document these sub-resources hang off, and refuse callers from another PT.
+ *
+ * The approval chain, the attachments and the activity log are all *about* a
+ * document, so they are exactly as confidential as the document itself. Scoping
+ * only /purchase-requests and leaving these open meant another PT's chain, file
+ * list and history were readable — and its attachments writable — by anyone who
+ * knew an id. Returns null once the response has been sent.
+ */
+async function loadScopedDocument(req: Request, res: Response): Promise<any | null> {
+  const docType = req.params.type as DocType;
+  const [rows] = await pool.query(
+    `SELECT * FROM ${DOC_TABLE[docType]} WHERE id = ? LIMIT 1`, [req.params.id]);
+  const doc = (rows as any[])[0];
+  if (!doc) { res.status(404).json({ message: 'Document not found.' }); return null; }
+
+  const user = req.user;
+  if (!user || user.type !== 'User') {
+    res.status(403).json({ message: 'Staff access only.' }); return null;
+  }
+  const isAdmin = SYSTEM_ADMIN_ROLES.includes(user.roleCode as any);
+  if (!isAdmin && !user.roleCrossEntity && doc.entity_id != null && user.entityId !== doc.entity_id) {
+    res.status(403).json({ message: 'This document belongs to another entity.' }); return null;
+  }
+  return doc;
+}
+
 // ---- Approvals ----
 router.get('/:type/:id/approvals', authenticate, async (req, res) => {
   if (!checkType(req, res)) return;
+  if (!(await loadScopedDocument(req, res))) return;
   const [rows] = await pool.query(
     `SELECT da.*, r.role_code, r.role_name, u.name AS user_name
      FROM document_approvals da
@@ -163,6 +191,7 @@ router.post('/:type/:id/resubmit', authenticate, async (req: Request, res: Respo
 // ---- Attachments ----
 router.get('/:type/:id/attachments', authenticate, async (req, res) => {
   if (!checkType(req, res)) return;
+  if (!(await loadScopedDocument(req, res))) return;
   const [rows] = await pool.query(
     'SELECT * FROM document_attachments WHERE document_type = ? AND document_id = ? ORDER BY id DESC',
     [req.params.type, req.params.id]
@@ -172,6 +201,10 @@ router.get('/:type/:id/attachments', authenticate, async (req, res) => {
 
 router.post('/:type/:id/attachments', authenticate, upload.single('file'), async (req: Request, res: Response) => {
   if (!checkType(req, res)) return;
+  // Deliberately not gated on status: Finance uploads the transfer receipt after a
+  // payment request is already Paid, and a requester uploads revision evidence
+  // while the document sits in Revision. The entity is the line that matters.
+  if (!(await loadScopedDocument(req, res))) return;
   const path = fileToPath(req.file);
   if (!path) return res.status(422).json({ message: 'file is required' });
   const [result] = await pool.query(
@@ -185,6 +218,7 @@ router.post('/:type/:id/attachments', authenticate, upload.single('file'), async
 
 router.delete('/:type/:id/attachments/:attId', authenticate, async (req, res) => {
   if (!checkType(req, res)) return;
+  if (!(await loadScopedDocument(req, res))) return;
   await pool.query('DELETE FROM document_attachments WHERE id = ? AND document_type = ? AND document_id = ?',
     [req.params.attId, req.params.type, req.params.id]);
   return res.json({ message: 'Attachment deleted' });
@@ -193,6 +227,7 @@ router.delete('/:type/:id/attachments/:attId', authenticate, async (req, res) =>
 // ---- Activities (timeline) ----
 router.get('/:type/:id/activities', authenticate, async (req, res) => {
   if (!checkType(req, res)) return;
+  if (!(await loadScopedDocument(req, res))) return;
   const [rows] = await pool.query(
     `SELECT da.*, u.name AS user_name FROM document_activities da
      LEFT JOIN users u ON u.id = da.user_id
@@ -251,6 +286,16 @@ export function guardEdit(
  * rather than hard-coded: the chain comes from `approval_routes`, which an admin
  * may re-point from Settings, and a hard-coded map would quietly disagree with it.
  */
+/**
+ * Who raises each kind of document, for the one case the chain cannot answer:
+ * a Draft, which has no chain yet. Kept in step with db/seed.sql's approval_routes.
+ */
+const DEFAULT_REQUESTER_ROLE: Record<DocType, string> = {
+  PR: ROLE.FIELD_ADMIN,
+  PO: ROLE.PROCUREMENT,
+  PayReq: ROLE.PROCUREMENT,
+};
+
 async function requesterRoleCode(docType: DocType, docId: number): Promise<string | null> {
   const [rows] = await pool.query(
     `SELECT r.role_code FROM document_approvals da
@@ -284,6 +329,66 @@ export async function guardRequester(
     return `Only ${owner} may resubmit this document.`;
   }
   return null;
+}
+
+/**
+ * May this caller delete this document?
+ *
+ * Deleting was the one operation with no guard at all: any signed-in staff member
+ * could remove another PT's purchase request by id, mid-approval, and the approvals
+ * and attachments hanging off it were left behind as orphans.
+ *
+ * The rule: a document is destroyable only while nobody has acted on it. Draft
+ * belongs to whoever filed it and may be thrown away. Anything that has entered
+ * the chain — Pending, Revision, Approved, Rejected — is a record of decisions
+ * people made, so removing it is a system-administrator act, not a daily one.
+ * `Paid` is refused outright: money moved, and the trail has to survive.
+ */
+export async function guardDelete(
+  user: AuthUser | undefined,
+  docType: DocType,
+  docId: number,
+  doc: { status: string; entity_id?: number | null; requested_by_user_id?: number | null },
+): Promise<string | null> {
+  if (!user || user.type !== 'User') return 'Staff access only.';
+  if (doc.status === 'Paid') {
+    return 'A paid payment request cannot be deleted — the payment record must stay.';
+  }
+  if (isSystemAdmin(user)) return null;
+  if (!user.roleCrossEntity && doc.entity_id != null && user.entityId !== doc.entity_id) {
+    return 'This document belongs to another entity.';
+  }
+  if (doc.status !== 'Draft') {
+    return `Only a Draft can be deleted; this one is ${doc.status}. Ask an administrator if it really has to go.`;
+  }
+
+  // A draft has no approval chain yet, so — unlike resubmitting — who filed it
+  // cannot be read off one. A purchase request records its author, so that is the
+  // test; a PO and a PayReq do not, so they fall back to the role that raises them.
+  // Without this a Project Manager could delete a Field Admin's draft simply by
+  // sharing the entity with it.
+  if (doc.requested_by_user_id != null) {
+    return doc.requested_by_user_id === user.id
+      ? null
+      : 'Only the person who filed this draft may delete it.';
+  }
+  const owner = (await requesterRoleCode(docType, docId)) ?? DEFAULT_REQUESTER_ROLE[docType];
+  if (owner && user.roleCode !== owner) return `Only ${owner} may delete this draft.`;
+  return null;
+}
+
+/**
+ * Remove the polymorphic rows that hang off a deleted document.
+ *
+ * document_approvals / _attachments / _activities reference their document by
+ * (type, id) rather than by a foreign key, so nothing cascades: without this the
+ * rows survive their document and reattach themselves to whatever later takes that
+ * id back.
+ */
+export async function deleteDocumentChildren(docType: DocType, docId: number): Promise<void> {
+  for (const table of ['document_approvals', 'document_attachments', 'document_activities']) {
+    await pool.query(`DELETE FROM ${table} WHERE document_type = ? AND document_id = ?`, [docType, docId]);
+  }
 }
 
 /**

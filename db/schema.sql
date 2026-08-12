@@ -5,6 +5,17 @@
 --
 -- Run:  mysql -u root -p < db/schema.sql
 -- (Drops & recreates the `agro_supply` database — clean install.)
+--
+-- INVARIANT: a clean install from db/*.sql must produce exactly the schema a
+-- migrated production database has. Whenever a script under scripts/migrate*.js
+-- adds a table, column, key or view, the same change belongs here (or in
+-- views.sql) in the same release — otherwise a new environment silently comes up
+-- missing a feature. This drifted once already: `stock_out` and the two
+-- `pre_finance_distributions` columns existed only in the migration, so a fresh
+-- install had no outgoing side to its warehouse at all.
+--
+-- To check: build one database from db/*.sql, another from db/*.sql + every
+-- migration, and compare information_schema (tables, columns, keys, views).
 -- =============================================================================
 
 DROP DATABASE IF EXISTS `agro_supply`;
@@ -592,6 +603,29 @@ CREATE TABLE `saprodi_reorder_levels` (
   UNIQUE KEY `uq_wh_sapropdi` (`warehouse_id`, `sapropdi_id`)
 ) ENGINE=InnoDB;
 
+-- Stock Out header. The lines live in `pre_finance_distributions` (below), because
+-- the farmer's outstanding balance is computed from that table and moving them
+-- would change every debt figure; this groups rows that already had to exist.
+--
+-- Added to production by scripts/migrateStockOut2026-08.js. It is repeated here so
+-- a clean install matches a migrated database — without it the whole warehouse
+-- module is missing its outgoing side.
+CREATE TABLE `stock_out` (
+  `id`                INT AUTO_INCREMENT PRIMARY KEY,
+  `stock_out_number`  VARCHAR(60) NOT NULL,
+  `stock_out_date`    DATE NOT NULL,
+  `warehouse_id`      INT NOT NULL,
+  `issued_by_user_id` INT NULL,
+  `notes`             TEXT NULL,
+  `created_at`        DATETIME NULL,
+  `updated_at`        DATETIME NULL,
+  UNIQUE KEY `uq_stock_out_number` (`stock_out_number`),
+  KEY `fk_so_warehouse` (`warehouse_id`),
+  KEY `fk_so_user` (`issued_by_user_id`),
+  CONSTRAINT `fk_so_warehouse` FOREIGN KEY (`warehouse_id`)      REFERENCES `warehouse`(`id`),
+  CONSTRAINT `fk_so_user`      FOREIGN KEY (`issued_by_user_id`) REFERENCES `users`(`id`) ON DELETE SET NULL
+) ENGINE=InnoDB;
+
 -- -----------------------------------------------------------------------------
 -- CLUSTER: Pre-Finance (Distribusi saprodi = utang petani, dilunasi via cicilan)
 -- -----------------------------------------------------------------------------
@@ -603,6 +637,12 @@ CREATE TABLE `pre_finance_distributions` (
   `plot_id`             INT NULL,
   `commodities_id`      INT NULL,
   `sapropdi_id`         INT NULL,                 -- khusus Saprodi
+  -- Which warehouse the goods left, and the Stock Out document they left on.
+  -- Both were added to production by the 2026-08 warehouse migrations; a saprodi
+  -- line without a warehouse cannot be subtracted from any stock, which is the
+  -- drift `warehouse_id` was introduced to end.
+  `warehouse_id`        INT NULL,
+  `stock_out_id`        INT NULL,
   `quantity`            DECIMAL(15,3) NULL,
   `unit_id`             INT NULL,
   `price_per_unit`      DECIMAL(15,2) NULL,
@@ -620,7 +660,10 @@ CREATE TABLE `pre_finance_distributions` (
   CONSTRAINT `fk_pfd_commodity` FOREIGN KEY (`commodities_id`)      REFERENCES `commodities`(`id`) ON DELETE SET NULL,
   CONSTRAINT `fk_pfd_sapropdi`  FOREIGN KEY (`sapropdi_id`)         REFERENCES `sapropdi`(`id`) ON DELETE SET NULL,
   CONSTRAINT `fk_pfd_unit`      FOREIGN KEY (`unit_id`)             REFERENCES `units`(`id`) ON DELETE SET NULL,
-  CONSTRAINT `fk_pfd_shipuser`  FOREIGN KEY (`shipped_by_user_id`)  REFERENCES `users`(`id`) ON DELETE SET NULL
+  CONSTRAINT `fk_pfd_shipuser`  FOREIGN KEY (`shipped_by_user_id`)  REFERENCES `users`(`id`) ON DELETE SET NULL,
+  CONSTRAINT `fk_pfd_warehouse` FOREIGN KEY (`warehouse_id`)        REFERENCES `warehouse`(`id`) ON DELETE SET NULL,
+  -- RESTRICT: the lines are farmer debt, so a Stock Out cannot take them with it.
+  CONSTRAINT `fk_pfd_stock_out` FOREIGN KEY (`stock_out_id`)        REFERENCES `stock_out`(`id`) ON DELETE RESTRICT
 ) ENGINE=InnoDB;
 
 CREATE TABLE `pre_finance_installments` (

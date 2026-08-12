@@ -9,7 +9,8 @@
     "build": "tsc",
     "start": "node dist/server.js",
     "db:reset": "node scripts/dbReset.js",
-    "hash": "node scripts/hash.js"
+    "hash": "node scripts/hash.js",
+    "db:compare": "node scripts/compareSchema.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

@@ -3,6 +3,8 @@ import pool from '../db/connection';
 import { authenticate } from '../middleware/auth';
 import { upload, fileToPath } from '../middleware/upload';
 import { compressImages } from '../services/imageProcessor';
+import { entityScope } from '../utils/entityScope';
+import { distributionEntityPredicate, farmerEntityPredicate } from '../utils/farmScope';
 
 // -----------------------------------------------------------------------------
 // Distributions  /api/pre-finance/distributions
@@ -15,14 +17,20 @@ export const distributionsRouter = Router();
 const DIST_SELECT = `
   SELECT d.*, t.type_name, f.farmer_name, p.plot_name, s.sapropdi_name, u.unit_name,
          w.warehouse_name,
+         COALESCE(fk.entities_id, wk.entities_id) AS entity_id,
+         COALESCE(fe.entities_name, we.entities_name) AS entity_name,
          COALESCE(p.scheme, 'BeliPutus') AS scheme
   FROM pre_finance_distributions d
   LEFT JOIN pre_finance_types t ON t.id = d.pre_finance_type_id
   LEFT JOIN farmers f           ON f.id = d.farmer_id
+  LEFT JOIN kth fk              ON fk.id = f.kth_id
+  LEFT JOIN entities fe         ON fe.id = fk.entities_id
   LEFT JOIN plot p              ON p.id = d.plot_id
   LEFT JOIN sapropdi s          ON s.id = d.sapropdi_id
   LEFT JOIN units u             ON u.id = d.unit_id
   LEFT JOIN warehouse w         ON w.id = d.warehouse_id
+  LEFT JOIN kth wk              ON wk.id = w.kth_id
+  LEFT JOIN entities we         ON we.id = wk.entities_id
 `;
 
 const distFiles = upload.fields([
@@ -38,13 +46,20 @@ distributionsRouter.get('/', authenticate, async (req: Request, res: Response) =
   if (req.query.warehouse_id)        { where.push('d.warehouse_id = ?'); args.push(req.query.warehouse_id); }
   if (req.query.plot_id)             { where.push('d.plot_id = ?'); args.push(req.query.plot_id); }
   if (req.query.scheme)              { where.push("COALESCE(p.scheme, 'BeliPutus') = ?"); args.push(req.query.scheme); }
+  // "Riwayat Barang Keluar" is farmer debt and a warehouse movement at once, so it
+  // follows the same PT rule as both: the farmer's PT, or the issuing warehouse's
+  // when no farmer is named.
+  const scope = entityScope(req);
+  if (scope != null) { where.push(distributionEntityPredicate('d')); args.push(scope); }
   const sql = DIST_SELECT + (where.length ? ` WHERE ${where.join(' AND ')}` : '') + ' ORDER BY d.date DESC, d.id DESC';
   const [rows] = await pool.query(sql, args);
   return res.json({ data: rows });
 });
 
 distributionsRouter.get('/:id', authenticate, async (req, res) => {
-  const [rows] = await pool.query(DIST_SELECT + ' WHERE d.id = ? LIMIT 1', [req.params.id]);
+  const scope = entityScope(req);
+  const sql = DIST_SELECT + ` WHERE d.id = ?${scope != null ? ` AND ${distributionEntityPredicate('d')}` : ''} LIMIT 1`;
+  const [rows] = await pool.query(sql, scope != null ? [req.params.id, scope] : [req.params.id]);
   const list = rows as any[];
   if (!list.length) return res.status(404).json({ message: 'Distribution not found' });
   return res.json({ data: list[0] });
@@ -123,9 +138,20 @@ distributionsRouter.post('/:id/ship', authenticate, upload.single('delivery_proo
 });
 
 distributionsRouter.delete('/:id', authenticate, async (req, res) => {
-  const [result] = await pool.query('DELETE FROM pre_finance_distributions WHERE id = ?', [req.params.id]);
+ try {
+  // A distribution line is a farmer's debt. Another PT's is not this caller's to
+  // erase, so the delete is scoped exactly like the list it appears in.
+  // MariaDB does not accept a table alias in a single-table DELETE, so the
+  // predicate is qualified with the table name itself.
+  const scope = entityScope(req);
+  const sql = 'DELETE FROM pre_finance_distributions WHERE id = ?'
+    + (scope != null ? ` AND ${distributionEntityPredicate('pre_finance_distributions')}` : '');
+  const [result] = await pool.query(sql, scope != null ? [req.params.id, scope] : [req.params.id]);
   if (!(result as any).affectedRows) return res.status(404).json({ message: 'Distribution not found' });
   return res.json({ message: 'Distribution deleted' });
+  // Without this the route had no error path at all: a failing query became an
+  // unhandled rejection and the caller waited forever instead of seeing a 500.
+ } catch (err: any) { return res.status(500).json({ message: 'Server error', error: err.message }); }
 });
 
 // -----------------------------------------------------------------------------
@@ -152,6 +178,9 @@ installmentsRouter.get('/', authenticate, async (req: Request, res: Response) =>
   const where: string[] = [];
   const args: any[] = [];
   if (req.query.farmer_id) { where.push('i.farmer_id = ?'); args.push(req.query.farmer_id); }
+  // A repayment belongs to the PT that farms the debt.
+  const scope = entityScope(req);
+  if (scope != null) { where.push(farmerEntityPredicate('i.farmer_id')); args.push(scope); }
   const sql = INST_SELECT + (where.length ? ` WHERE ${where.join(' AND ')}` : '') + ' ORDER BY i.date DESC, i.id DESC';
   const [rows] = await pool.query(sql, args);
   return res.json({ data: rows });
@@ -223,17 +252,22 @@ outstandingRouter.get('/', authenticate, async (req: Request, res: Response) => 
   const where: string[] = ['outstanding <> 0'];
   const args: any[] = [];
   if (req.query.farmer_id) { where.push('farmer_id = ?'); args.push(req.query.farmer_id); }
+  const scope = entityScope(req);
+  if (scope != null) { where.push(farmerEntityPredicate('farmer_id')); args.push(scope); }
   const [rows] = await pool.query(
     `SELECT * FROM v_pre_finance_outstanding WHERE ${where.join(' AND ')} ORDER BY farmer_name, type_name`, args);
   return res.json({ data: rows });
 });
 
 // Summary per farmer (all types combined).
-outstandingRouter.get('/summary', authenticate, async (_req: Request, res: Response) => {
+outstandingRouter.get('/summary', authenticate, async (req: Request, res: Response) => {
+  const scope = entityScope(req);
   const [rows] = await pool.query(
     `SELECT farmer_id, farmer_name, SUM(distributed_total) AS distributed_total,
             SUM(paid_total) AS paid_total, SUM(outstanding) AS outstanding
-     FROM v_pre_finance_outstanding GROUP BY farmer_id, farmer_name HAVING outstanding <> 0
-     ORDER BY outstanding DESC`);
+     FROM v_pre_finance_outstanding
+     ${scope != null ? `WHERE ${farmerEntityPredicate('farmer_id')}` : ''}
+     GROUP BY farmer_id, farmer_name HAVING outstanding <> 0
+     ORDER BY outstanding DESC`, scope != null ? [scope] : []);
   return res.json({ data: rows });
 });

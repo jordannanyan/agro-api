@@ -18,8 +18,15 @@ cp .env.example .env          # adjust DB creds / JWT_SECRET
 npm run db:reset              # creates DB `agro_supply`, runs schema + seed + views
 npm run dev                  # http://localhost:3002
 ```
-`db:reset` computes a real bcrypt hash for the seed users at runtime.
-Default staff login: **finance01 / password** (also intern01, pm01, head01, director01).
+`db:reset` recomputes the seed bcrypt hash at runtime; loading `db/seed.sql`
+directly with the `mysql` client also works, because the hash committed in the file
+is a real bcrypt of `password`.
+
+Seeded staff logins (username **or** email, password `password`):
+**jordan.nanyan** (Super Admin) · **elma.aryanti** / **alfina.octa** (Field Admin
+SNBS / JNBS) · **edo.santeyo** / **eren.efendi** (Project Manager SNBS / JNBS) ·
+**putri.gandini** (Procurement) · **nyi.arum** (Finance Manager) ·
+**saskia.vianacika** (Finance Staff) · **rizky.sudirman** (Director).
 
 ## Auth
 ```
@@ -80,3 +87,13 @@ Send `Authorization: Bearer <token>` on every other request.
 - Generated columns: `purchasing.total_value`, `selling.total_revenue/rejected_volume`,
   `*_items.total_cost/total`, `profit_sharing.net_profit`.
 - The DB schema lives in `db/schema.sql`, views in `db/views.sql`, seed in `db/seed.sql`.
+- **A clean install must equal a migrated database.** Anything a `scripts/migrate*.js`
+  adds to production belongs in `db/schema.sql` / `db/views.sql` in the same release.
+  To verify, build one database from `db/*.sql`, another from `db/*.sql` + every
+  migration, then:
+  ```bash
+  node scripts/compareSchema.js agro_fresh agro_migrated   # must print IDENTICAL
+  ```
+  This drifted once: `stock_out` and `pre_finance_distributions.warehouse_id/stock_out_id`
+  existed only in the migrations, so fresh environments had no Stock Out at all and
+  `v_saprodi_stock` subtracted every warehouse's issues from every warehouse.

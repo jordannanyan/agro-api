@@ -27,6 +27,12 @@ export interface CrudConfig {
   hideColumns?: string[];
   /** If set, list is auto-filtered by entity scope on this column (e.g. entities_id). */
   scopeEntityColumn?: string;
+  /**
+   * Entity scope for tables that reach their PT indirectly — a warehouse or a
+   * collector belongs to a KTH, and the KTH to the entity. An SQL predicate with
+   * exactly one `?`; see utils/farmScope for ready-made ones.
+   */
+  scopeSql?: string;
   /** Human label for messages. Default = table. */
   label?: string;
 }
@@ -74,9 +80,12 @@ export function crudRouter(cfg: CrudConfig): Router {
         where.push(`(${ors.join(' OR ')})`);
         cfg.searchColumns.forEach(() => args.push(`%${search}%`));
       }
-      if (cfg.scopeEntityColumn) {
+      if (cfg.scopeEntityColumn || cfg.scopeSql) {
         const scope = entityScope(req);
-        if (scope != null) { where.push(`\`${cfg.scopeEntityColumn}\` = ?`); args.push(scope); }
+        if (scope != null) {
+          where.push(cfg.scopeSql ?? `\`${cfg.scopeEntityColumn}\` = ?`);
+          args.push(scope);
+        }
       }
 
       const sql =

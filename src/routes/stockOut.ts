@@ -2,6 +2,8 @@ import { Router, Request, Response } from 'express';
 import pool from '../db/connection';
 import { authenticate } from '../middleware/auth';
 import { nextDocNumber } from '../utils/docNumber';
+import { entityScope } from '../utils/entityScope';
+import { warehouseEntityPredicate } from '../utils/farmScope';
 
 // -----------------------------------------------------------------------------
 // Stock Out  /api/stock-out
@@ -21,13 +23,18 @@ import { nextDocNumber } from '../utils/docNumber';
 // -----------------------------------------------------------------------------
 export const router = Router();
 
+// Every list in this cluster carries the owning PT, so a reader who legitimately
+// sees several (the NBSV admins, the cross-entity roles) can tell them apart.
 const SELECT = `
   SELECT so.*, w.warehouse_name, u.name AS issued_by_name,
+         ent.id AS entity_id, ent.entities_name AS entity_name,
          (SELECT COUNT(*) FROM pre_finance_distributions d WHERE d.stock_out_id = so.id) AS line_count,
          (SELECT COALESCE(SUM(d.quantity), 0) FROM pre_finance_distributions d WHERE d.stock_out_id = so.id) AS total_qty,
          (SELECT COALESCE(SUM(d.total_amount), 0) FROM pre_finance_distributions d WHERE d.stock_out_id = so.id) AS total_amount
   FROM stock_out so
   LEFT JOIN warehouse w ON w.id = so.warehouse_id
+  LEFT JOIN kth wk      ON wk.id = w.kth_id
+  LEFT JOIN entities ent ON ent.id = wk.entities_id
   LEFT JOIN users u     ON u.id = so.issued_by_user_id
 `;
 
@@ -60,6 +67,10 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
     const args: any[] = [];
     if (req.query.warehouse_id) { where.push('so.warehouse_id = ?'); args.push(req.query.warehouse_id); }
     if (req.query.search)       { where.push('so.stock_out_number LIKE ?'); args.push(`%${req.query.search}%`); }
+    // A warehouse belongs to a KTH, which belongs to a PT — so does everything
+    // issued from it. Staff bound to one PT see only their own warehouses' issues.
+    const scope = entityScope(req);
+    if (scope != null) { where.push(warehouseEntityPredicate('so.warehouse_id')); args.push(scope); }
     const sql = SELECT + (where.length ? ` WHERE ${where.join(' AND ')}` : '')
       + ' ORDER BY so.stock_out_date DESC, so.id DESC';
     const [rows] = await pool.query(sql, args);
@@ -70,7 +81,9 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
 // GET /api/stock-out/:id
 router.get('/:id', authenticate, async (req: Request, res: Response) => {
   try {
-    const [rows] = await pool.query(SELECT + ' WHERE so.id = ? LIMIT 1', [req.params.id]);
+    const scope = entityScope(req);
+    const sql = SELECT + ` WHERE so.id = ?${scope != null ? ` AND ${warehouseEntityPredicate('so.warehouse_id')}` : ''} LIMIT 1`;
+    const [rows] = await pool.query(sql, scope != null ? [req.params.id, scope] : [req.params.id]);
     const list = rows as any[];
     if (!list.length) return res.status(404).json({ message: 'Stock out not found' });
     const data = list[0];
@@ -179,6 +192,14 @@ router.post('/', authenticate, async (req: Request, res: Response) => {
 // DELETE /api/stock-out/:id
 router.delete('/:id', authenticate, async (req: Request, res: Response) => {
   try {
+    // Another PT's stock movement is not this caller's to remove.
+    const scope = entityScope(req);
+    if (scope != null) {
+      const [own] = await pool.query(
+        `SELECT id FROM stock_out WHERE id = ? AND ${warehouseEntityPredicate('warehouse_id')} LIMIT 1`,
+        [req.params.id, scope]);
+      if (!(own as any[]).length) return res.status(404).json({ message: 'Stock out not found' });
+    }
     // The lines are farmer debt, so this refuses rather than cascading. Removing the
     // debt has to be a deliberate act on the distribution itself.
     const [c] = await pool.query(

@@ -2,7 +2,10 @@ import { Router, Request, Response } from 'express';
 import pool from '../db/connection';
 import { authenticate, requireRole } from '../middleware/auth';
 import { nextDocNumber } from '../utils/docNumber';
-import { seedApprovalSteps, syncDocumentStatus, resetRevisionSteps, guardEdit, guardRequester } from './documents';
+import {
+  seedApprovalSteps, syncDocumentStatus, resetRevisionSteps,
+  guardEdit, guardRequester, guardDelete, deleteDocumentChildren,
+} from './documents';
 import { ROLE, PAYMENT_EXECUTOR_ROLES } from '../utils/roles';
 import { inheritEntity, entityScope, canSeeEntity } from '../utils/entityScope';
 import { PENDING_STEP_COLUMNS, pendingStepJoin } from '../utils/pendingStep';
@@ -298,9 +301,18 @@ router.post('/:id/pay', authenticate, requireRole(...PAYMENT_EXECUTOR_ROLES), as
 });
 
 // DELETE /api/payment-requests/:id
-router.delete('/:id', authenticate, async (req: Request, res: Response) => {
-  const [result] = await pool.query('DELETE FROM payment_requests WHERE id = ?', [req.params.id]);
-  if (!(result as any).affectedRows) return res.status(404).json({ message: 'Payment request not found' });
+router.delete('/:id', authenticate, requireRole(...PAYREQ_WRITERS), async (req: Request, res: Response) => {
+  const id = Number(req.params.id);
+  const [ex] = await pool.query('SELECT * FROM payment_requests WHERE id = ? LIMIT 1', [id]);
+  const prev = (ex as any[])[0];
+  if (!prev) return res.status(404).json({ message: 'Payment request not found' });
+
+  // guardDelete refuses a paid request outright — see its comment.
+  const denied = await guardDelete(req.user, 'PayReq', id, prev);
+  if (denied) return res.status(403).json({ message: denied });
+
+  await pool.query('DELETE FROM payment_requests WHERE id = ?', [id]);
+  await deleteDocumentChildren('PayReq', id);
   return res.json({ message: 'Payment request deleted' });
 });
 

@@ -2,7 +2,10 @@ import { Router, Request, Response } from 'express';
 import pool from '../db/connection';
 import { authenticate } from '../middleware/auth';
 import { nextDocNumber } from '../utils/docNumber';
-import { seedApprovalSteps, syncDocumentStatus, resetRevisionSteps, guardEdit, guardRequester } from './documents';
+import {
+  seedApprovalSteps, syncDocumentStatus, resetRevisionSteps,
+  guardEdit, guardRequester, guardDelete, deleteDocumentChildren,
+} from './documents';
 import { resolveWriteEntity, entityScope, canSeeEntity } from '../utils/entityScope';
 import { PENDING_STEP_COLUMNS, pendingStepJoin } from '../utils/pendingStep';
 
@@ -217,8 +220,30 @@ router.post('/:id', authenticate, (req, res) => {
 
 // DELETE /api/purchase-requests/:id
 router.delete('/:id', authenticate, async (req: Request, res: Response) => {
-  const [result] = await pool.query('DELETE FROM purchase_requests WHERE id = ?', [req.params.id]);
-  if (!(result as any).affectedRows) return res.status(404).json({ message: 'PR not found' });
+  const id = Number(req.params.id);
+  const [ex] = await pool.query('SELECT * FROM purchase_requests WHERE id = ? LIMIT 1', [id]);
+  const prev = (ex as any[])[0];
+  if (!prev) return res.status(404).json({ message: 'PR not found' });
+
+  const denied = await guardDelete(req.user, 'PR', id, prev);
+  if (denied) return res.status(403).json({ message: denied });
+
+  // Orders and payments descend from the request and inherit its entity. The
+  // foreign key would quietly set their pointer to NULL, leaving a PO that claims
+  // an entity nothing supports any more — so refuse instead of orphaning them.
+  const [deps] = await pool.query(
+    `SELECT (SELECT COUNT(*) FROM purchase_orders WHERE purchase_request_id = ?) AS po,
+            (SELECT COUNT(*) FROM payment_requests WHERE purchase_request_id = ?) AS pay`,
+    [id, id]);
+  const { po, pay } = (deps as any[])[0];
+  if (Number(po) || Number(pay)) {
+    return res.status(409).json({
+      message: `PR ini masih dipakai ${Number(po)} PO dan ${Number(pay)} payment request. Hapus dokumen turunannya lebih dulu.`,
+    });
+  }
+
+  await pool.query('DELETE FROM purchase_requests WHERE id = ?', [id]);
+  await deleteDocumentChildren('PR', id);
   return res.json({ message: 'PR deleted' });
 });
 

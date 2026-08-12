@@ -2,7 +2,10 @@ import { Router, Request, Response } from 'express';
 import pool from '../db/connection';
 import { authenticate, requireRole } from '../middleware/auth';
 import { nextDocNumber } from '../utils/docNumber';
-import { seedApprovalSteps, syncDocumentStatus, resetRevisionSteps, guardEdit, guardRequester } from './documents';
+import {
+  seedApprovalSteps, syncDocumentStatus, resetRevisionSteps,
+  guardEdit, guardRequester, guardDelete, deleteDocumentChildren,
+} from './documents';
 import { ROLE } from '../utils/roles';
 import { inheritEntity, entityScope, canSeeEntity } from '../utils/entityScope';
 import { PENDING_STEP_COLUMNS, pendingStepJoin } from '../utils/pendingStep';
@@ -265,9 +268,30 @@ router.post('/:id', authenticate, requireRole(...PO_WRITERS), (req, res) => {
 });
 
 // DELETE /api/purchase-orders/:id
-router.delete('/:id', authenticate, async (req: Request, res: Response) => {
-  const [result] = await pool.query('DELETE FROM purchase_orders WHERE id = ?', [req.params.id]);
-  if (!(result as any).affectedRows) return res.status(404).json({ message: 'PO not found' });
+router.delete('/:id', authenticate, requireRole(...PO_WRITERS), async (req: Request, res: Response) => {
+  const id = Number(req.params.id);
+  const [ex] = await pool.query('SELECT * FROM purchase_orders WHERE id = ? LIMIT 1', [id]);
+  const prev = (ex as any[])[0];
+  if (!prev) return res.status(404).json({ message: 'PO not found' });
+
+  const denied = await guardDelete(req.user, 'PO', id, prev);
+  if (denied) return res.status(403).json({ message: denied });
+
+  // Payments raised against the order, and goods already received under it, both
+  // point back here. Deleting would leave a payment for an order nobody can read.
+  const [deps] = await pool.query(
+    `SELECT (SELECT COUNT(*) FROM payment_requests WHERE purchase_order_id = ?) AS pay,
+            (SELECT COUNT(*) FROM stock_in WHERE purchase_order_id = ?) AS si`,
+    [id, id]);
+  const { pay, si } = (deps as any[])[0];
+  if (Number(pay) || Number(si)) {
+    return res.status(409).json({
+      message: `PO ini masih dipakai ${Number(pay)} payment request dan ${Number(si)} penerimaan barang. Hapus dokumen turunannya lebih dulu.`,
+    });
+  }
+
+  await pool.query('DELETE FROM purchase_orders WHERE id = ?', [id]);
+  await deleteDocumentChildren('PO', id);
   return res.json({ message: 'PO deleted' });
 });
 

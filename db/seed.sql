@@ -6,7 +6,12 @@
 -- =============================================================================
 USE `agro_supply`;
 
-SET @PW := '$2y$12$e0MYzXyjpJS7Pd0RVvHwHe1DYQyDzYqZ0zK7Yy8mQF3q8m9pC1yfa'; -- "password"
+-- Real bcrypt($2y$, cost 12) of "password" — verified, not a placeholder. The
+-- value that stood here before was a hand-made lookalike that matched nothing, so
+-- a database seeded straight from this file could not be logged into at all.
+-- scripts/dbReset.js overwrites this line with a freshly computed hash; loading
+-- the file with the mysql client does not, which is why it has to be valid here.
+SET @PW := '$2y$12$Lr1i7GB267U0dF97snB5YezDZC2W155ZZSvik59rvMmRc45/GJDA6'; -- "password"
 
 -- Entities. SNBS & JNBS are the operational PTs (they own land, plots, trees).
 -- WLI holds Procurement + Finance; NBSV holds Super Admin + Admin. Neither owns land,

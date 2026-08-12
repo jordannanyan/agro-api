@@ -80,6 +80,45 @@ export function sellingScope(alias = 's'): string {
   LEFT JOIN kth        es_k  ON es_k.id  = COALESCE(es_w.kth_id, ${kthFromContributions('es_pr')})`;
 }
 
+// ---------------------------------------------------------------------------
+// Predicate form, for queries whose joins should not be touched.
+//
+// The warehouse cluster (stock in, stock out, distributions, stock card, reorder)
+// keys off `warehouse_id`, and several of those queries are unions or read from
+// views where adding joins would change the shape of the result. A correlated
+// scalar subquery states the same rule without disturbing anything. Each takes
+// exactly one `?`.
+// ---------------------------------------------------------------------------
+
+/** The PT behind a warehouse column: warehouse → KTH → entity. */
+export function warehouseEntityPredicate(column: string): string {
+  return `(SELECT es_wk.entities_id FROM warehouse es_w
+             JOIN kth es_wk ON es_wk.id = es_w.kth_id
+            WHERE es_w.id = ${column}) = ?`;
+}
+
+/** The PT behind a farmer column: farmer → KTH → entity. */
+export function farmerEntityPredicate(column: string): string {
+  return `(SELECT es_fk.entities_id FROM farmers es_f
+             JOIN kth es_fk ON es_fk.id = es_f.kth_id
+            WHERE es_f.id = ${column}) = ?`;
+}
+
+/**
+ * A distribution line (goods issued to a farmer) belongs to the farmer's PT, and
+ * to the issuing warehouse's when no farmer is recorded. Farmer first: the line's
+ * lasting effect is the farmer's debt, and the debt belongs to whoever farms it.
+ * Reading exactly one of the two keeps SNBS + JNBS adding up to the whole.
+ */
+export function distributionEntityPredicate(alias = 'd'): string {
+  return `COALESCE(
+    (SELECT es_fk.entities_id FROM farmers es_f
+       JOIN kth es_fk ON es_fk.id = es_f.kth_id WHERE es_f.id = ${alias}.farmer_id),
+    (SELECT es_wk.entities_id FROM warehouse es_w
+       JOIN kth es_wk ON es_wk.id = es_w.kth_id WHERE es_w.id = ${alias}.warehouse_id)
+  ) = ?`;
+}
+
 /** Join the given predicates into a WHERE clause, dropping the empty ones. */
 export function whereClause(...parts: (string | null | undefined)[]): string {
   const list = parts.filter(Boolean) as string[];

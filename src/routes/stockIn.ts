@@ -2,13 +2,18 @@ import { Router, Request, Response } from 'express';
 import pool from '../db/connection';
 import { authenticate } from '../middleware/auth';
 import { nextDocNumber } from '../utils/docNumber';
+import { entityScope } from '../utils/entityScope';
+import { warehouseEntityPredicate } from '../utils/farmScope';
 
 export const router = Router();
 
 const SELECT = `
-  SELECT si.*, w.warehouse_name, po.po_number, u.name AS received_by_name
+  SELECT si.*, w.warehouse_name, po.po_number, u.name AS received_by_name,
+         ent.id AS entity_id, ent.entities_name AS entity_name
   FROM stock_in si
   LEFT JOIN warehouse w        ON w.id = si.warehouse_id
+  LEFT JOIN kth wk             ON wk.id = w.kth_id
+  LEFT JOIN entities ent       ON ent.id = wk.entities_id
   LEFT JOIN purchase_orders po ON po.id = si.purchase_order_id
   LEFT JOIN users u            ON u.id = si.received_by_user_id
 `;
@@ -28,6 +33,9 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
   if (req.query.warehouse_id) { where.push('si.warehouse_id = ?'); args.push(req.query.warehouse_id); }
   if (req.query.status)       { where.push('si.status = ?'); args.push(req.query.status); }
   if (req.query.search)       { where.push('si.stock_in_number LIKE ?'); args.push(`%${req.query.search}%`); }
+  // Same rule as stock out — goods received into a warehouse belong to its PT.
+  const scope = entityScope(req);
+  if (scope != null) { where.push(warehouseEntityPredicate('si.warehouse_id')); args.push(scope); }
   const sql = SELECT + (where.length ? ` WHERE ${where.join(' AND ')}` : '') + ' ORDER BY si.id DESC';
   const [rows] = await pool.query(sql, args);
   return res.json({ data: rows });
@@ -35,7 +43,9 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
 
 // GET /api/stock-in/:id
 router.get('/:id', authenticate, async (req: Request, res: Response) => {
-  const [rows] = await pool.query(SELECT + ' WHERE si.id = ? LIMIT 1', [req.params.id]);
+  const scope = entityScope(req);
+  const sql = SELECT + ` WHERE si.id = ?${scope != null ? ` AND ${warehouseEntityPredicate('si.warehouse_id')}` : ''} LIMIT 1`;
+  const [rows] = await pool.query(sql, scope != null ? [req.params.id, scope] : [req.params.id]);
   const list = rows as any[];
   if (!list.length) return res.status(404).json({ message: 'Stock In not found' });
   const data = list[0];

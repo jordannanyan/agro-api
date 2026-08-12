@@ -6,16 +6,26 @@ USE `agro_supply`;
 
 -- Stok saprodi TERHITUNG per gudang:
 --   Σ(stock_in_items.received_qty) − Σ(pre_finance_distributions.quantity, type=Saprodi)
+--
+-- IN and OUT are grouped the same way — by (warehouse, saprodi) — so a warehouse
+-- only carries what actually moved through it. Grouping OUT by saprodi alone (as
+-- this view once did) subtracted every warehouse's issues from every warehouse,
+-- so with two warehouses each one read short and Stock Out refused valid issues.
+-- Distributions with no warehouse are left out rather than smeared across all of
+-- them; scripts/migrateWarehouseStock2026-08.js reports any that remain.
+--
+-- Keep this identical to VIEW_SQL in that migration script: production got the
+-- rebuilt view from there, a clean install gets it from here.
 DROP VIEW IF EXISTS `v_saprodi_stock`;
 CREATE VIEW `v_saprodi_stock` AS
 SELECT
-  w.id                        AS warehouse_id,
-  w.warehouse_name            AS warehouse_name,
-  s.id                        AS sapropdi_id,
-  s.sapropdi_name             AS sapropdi_name,
-  COALESCE(si.total_in, 0)    AS total_in,
-  COALESCE(dist.total_out, 0) AS total_out,
-  COALESCE(si.total_in, 0) - COALESCE(dist.total_out, 0) AS remaining
+  w.id                     AS warehouse_id,
+  w.warehouse_name         AS warehouse_name,
+  s.id                     AS sapropdi_id,
+  s.sapropdi_name          AS sapropdi_name,
+  COALESCE(si.total_in, 0) AS total_in,
+  COALESCE(d.total_out, 0) AS total_out,
+  COALESCE(si.total_in, 0) - COALESCE(d.total_out, 0) AS remaining
 FROM warehouse w
 CROSS JOIN sapropdi s
 LEFT JOIN (
@@ -26,13 +36,15 @@ LEFT JOIN (
   GROUP BY si.warehouse_id, sii.sapropdi_id
 ) si ON si.warehouse_id = w.id AND si.sapropdi_id = s.id
 LEFT JOIN (
-  SELECT pfd.sapropdi_id, SUM(pfd.quantity) AS total_out
+  SELECT pfd.warehouse_id, pfd.sapropdi_id, SUM(pfd.quantity) AS total_out
   FROM pre_finance_distributions pfd
   JOIN pre_finance_types t ON t.id = pfd.pre_finance_type_id
-  WHERE pfd.sapropdi_id IS NOT NULL AND t.type_name = 'Saprodi'
-  GROUP BY pfd.sapropdi_id
-) dist ON dist.sapropdi_id = s.id
-WHERE si.total_in IS NOT NULL OR dist.total_out IS NOT NULL;
+  WHERE pfd.sapropdi_id IS NOT NULL
+    AND pfd.warehouse_id IS NOT NULL
+    AND t.type_name = 'Saprodi'
+  GROUP BY pfd.warehouse_id, pfd.sapropdi_id
+) d ON d.warehouse_id = w.id AND d.sapropdi_id = s.id
+WHERE si.total_in IS NOT NULL OR d.total_out IS NOT NULL;
 
 -- Outstanding petani per pre-finance type:
 --   Σ distributions.total_amount(type=T) − Σ installment_details.amount(type=T)
