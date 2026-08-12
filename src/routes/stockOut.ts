@@ -4,6 +4,7 @@ import { authenticate } from '../middleware/auth';
 import { nextDocNumber } from '../utils/docNumber';
 import { entityScope } from '../utils/entityScope';
 import { warehouseEntityPredicate } from '../utils/farmScope';
+import { respondList } from '../utils/pagination';
 
 // -----------------------------------------------------------------------------
 // Stock Out  /api/stock-out
@@ -73,8 +74,7 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
     if (scope != null) { where.push(warehouseEntityPredicate('so.warehouse_id')); args.push(scope); }
     const sql = SELECT + (where.length ? ` WHERE ${where.join(' AND ')}` : '')
       + ' ORDER BY so.stock_out_date DESC, so.id DESC';
-    const [rows] = await pool.query(sql, args);
-    return res.json({ data: rows });
+    return respondList(req, res, sql, args);
   } catch (err: any) { return res.status(500).json({ message: 'Server error', error: err.message }); }
 });
 

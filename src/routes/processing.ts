@@ -3,6 +3,7 @@ import pool from '../db/connection';
 import { authenticate } from '../middleware/auth';
 import { entityScope } from '../utils/entityScope';
 import { ENTITY_COL, processingScope } from '../utils/farmScope';
+import { respondList } from '../utils/pagination';
 
 export const router = Router();
 
@@ -49,10 +50,10 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
   // Same entity rule as purchasing — see utils/farmScope for how a run reaches its PT.
   const scope = entityScope(req);
   if (scope != null) { where.push(`${ENTITY_COL} = ?`); args.push(scope); }
+  if (req.query.search) { where.push('pr.processing_code LIKE ?'); args.push(`%${req.query.search}%`); }
   const sql = SELECT + processingScope('pr')
     + (where.length ? ` WHERE ${where.join(' AND ')}` : '') + ' ORDER BY pr.date DESC, pr.id DESC';
-  const [rows] = await pool.query(sql, args);
-  return res.json({ data: (rows as any[]).map(shape) });
+  return respondList(req, res, sql, args, shape);
 });
 
 // GET /api/processing/:id  (with contributing purchasings)

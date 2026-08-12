@@ -5,6 +5,7 @@ import { upload, fileToPath } from '../middleware/upload';
 import { compressImages } from '../services/imageProcessor';
 import { entityScope } from '../utils/entityScope';
 import { ENTITY_COL, purchasingScope } from '../utils/farmScope';
+import { respondList } from '../utils/pagination';
 
 export const router = Router();
 
@@ -71,10 +72,17 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
   // dashboard counts by, so the KPI and this table cannot disagree.
   const scope = entityScope(req);
   if (scope != null) { where.push(`${ENTITY_COL} = ?`); args.push(scope); }
+  if (req.query.search) {
+    // Paging and a client-side filter cannot coexist: filtering one page would hide
+    // matches on every other. The search moves to the query instead.
+    where.push('(p.receipt_invoice LIKE ? OR pl.plot_name LIKE ? OR f.farmer_name LIKE ? OR col.collector_name LIKE ?)');
+    const q = `%${req.query.search}%`;
+    args.push(q, q, q, q);
+  }
   const sql = SELECT + purchasingScope('p')
     + (where.length ? ` WHERE ${where.join(' AND ')}` : '') + ' ORDER BY p.date DESC, p.id DESC';
-  const [rows] = await pool.query(sql, args);
-  return res.json({ data: (rows as any[]).map(shape) });
+  return respondList(req, res, sql, args, shape,
+    'COALESCE(SUM(quantity),0) AS quantity, COALESCE(SUM(total_value),0) AS total_value');
 });
 
 // GET /api/purchasing/:id

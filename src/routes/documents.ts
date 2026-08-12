@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express';
 import pool from '../db/connection';
 import { authenticate, AuthUser } from '../middleware/auth';
 import { upload, fileToPath } from '../middleware/upload';
-import { SYSTEM_ADMIN_ROLES, ROLE } from '../utils/roles';
+import { SYSTEM_ADMIN_ROLES, WRITE_OVERRIDE_ROLES, ROLE } from '../utils/roles';
 
 // Polymorphic document layer: approvals / attachments / activities.
 // Mounted at /api/documents/:type/:id/(approvals|attachments|activities)
@@ -100,7 +100,8 @@ router.post('/:type/:id/approvals/:stepId/action', authenticate, async (req: Req
   // Note: Director no longer bypasses other roles' steps — with the 2026-08 flow the
   // Director owns explicit steps on PO and PayReq, so a blanket bypass would hollow out
   // exactly the control the flow is meant to enforce.
-  const isSystemAdmin = SYSTEM_ADMIN_ROLES.includes(user.roleCode as any);
+  // Super Admin only: an Admin sees every document but does not sign for anyone.
+  const isSystemAdmin = WRITE_OVERRIDE_ROLES.includes(user.roleCode as any);
   if (!isSystemAdmin && (!step.role_code || user.roleCode !== step.role_code)) {
     return res.status(403).json({ message: `Only ${step.role_name || 'the assigned role'} may act on this step.` });
   }
@@ -249,8 +250,9 @@ export default router;
 // -----------------------------------------------------------------------------
 export const EDITABLE_STATUSES = ['Draft', 'Revision'];
 
-function isSystemAdmin(user: AuthUser): boolean {
-  return SYSTEM_ADMIN_ROLES.includes(user.roleCode as any);
+/** May this user override a business rule? Super Admin only — see utils/roles. */
+function canOverride(user: AuthUser): boolean {
+  return WRITE_OVERRIDE_ROLES.includes(user.roleCode as any);
 }
 
 /**
@@ -271,7 +273,7 @@ export function guardEdit(
   if (nextStatus === 'Draft' && doc.status === 'Revision') {
     return 'A document in revision cannot be moved back to draft — edit it and resubmit.';
   }
-  if (isSystemAdmin(user)) return null;
+  if (canOverride(user)) return null;
   if (!user.roleCrossEntity && doc.entity_id != null && user.entityId !== doc.entity_id) {
     return 'This document belongs to another entity.';
   }
@@ -318,7 +320,7 @@ export async function guardRequester(
   docId: number,
   doc: { entity_id?: number | null; requested_by_user_id?: number | null },
 ): Promise<string | null> {
-  if (isSystemAdmin(user)) return null;
+  if (canOverride(user)) return null;
   if (!user.roleCrossEntity && doc.entity_id != null && user.entityId !== doc.entity_id) {
     return 'This document belongs to another entity.';
   }
@@ -354,7 +356,7 @@ export async function guardDelete(
   if (doc.status === 'Paid') {
     return 'A paid payment request cannot be deleted — the payment record must stay.';
   }
-  if (isSystemAdmin(user)) return null;
+  if (canOverride(user)) return null;
   if (!user.roleCrossEntity && doc.entity_id != null && user.entityId !== doc.entity_id) {
     return 'This document belongs to another entity.';
   }

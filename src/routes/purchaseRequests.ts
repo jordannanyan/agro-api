@@ -1,11 +1,12 @@
 import { Router, Request, Response } from 'express';
 import pool from '../db/connection';
-import { authenticate } from '../middleware/auth';
+import { authenticate, requireRole } from '../middleware/auth';
 import { nextDocNumber } from '../utils/docNumber';
 import {
   seedApprovalSteps, syncDocumentStatus, resetRevisionSteps,
   guardEdit, guardRequester, guardDelete, deleteDocumentChildren,
 } from './documents';
+import { ROLE } from '../utils/roles';
 import { resolveWriteEntity, entityScope, canSeeEntity } from '../utils/entityScope';
 import { PENDING_STEP_COLUMNS, pendingStepJoin } from '../utils/pendingStep';
 
@@ -77,8 +78,13 @@ function itemCols(it: any) {
   };
 }
 
+// Who may file a purchase request. Admin is absent on purpose: they supervise the
+// flow rather than take part in it.
+const PR_WRITERS = [ROLE.FIELD_ADMIN, ROLE.PROJECT_MANAGER, ROLE.PROCUREMENT,
+                    ROLE.FINANCE_MANAGER, ROLE.DIRECTOR, ROLE.SUPER_ADMIN];
+
 // POST /api/purchase-requests  body: {entity_id, request_date, date_required, status, items:[...]}
-router.post('/', authenticate, async (req: Request, res: Response) => {
+router.post('/', authenticate, requireRole(...PR_WRITERS), async (req: Request, res: Response) => {
   const conn = await pool.getConnection();
   try {
     const b = req.body || {};
@@ -212,7 +218,7 @@ const update = async (req: Request, res: Response) => {
     conn.release();
   }
 };
-router.put('/:id', authenticate, update);
+router.put('/:id', authenticate, requireRole(...PR_WRITERS), update);
 router.post('/:id', authenticate, (req, res) => {
   if (String(req.body?._method || req.query?._method || '').toUpperCase() === 'PUT') return update(req, res);
   return res.status(404).json({ message: `Not found: POST ${req.originalUrl}` });

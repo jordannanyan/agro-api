@@ -4,6 +4,7 @@ import { authenticate } from '../middleware/auth';
 import { nextDocNumber } from '../utils/docNumber';
 import { entityScope } from '../utils/entityScope';
 import { warehouseEntityPredicate } from '../utils/farmScope';
+import { respondList } from '../utils/pagination';
 
 export const router = Router();
 
@@ -37,8 +38,7 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
   const scope = entityScope(req);
   if (scope != null) { where.push(warehouseEntityPredicate('si.warehouse_id')); args.push(scope); }
   const sql = SELECT + (where.length ? ` WHERE ${where.join(' AND ')}` : '') + ' ORDER BY si.id DESC';
-  const [rows] = await pool.query(sql, args);
-  return res.json({ data: rows });
+  return respondList(req, res, sql, args);
 });
 
 // GET /api/stock-in/:id

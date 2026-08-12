@@ -25,6 +25,8 @@ import profitSharingRoutes from './routes/profitSharing';
 import distributedSaprodiRoutes from './routes/distributedSaprodi';
 import { distributionsRouter, installmentsRouter, outstandingRouter } from './routes/preFinance';
 import { treesRouter, treeMonSubRouter, treeMonitoringRouter, polygonPointsRouter, mapRouter } from './routes/gis';
+import { authenticate } from './middleware/auth';
+import { operationsReadOnly } from './middleware/readOnly';
 import {
   entitiesRouter, rolesRouter, budgetCodesRouter, unitsRouter, paymentMethodsRouter,
   preFinanceTypesRouter, sapropdiRouter, commoditiesRouter, gradesRouter, offtakersRouter,
@@ -81,12 +83,16 @@ app.use('/api/approval-routes', approvalRoutesRouter);
 app.use('/api/reorder-levels', reorderLevelsRouter);
 app.use('/api/budgets', budgetsRouter);
 
+// Business transactions are read-only for roles that only supervise them (Admin).
+// Master data, users and roles are deliberately outside this guard.
+const opsGuard = [authenticate, operationsReadOnly];
+
 // Traceability
 app.use('/api/farmers', farmersRoutes);
 app.use('/api/plots', plotsRoutes);
-app.use('/api/purchasing', purchasingRoutes);
-app.use('/api/processing', processingRoutes);
-app.use('/api/selling', sellingRoutes);
+app.use('/api/purchasing', ...opsGuard, purchasingRoutes);
+app.use('/api/processing', ...opsGuard, processingRoutes);
+app.use('/api/selling', ...opsGuard, sellingRoutes);
 
 // GIS / Map
 app.use('/api/trees/:treeId/monitorings', treeMonSubRouter);
@@ -96,19 +102,19 @@ app.use('/api/polygon-points', polygonPointsRouter);
 app.use('/api/map', mapRouter);
 
 // Procurement
-app.use('/api/purchase-requests', purchaseRequestsRoutes);
-app.use('/api/purchase-orders', purchaseOrdersRoutes);
-app.use('/api/payment-requests', paymentRequestsRoutes);
-app.use('/api/stock-in', stockInRoutes);
-app.use('/api/stock-out', stockOutRoutes);
-app.use('/api/documents', documentsRoutes);
+app.use('/api/purchase-requests', ...opsGuard, purchaseRequestsRoutes);
+app.use('/api/purchase-orders', ...opsGuard, purchaseOrdersRoutes);
+app.use('/api/payment-requests', ...opsGuard, paymentRequestsRoutes);
+app.use('/api/stock-in', ...opsGuard, stockInRoutes);
+app.use('/api/stock-out', ...opsGuard, stockOutRoutes);
+app.use('/api/documents', ...opsGuard, documentsRoutes);
 
 // Warehouse (calculated stock)
 app.use('/api/warehouse-stock', warehouseStockRoutes);
 
 // Pre-finance
-app.use('/api/pre-finance/distributions', distributionsRouter);
-app.use('/api/pre-finance/installments', installmentsRouter);
+app.use('/api/pre-finance/distributions', ...opsGuard, distributionsRouter);
+app.use('/api/pre-finance/installments', ...opsGuard, installmentsRouter);
 app.use('/api/pre-finance/outstanding', outstandingRouter);
 
 // Per-plot saprodi handouts for the mobile app (reads pre_finance_distributions, type Saprodi).

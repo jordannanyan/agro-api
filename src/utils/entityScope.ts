@@ -1,4 +1,5 @@
 import { Request } from 'express';
+import { SYSTEM_ADMIN_ROLES } from './roles';
 
 // Resolve which entity's data the caller may see.
 //  - Entities (non-superadmin) → locked to their own id.
@@ -16,6 +17,15 @@ export function entityScope(req: Request): number | null {
     return u.id;
   }
   if (u.type === 'User') {
+    // System administrators are never scoped. They sit at NBSV, which owns no
+    // farmer group and therefore no data at all, so pinning them to their own
+    // entity would show them an empty application. Checked by role rather than by
+    // relying on `roles.is_cross_entity`, which is editable from Settings — one
+    // flag turned off there should not blind the administrators.
+    if (SYSTEM_ADMIN_ROLES.includes(u.roleCode as any)) {
+      const q = req.query.entity_id;
+      return q != null && q !== '' ? Number(q) : null;
+    }
     // Cross-entity roles (Procurement, Finance, Director) sit at WLI or have no
     // entity at all, yet they work across every operational PT. Pinning them to
     // their own entity_id would scope them to an org unit that owns no data.

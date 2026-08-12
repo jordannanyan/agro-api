@@ -115,7 +115,7 @@ function bodyToCols(b: any) {
 
 // POST /api/payment-requests  (CHECK: PR or PO source required)
 router.post('/', authenticate, requireRole(
-  ROLE.PROCUREMENT, ROLE.FINANCE_MANAGER, ROLE.DIRECTOR, ROLE.SUPER_ADMIN, ROLE.ADMIN,
+  ROLE.PROCUREMENT, ROLE.FINANCE_MANAGER, ROLE.DIRECTOR, ROLE.SUPER_ADMIN,
 ), async (req: Request, res: Response) => {
   try {
     const b = req.body || {};
@@ -224,7 +224,7 @@ const update = async (req: Request, res: Response) => {
   }
 };
 // Editing a payment request is bounded by the same roles that may raise one.
-const PAYREQ_WRITERS = [ROLE.PROCUREMENT, ROLE.FINANCE_MANAGER, ROLE.DIRECTOR, ROLE.SUPER_ADMIN, ROLE.ADMIN];
+const PAYREQ_WRITERS = [ROLE.PROCUREMENT, ROLE.FINANCE_MANAGER, ROLE.DIRECTOR, ROLE.SUPER_ADMIN];
 router.put('/:id', authenticate, requireRole(...PAYREQ_WRITERS), update);
 router.post('/:id', authenticate, requireRole(...PAYREQ_WRITERS), (req, res) => {
   if (String(req.body?._method || req.query?._method || '').toUpperCase() === 'PUT') return update(req, res);

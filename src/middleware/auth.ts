@@ -79,6 +79,12 @@ export async function issueToken(kind: UserKind, id: number, name: string): Prom
 }
 
 export async function authenticate(req: Request, res: Response, next: NextFunction) {
+  // Idempotent: routers apply this per-route, and some are also mounted behind an
+  // outer authenticate (see operationsReadOnly, which needs the role before the
+  // handler runs). Without this the token lookup and the user + role queries would
+  // run twice for every one of those requests.
+  if (req.user) return next();
+
   const header = req.headers.authorization || '';
   if (!header.startsWith('Bearer ')) {
     return res.status(401).json({ message: 'Token not provided.' });

@@ -88,7 +88,7 @@ router.get('/:id', authenticate, async (req: Request, res: Response) => {
 
 // POST /api/purchase-orders  body: {..., items:[{pr_item_id,order_qty,unit_price}], extra_costs:[{description,amount}]}
 router.post('/', authenticate, requireRole(
-  ROLE.PROCUREMENT, ROLE.PROJECT_MANAGER, ROLE.FINANCE_MANAGER, ROLE.DIRECTOR, ROLE.SUPER_ADMIN, ROLE.ADMIN,
+  ROLE.PROCUREMENT, ROLE.PROJECT_MANAGER, ROLE.FINANCE_MANAGER, ROLE.DIRECTOR, ROLE.SUPER_ADMIN,
 ), async (req: Request, res: Response) => {
   const conn = await pool.getConnection();
   try {
@@ -260,7 +260,7 @@ const update = async (req: Request, res: Response) => {
 };
 // Editing a PO is bounded by the same roles that may raise one — a Field Admin
 // files requests, not orders.
-const PO_WRITERS = [ROLE.PROCUREMENT, ROLE.PROJECT_MANAGER, ROLE.FINANCE_MANAGER, ROLE.DIRECTOR, ROLE.SUPER_ADMIN, ROLE.ADMIN];
+const PO_WRITERS = [ROLE.PROCUREMENT, ROLE.PROJECT_MANAGER, ROLE.FINANCE_MANAGER, ROLE.DIRECTOR, ROLE.SUPER_ADMIN];
 router.put('/:id', authenticate, requireRole(...PO_WRITERS), update);
 router.post('/:id', authenticate, requireRole(...PO_WRITERS), (req, res) => {
   if (String(req.body?._method || req.query?._method || '').toUpperCase() === 'PUT') return update(req, res);

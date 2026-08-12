@@ -5,6 +5,7 @@ import { upload, fileToPath } from '../middleware/upload';
 import { compressImages } from '../services/imageProcessor';
 import { entityScope } from '../utils/entityScope';
 import { distributionEntityPredicate, farmerEntityPredicate } from '../utils/farmScope';
+import { respondList } from '../utils/pagination';
 
 // -----------------------------------------------------------------------------
 // Distributions  /api/pre-finance/distributions
@@ -51,9 +52,15 @@ distributionsRouter.get('/', authenticate, async (req: Request, res: Response) =
   // when no farmer is named.
   const scope = entityScope(req);
   if (scope != null) { where.push(distributionEntityPredicate('d')); args.push(scope); }
+  // The screen searches by farmer; with paging that has to happen in the query.
+  if (req.query.search) {
+    where.push('(f.farmer_name LIKE ? OR s.sapropdi_name LIKE ? OR p.plot_name LIKE ?)');
+    const q = `%${req.query.search}%`;
+    args.push(q, q, q);
+  }
   const sql = DIST_SELECT + (where.length ? ` WHERE ${where.join(' AND ')}` : '') + ' ORDER BY d.date DESC, d.id DESC';
-  const [rows] = await pool.query(sql, args);
-  return res.json({ data: rows });
+  return respondList(req, res, sql, args, undefined,
+    'COALESCE(SUM(total_amount),0) AS total_amount');
 });
 
 distributionsRouter.get('/:id', authenticate, async (req, res) => {
