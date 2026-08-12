@@ -80,7 +80,15 @@ DROP VIEW IF EXISTS `v_budget_actual`;
 CREATE VIEW `v_budget_actual` AS
 SELECT
   po.entity_id                 AS entity_id,
-  CAST(YEAR(po.order_date) AS CHAR) COLLATE utf8mb4_unicode_ci AS period,
+  -- The period is compared against `budgets`.`period` (utf8mb4_unicode_ci), so it
+  -- has to carry that collation or the join fails on mixed collations.
+  --
+  -- CHARACTER SET is stated explicitly: a bare `CAST(... AS CHAR)` takes the
+  -- *connection's* charset, so loading this file from a client defaulting to
+  -- utf8mb3 (the mysql CLI on Ubuntu, and cp850 on Windows) made the COLLATE
+  -- invalid and the statement failed — after the DROP above had already run,
+  -- leaving the database with no v_budget_actual at all.
+  CAST(YEAR(po.order_date) AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci AS period,
   po.budget_code_id            AS budget_code_id,
   SUM(poi.total)               AS actual_amount
 FROM purchase_orders po
