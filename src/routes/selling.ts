@@ -1,11 +1,27 @@
 import { Router, Request, Response } from 'express';
 import pool from '../db/connection';
 import { authenticate } from '../middleware/auth';
+import { crudRouter } from '../utils/crudFactory';
 import { entityScope } from '../utils/entityScope';
 import { ENTITY_COL, sellingScope } from '../utils/farmScope';
 import { respondList } from '../utils/pagination';
 
 export const router = Router();
+
+// Freight, sorting, loading — costs of getting one sale out of the door. They are
+// shared across the batch's depositors per kg when a profit share is worked out,
+// so they must hang off the sale rather than off a plot.
+//
+// Mounted before `/:id` so `/costs` is not read as a selling id.
+router.use('/costs', crudRouter({
+  table: 'selling_costs',
+  columns: ['selling_id', 'pre_finance_type_id', 'description', 'amount'],
+  required: ['selling_id'],
+  numeric: ['selling_id', 'pre_finance_type_id', 'amount'],
+  filterColumns: ['selling_id', 'pre_finance_type_id'],
+  orderBy: 'id ASC',
+  label: 'Selling cost',
+}));
 
 // scheme derived through processing → purchasing → plot (best-effort: majority scheme of contributions).
 const SELECT = `
@@ -13,7 +29,8 @@ const SELECT = `
          pr.processing_code AS processing__processing_code, pr.commodities_id AS processing__commodities_id,
          o.offtaker_name AS offtaker__offtaker_name,
          w.warehouse_name AS warehouse__warehouse_name,
-         c.commodities_name AS commodity__commodities_name
+         c.commodities_name AS commodity__commodities_name,
+         (SELECT COALESCE(SUM(sc.amount), 0) FROM selling_costs sc WHERE sc.selling_id = s.id) AS total_cost
   FROM selling s
   LEFT JOIN processing pr  ON pr.id = s.processing_id
   LEFT JOIN offtaker o     ON o.id = s.offtaker_id
@@ -74,6 +91,9 @@ router.post('/', authenticate, async (req: Request, res: Response) => {
       delivered_volume: b.delivered_volume != null ? Number(b.delivered_volume) : 0,
       accepted_volume: b.accepted_volume != null ? Number(b.accepted_volume) : 0,
       price_per_unit: b.price_per_unit != null ? Number(b.price_per_unit) : 0,
+      // NULL = fall back to the selling PT's default share.
+      profit_share_farmer_pct: b.profit_share_farmer_pct != null && b.profit_share_farmer_pct !== ''
+        ? Number(b.profit_share_farmer_pct) : null,
       created_at: new Date(),
       updated_at: new Date(),
     };
@@ -105,6 +125,10 @@ const update = async (req: Request, res: Response) => {
     set('delivered_volume', b.delivered_volume != null ? Number(b.delivered_volume) : undefined);
     set('accepted_volume', b.accepted_volume != null ? Number(b.accepted_volume) : undefined);
     set('price_per_unit', b.price_per_unit != null ? Number(b.price_per_unit) : undefined);
+    set('profit_share_farmer_pct', b.profit_share_farmer_pct !== undefined
+      ? (b.profit_share_farmer_pct === '' || b.profit_share_farmer_pct === null
+          ? null : Number(b.profit_share_farmer_pct))
+      : undefined);
     const keys = Object.keys(updates);
     if (keys.length) {
       updates.updated_at = new Date(); keys.push('updated_at');

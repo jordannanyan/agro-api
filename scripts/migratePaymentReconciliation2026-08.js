@@ -8,6 +8,9 @@
 //   3. bank_statement_lines    — one row per transaction line, with its verdict
 //   4. backfill — issue a code to every payment request already approved and not
 //      yet paid, because those are exactly the ones somebody is about to transfer
+//   5. reformat — codes issued by the first version of this script were written
+//      PAY26-7K4Q3, and the bank's remark field rejects the hyphen. Same code,
+//      written the way it can actually be typed
 //
 // Every step is idempotent, so the script can be re-run safely.
 //
@@ -180,6 +183,30 @@ async function run() {
     }
   } else {
     say('· backfill kode dilewati pada dry run (kolomnya belum ada)');
+  }
+
+  // 5. Reformat hyphenated codes ------------------------------------------------
+  //
+  // The first version of this script wrote PAY26-7K4Q3. The bank's transfer remark
+  // field will not accept a hyphen, so the separator is a space now. Only the
+  // punctuation changes — the body and its check character are untouched, so a code
+  // somebody already wrote down stays correct, and the matcher accepts either form
+  // in any case.
+  if (await columnExists(conn, 'payment_requests', 'payment_code')) {
+    const [old] = await conn.query(
+      "SELECT id, payreq_number, payment_code FROM payment_requests WHERE payment_code LIKE '%-%'");
+    if (old.length) {
+      todo.push(`ubah ${old.length} kode lama bertanda hubung menjadi berspasi`);
+      if (APPLY) {
+        for (const p of old) {
+          const fixed = p.payment_code.replace(/-/g, ' ');
+          await conn.query('UPDATE payment_requests SET payment_code = ? WHERE id = ?', [fixed, p.id]);
+          say(`  ${p.payreq_number}: ${p.payment_code} → ${fixed}`);
+        }
+      }
+    } else {
+      say('✓ tidak ada kode lama bertanda hubung');
+    }
   }
 
   await conn.end();

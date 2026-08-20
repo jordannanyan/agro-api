@@ -124,7 +124,9 @@ app.use('/api/pre-finance/outstanding', outstandingRouter);
 app.use('/api/distributed-sapropdi', distributedSaprodiRoutes);
 
 // Profit sharing / Finance / Dashboard
-app.use('/api/profit-sharing', profitSharingRoutes);
+// Under opsGuard: booking an investment or settling a share is a business
+// transaction, not master-data upkeep, so the supervising roles read it only.
+app.use('/api/profit-sharing', ...opsGuard, profitSharingRoutes);
 app.use('/api/finance', financeRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 

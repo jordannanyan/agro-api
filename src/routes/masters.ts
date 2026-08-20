@@ -8,8 +8,10 @@ import { authenticate } from '../middleware/auth';
 
 const entitiesCrud = crudRouter({
   table: 'entities',
-  columns: ['entities_name', 'location', 'username', 'password', 'is_superadmin', 'entity_type'],
+  columns: ['entities_name', 'location', 'username', 'password', 'is_superadmin', 'entity_type',
+            'profit_share_farmer_pct'],
   required: ['entities_name', 'username'],
+  numeric: ['profit_share_farmer_pct'],
   boolean: ['is_superadmin'],
   hashColumns: ['password'],
   hideColumns: ['password'],

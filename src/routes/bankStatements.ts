@@ -23,7 +23,7 @@ import { authenticate, requireRole } from '../middleware/auth';
 import { uploadStatement, STATEMENT_PATH } from '../middleware/upload';
 import { PAYMENT_EXECUTOR_ROLES, WRITE_OVERRIDE_ROLES } from '../utils/roles';
 import { findPaymentCodes } from '../utils/paymentCode';
-import { parseStatement, StatementFormatError, StatementRow } from '../utils/statementParser';
+import { parseStatement, checkStatement, StatementFormatError, StatementRow } from '../utils/statementParser';
 import { settlePaymentRequest } from '../utils/payments';
 import { respondList } from '../utils/pagination';
 
@@ -144,9 +144,22 @@ async function judge(
 
 const fmt = (n: number) => `Rp ${Number(n || 0).toLocaleString('id-ID')}`;
 
+/**
+ * Accounts this statement may belong to, if the deployment chooses to say so.
+ *
+ * Empty by default. When set (comma-separated in BANK_ACCOUNTS), a statement for
+ * any other account is flagged — the reconciliation would otherwise happily settle
+ * payments against somebody else's bank account.
+ */
+const KNOWN_ACCOUNTS = String(process.env.BANK_ACCOUNTS || '')
+  .split(',').map((s) => s.trim()).filter(Boolean);
+
 /** Read the upload, parse it, and judge every line. Writes nothing. */
 async function analyse(file: Express.Multer.File, password?: string | null) {
   const parsed = await parseStatement(file.buffer, file.originalname, password);
+  const checks = checkStatement(parsed);
+  const accountKnown = !KNOWN_ACCOUNTS.length
+    || (!!checks.account_number && KNOWN_ACCOUNTS.includes(checks.account_number));
 
   // Lines already on record — one query rather than one per line.
   const hashes = parsed.rows.map((r) => r.hash);
@@ -165,7 +178,7 @@ async function analyse(file: Express.Multer.File, password?: string | null) {
     seen.add(line.hash); // a repeated line inside one file is still a repeat
     verdicts.push(v);
   }
-  return { parsed, verdicts };
+  return { parsed, verdicts, checks: { ...checks, account_known: accountKnown } };
 }
 
 function summarise(verdicts: LineVerdict[]) {
@@ -220,12 +233,14 @@ router.post('/preview', authenticate, requireRole(...RECONCILERS),
     try {
       // The password only ever lives in this request: it opens the file and is
       // never stored, logged, or written into the import record.
-      const { parsed, verdicts } = await analyse(req.file!, req.body?.password);
+      const { parsed, verdicts, checks } = await analyse(req.file!, req.body?.password);
       return res.json({
         message: 'Pratinjau rekonsiliasi',
         data: {
           file_name: req.file!.originalname,
           columns: parsed.columns,
+          statement: parsed.summary,
+          checks,
           summary: summarise(verdicts),
           lines: verdicts.map(shape),
         },
@@ -242,8 +257,28 @@ router.post('/', authenticate, requireRole(...RECONCILERS),
     if (rejectUpload(req, res)) return;
     try {
       const user = req.user!;
-      const { parsed, verdicts } = await analyse(req.file!, req.body?.password);
+      const { parsed, verdicts, checks } = await analyse(req.file!, req.body?.password);
       const summary = summarise(verdicts);
+
+      // A statement that contradicts its own totals is not evidence of anything, and
+      // settling payments from it would put that contradiction into the payment
+      // record. Refused outright rather than partially applied: the preview already
+      // showed the person what the file contains, so nothing here is a surprise.
+      if (!checks.arithmetic_ok) {
+        const why: string[] = [];
+        if (!checks.totals.ok) {
+          why.push(`total transaksi tidak sama dengan ringkasan bank (terbaca masuk ${fmt(checks.totals.parsed_in)} / keluar ${fmt(checks.totals.parsed_out)}, tertulis masuk ${fmt(checks.totals.stated_in ?? 0)} / keluar ${fmt(checks.totals.stated_out ?? 0)})`);
+        }
+        if (!checks.closing.ok) why.push('saldo akhir tidak sama dengan saldo awal ditambah mutasi');
+        if (!checks.balance_chain.ok) {
+          why.push(`rantai saldo putus di ${checks.balance_chain.breaks} baris (pertama di baris ${checks.balance_chain.first_break_row})`);
+        }
+        return res.status(422).json({
+          message: 'File ditolak — aritmetika di dalamnya tidak konsisten, yang berarti isinya sudah berubah '
+            + 'sejak diterbitkan bank: ' + why.join('; ') + '. Unduh ulang rekening koran langsung dari bank.',
+          data: { checks },
+        });
+      }
 
       const dates = parsed.rows.map((r) => r.date).filter(Boolean).sort() as string[];
 
@@ -310,7 +345,10 @@ router.post('/', authenticate, requireRole(...RECONCILERS),
         message: paid
           ? `${paid} payment request ditandai Paid dari rekening koran`
           : 'Tidak ada payment request yang cocok pada file ini',
-        data: { id: importId, file_name: req.file!.originalname, summary: { ...summary, paid }, lines: results },
+        data: {
+          id: importId, file_name: req.file!.originalname, statement: parsed.summary, checks,
+          summary: { ...summary, paid }, lines: results,
+        },
       });
     } catch (err: any) {
       if (err instanceof StatementFormatError) return res.status(422).json({ message: err.message });

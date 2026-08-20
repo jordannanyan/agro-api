@@ -5,16 +5,24 @@
 // starts: banks put an account header, a logo and a blank row or two above it, and
 // that preamble changes between exports. Everything is found by column *name*.
 //
-// Layout it is written for (bilingual, two lines per header cell):
+// The real layout, taken from an actual export rather than guessed at:
 //
-//   No | Tanggal / Date | Keterangan / Remarks | Dana Masuk (IDR) | Dana Keluar (IDR) | Saldo (IDR)
+//   rows 1-14   letterhead, account holder, account number, period, and a summary
+//               block (opening balance, totals in/out, closing balance)
+//   row  16     Indonesian header: No | Tanggal | Keterangan | Dana Masuk (IDR) | ...
+//   row  17     the same header in English: No | Date | Remarks | Incoming ...
+//   rows 18+    two spreadsheet rows per transaction — the date on the first, the
+//               clock time on the second, with the number, remark, amounts and
+//               running balance repeated on both. Cells are merged across many
+//               columns, so one value appears several times in a row.
 //
-// where a single transaction spans several visual lines — the date carries a time
-// underneath it, and the remark runs to three or four lines naming the counterparty.
+// Reading it naively counts every transaction twice, which is exactly what the
+// first version of this parser did.
 
 import ExcelJS from 'exceljs';
 import crypto from 'crypto';
 import officecrypto from 'officecrypto-tool';
+import JSZip from 'jszip';
 
 export interface StatementRow {
   /** Row number as printed in the file's own "No" column, when it has one. */
@@ -30,10 +38,52 @@ export interface StatementRow {
   hash: string;
 }
 
+/**
+ * The block the bank prints above the table: whose account, which period, and its
+ * own arithmetic. Every field is optional — an export that omits one is still
+ * readable, it just cannot be cross-checked as thoroughly.
+ */
+export interface StatementSummary {
+  account_number: string | null;
+  period: string | null;
+  opening_balance: number | null;
+  closing_balance: number | null;
+  total_in: number | null;
+  total_out: number | null;
+}
+
+/**
+ * What the file says about where it came from.
+ *
+ * A Mandiri e-statement names itself three times over: `Application` in
+ * docProps/app.xml, and dc:creator / dc:title in docProps/core.xml, all naming
+ * "PT. Bank Mandiri (Persero) Tbk" and "Electronic Statement Livin by Mandiri".
+ *
+ * `application` is the one that discriminates, and it took an experiment to learn
+ * why: opening the file and saving it again keeps dc:creator and dc:title — they
+ * travel with the document — but rewrites Application to the program that saved it
+ * ("Microsoft Excel"). So a file whose creator still says Mandiri while its
+ * Application says something else has been through an editor, and says so.
+ *
+ * None of this is proof. The properties are plain text inside the package and
+ * anyone determined can write them back. They catch the careless, not the careful.
+ */
+export interface StatementIdentity {
+  application: string | null;
+  creator: string | null;
+  title: string | null;
+  /** The producing application names the bank. */
+  looks_like_bank: boolean;
+  /** Claims to be the bank's, but was last written by an editor. */
+  resaved: boolean;
+}
+
 export interface ParsedStatement {
   rows: StatementRow[];
   /** Which header names were found, for the error message when they were not. */
   columns: Record<string, number>;
+  summary: StatementSummary;
+  identity: StatementIdentity;
 }
 
 export class StatementFormatError extends Error {}
@@ -195,7 +245,7 @@ async function unlock(buffer: Buffer, password?: string | null): Promise<Buffer>
 }
 
 /** The file as a rectangle of raw cell values, whatever its type. */
-async function toMatrix(buffer: Buffer, filename: string, password?: string | null): Promise<any[][]> {
+async function toMatrix(buffer: Buffer, filename: string): Promise<any[][]> {
   const ext = (filename.split('.').pop() || '').toLowerCase();
   const wb = new ExcelJS.Workbook();
 
@@ -207,7 +257,7 @@ async function toMatrix(buffer: Buffer, filename: string, password?: string | nu
     return text.split(/\r?\n/).map((line) => splitCsvLine(line, delim));
   }
 
-  await wb.xlsx.load((await unlock(buffer, password)) as any);
+  await wb.xlsx.load(buffer as any);
   const ws = wb.worksheets[0];
   if (!ws) throw new StatementFormatError('File tidak berisi lembar kerja apa pun.');
 
@@ -217,6 +267,48 @@ async function toMatrix(buffer: Buffer, filename: string, password?: string | nu
     matrix.push(values.slice(1));
   });
   return matrix;
+}
+
+const NO_IDENTITY: StatementIdentity = {
+  application: null, creator: null, title: null, looks_like_bank: false, resaved: false,
+};
+
+const BANK_NAME = /bank\s*mandiri/i;
+const BANK_TITLE = /e-?statement|electronic\s*statement/i;
+
+/**
+ * Read docProps out of the xlsx package.
+ *
+ * ExcelJS surfaces dc:creator and dc:title but not `Application`, which is the
+ * field that actually distinguishes the bank's own export from a copy that has
+ * been through a spreadsheet editor — so the package is opened directly for it.
+ */
+async function readIdentity(plain: Buffer): Promise<StatementIdentity> {
+  try {
+    const zip = await JSZip.loadAsync(plain);
+    const read = async (name: string) => {
+      const f = zip.file(name);
+      return f ? await f.async('string') : '';
+    };
+    const app = await read('docProps/app.xml');
+    const core = await read('docProps/core.xml');
+    const pick = (xml: string, tag: string) => {
+      const m = new RegExp(`<${tag}[^>]*>([^<]*)</${tag}>`).exec(xml);
+      return m ? m[1].trim() || null : null;
+    };
+    const application = pick(app, 'Application');
+    const creator = pick(core, 'dc:creator');
+    const title = pick(core, 'dc:title');
+    const claimsBank = (!!creator && BANK_NAME.test(creator)) || (!!title && BANK_TITLE.test(title));
+    const producedByBank = !!application && BANK_NAME.test(application);
+    return {
+      application, creator, title,
+      looks_like_bank: producedByBank && claimsBank,
+      resaved: claimsBank && !producedByBank,
+    };
+  } catch {
+    return NO_IDENTITY; // unreadable package: the parser below will say so properly
+  }
 }
 
 /** A CSV line, honouring quotes so a remark containing the delimiter survives. */
@@ -239,6 +331,79 @@ function splitCsvLine(line: string, delim: string): string[] {
 }
 
 /**
+ * The block the bank prints above the table.
+ *
+ * Worth the trouble because it is the bank's own arithmetic over the same rows:
+ * opening balance, the two totals, closing balance. Anyone who edits a transaction
+ * has to correct all four to stay consistent, and they are the only figures in the
+ * file that can contradict the rows underneath them.
+ */
+function readSummary(matrix: any[][], headerIdx: number): StatementSummary {
+  const out: StatementSummary = {
+    account_number: null, period: null,
+    opening_balance: null, closing_balance: null, total_in: null, total_out: null,
+  };
+
+  // Cells are merged, so one logical value repeats across a run of columns. Reading
+  // the distinct values left to right gives back the line as a person sees it.
+  for (let r = 0; r < headerIdx; r++) {
+    const cells: string[] = [];
+    (matrix[r] || []).forEach((c) => {
+      const t = flatten(cellText(c));
+      if (t && t !== cells[cells.length - 1]) cells.push(t);
+    });
+    if (!cells.length) continue;
+
+    // One printed line often carries two labelled fields side by side — the account
+    // holder's name on the left and the period on the right. So a value is read
+    // relative to *its own* label, never as "the first colon on the line": that
+    // shortcut reported the account holder as the statement period.
+    const labelAt = (re: RegExp) => cells.findIndex((c) => re.test(c));
+
+    /** The text just past the colon that follows this label. */
+    const textFor = (re: RegExp): string | null => {
+      const i = labelAt(re);
+      if (i < 0) return null;
+      for (let j = i; j < Math.min(cells.length, i + 4); j++) {
+        if (cells[j] === ':' || cells[j].endsWith(':')) return cells[j + 1] ?? null;
+      }
+      return cells[i + 1] ?? null;
+    };
+
+    /** The last number appearing after this label — the figure it introduces. */
+    const numberFor = (re: RegExp): number | null => {
+      const i = labelAt(re);
+      if (i < 0) return null;
+      for (let j = cells.length - 1; j > i; j--) {
+        const n = parseAmount(cells[j]);
+        if (n) return n;
+      }
+      return null;
+    };
+
+    const RE = {
+      account: /nomor\s*rekening|account\s*number/i,
+      period: /periode|^period$/i,
+      opening: /saldo\s*awal|initial\s*balance/i,
+      closing: /saldo\s*akhir|closing\s*balance/i,
+      totalIn: /dana\s*masuk|incoming\s*transactions/i,
+      totalOut: /dana\s*keluar|outgoing\s*transactions/i,
+    };
+
+    if (out.account_number === null) {
+      const v = textFor(RE.account);
+      out.account_number = v ? v.replace(/\s+/g, '') : null;
+    }
+    if (out.period === null) out.period = textFor(RE.period);
+    if (out.opening_balance === null) out.opening_balance = numberFor(RE.opening);
+    if (out.closing_balance === null) out.closing_balance = numberFor(RE.closing);
+    if (out.total_in === null) out.total_in = numberFor(RE.totalIn);
+    if (out.total_out === null) out.total_out = numberFor(RE.totalOut);
+  }
+  return out;
+}
+
+/**
  * Parse a statement export into transaction rows.
  *
  * `password` is only needed for the encrypted exports the bank e-mails out; it is
@@ -253,22 +418,32 @@ export async function parseStatement(
   filename: string,
   password?: string | null,
 ): Promise<ParsedStatement> {
-  const matrix = await toMatrix(buffer, filename, password);
+  const isCsv = (filename.split('.').pop() || '').toLowerCase() === 'csv';
+  // Unlocked once and shared: decrypting twice would ask the same password to do
+  // the same work, and the properties have to come from the same bytes as the rows.
+  const plain = isCsv ? buffer : await unlock(buffer, password);
+  const matrix = await toMatrix(plain, filename);
+  const identity = isCsv ? NO_IDENTITY : await readIdentity(plain);
   if (!matrix.length) throw new StatementFormatError('File kosong.');
 
   // ── Find the header row. Two columns have to agree before a row is believed:
   // the word "Keterangan" alone also appears in the account summary above the table.
-  let headerIdx = -1;
-  let columns: Partial<Record<ColumnKey, number>> = {};
-  for (let r = 0; r < Math.min(matrix.length, 60); r++) {
+  const headerMatchesIn = (row: any[]) => {
     const found: Partial<Record<ColumnKey, number>> = {};
-    matrix[r].forEach((cell, c) => {
+    (row || []).forEach((cell, c) => {
       const text = flatten(cellText(cell));
       if (!text) return;
       (Object.keys(COLUMN_KEYS) as ColumnKey[]).forEach((key) => {
         if (found[key] === undefined && COLUMN_KEYS[key].test(text)) found[key] = c;
       });
     });
+    return found;
+  };
+
+  let headerIdx = -1;
+  let columns: Partial<Record<ColumnKey, number>> = {};
+  for (let r = 0; r < Math.min(matrix.length, 60); r++) {
+    const found = headerMatchesIn(matrix[r]);
     if (found.remark !== undefined && (found.amount_out !== undefined || found.amount_in !== undefined)) {
       headerIdx = r;
       columns = found;
@@ -287,8 +462,19 @@ export async function parseStatement(
 
   const at = (row: any[], key: ColumnKey) => (columns[key] === undefined ? undefined : row[columns[key]!]);
 
+  // The header is printed twice, once per language. Without this the English row
+  // becomes a transaction with no date and no amounts, which then reads as an
+  // unexplained line in the reconciliation.
+  let firstDataRow = headerIdx + 1;
+  while (firstDataRow < matrix.length) {
+    const again = headerMatchesIn(matrix[firstDataRow]);
+    if (again.remark !== undefined && (again.amount_out !== undefined || again.amount_in !== undefined)) {
+      firstDataRow++;
+    } else break;
+  }
+
   const rows: StatementRow[] = [];
-  for (let r = headerIdx + 1; r < matrix.length; r++) {
+  for (let r = firstDataRow; r < matrix.length; r++) {
     const row = matrix[r];
     if (!row || !row.length) continue;
 
@@ -303,13 +489,30 @@ export async function parseStatement(
     const empty = !remark && !amountIn && !amountOut && !date;
     if (empty) continue;
 
-    // A continuation line: the bank wraps one transaction's remark over several
-    // spreadsheet rows, and only the first carries the number and the amounts.
-    // Joining them matters — the reference is often on the second or third line.
-    const isContinuation = rowNo === null && !date && !amountIn && !amountOut && !!remark && rows.length > 0;
+    const prev = rows.length ? rows[rows.length - 1] : null;
+
+    // One transaction, two spreadsheet rows: the date sits on the first and the
+    // clock time on the second, while the number, remark, amounts and balance are
+    // repeated on both. They are the same transaction, recognised by the number
+    // the bank itself printed — adding the second one would double every total in
+    // the file, which is precisely what the first version of this parser did.
+    if (rowNo !== null && prev && prev.row_no === rowNo) {
+      if (!prev.date && date) prev.date = date;
+      if (prev.balance == null && balance != null) prev.balance = balance;
+      if (!prev.amount_in && amountIn) prev.amount_in = amountIn;
+      if (!prev.amount_out && amountOut) prev.amount_out = amountOut;
+      // Only genuinely new text is appended: the second line usually repeats the
+      // remark verbatim, and occasionally carries the tail of a long one.
+      if (remark && !prev.remark.includes(remark)) prev.remark = flatten(`${prev.remark} ${remark}`);
+      continue;
+    }
+
+    // A continuation line with no number of its own: the bank wraps one remark over
+    // several rows. Joining them matters — the payment code is often on the second
+    // or third line rather than the first.
+    const isContinuation = rowNo === null && !date && !amountIn && !amountOut && !!remark && !!prev;
     if (isContinuation) {
-      const prev = rows[rows.length - 1];
-      prev.remark = flatten(`${prev.remark} ${remark}`);
+      prev!.remark = flatten(`${prev!.remark} ${remark}`);
       continue;
     }
 
@@ -327,5 +530,86 @@ export async function parseStatement(
     throw new StatementFormatError('Tabel transaksi ditemukan tetapi tidak berisi baris apa pun.');
   }
 
-  return { rows, columns: columns as Record<string, number> };
+  return {
+    rows,
+    columns: columns as Record<string, number>,
+    summary: readSummary(matrix, headerIdx),
+    identity,
+  };
+}
+
+// ── Is this file what it claims to be? ────────────────────────────────────────
+//
+// It cannot be proven. The bank does not sign its export: the package carries no
+// digital signature, and its encryption uses a password rather than a certificate,
+// so nothing in it is bound to Mandiri's identity. Only the bank's own API feed can
+// settle the question, and that is a later phase.
+//
+// What is possible is to make an edited file fail arithmetic. Every figure below is
+// one the bank itself printed over the same rows, so tampering with a transaction
+// means correcting the running balance on every row beneath it *and* the four
+// summary figures above the table. That is a different proposition from changing one
+// number in Excel, which is the realistic threat here.
+
+export interface StatementChecks {
+  /**
+   * The producing application names the bank. Forgeable, but rewritten by any
+   * editor that saves the file, so `resaved` catches the ordinary case.
+   */
+  bank_identity: { ok: boolean; resaved: boolean; application: string | null; creator: string | null; title: string | null };
+  account_number: string | null;
+  /** Rows add up to the totals the bank printed. */
+  totals: { ok: boolean; parsed_in: number; parsed_out: number; stated_in: number | null; stated_out: number | null };
+  /** Opening + in − out lands exactly on the closing balance. */
+  closing: { ok: boolean; computed: number | null; stated: number | null };
+  /** Every row's running balance follows from the row above it. */
+  balance_chain: { ok: boolean; breaks: number; first_break_row: number | null; checked: number };
+  /** True when the file's own arithmetic contradicts itself. */
+  arithmetic_ok: boolean;
+}
+
+/** Two money figures agree, allowing for the cent the bank rounds. */
+const near = (a: number, b: number) => Math.abs(a - b) < 0.01;
+
+export function checkStatement(parsed: ParsedStatement): StatementChecks {
+  const { rows, summary, identity } = parsed;
+
+  const parsedIn = rows.reduce((s, r) => s + r.amount_in, 0);
+  const parsedOut = rows.reduce((s, r) => s + r.amount_out, 0);
+  const totalsOk =
+    (summary.total_in == null || near(parsedIn, summary.total_in))
+    && (summary.total_out == null || near(parsedOut, summary.total_out));
+
+  const computed = summary.opening_balance == null ? null : summary.opening_balance + parsedIn - parsedOut;
+  const closingOk = computed == null || summary.closing_balance == null || near(computed, summary.closing_balance);
+
+  // The chain is walked from the opening balance when the file states one; without
+  // it, each row is checked against the row above instead, which still catches an
+  // edited amount anywhere but the first.
+  let running = summary.opening_balance;
+  let breaks = 0, firstBreak: number | null = null, checked = 0;
+  rows.forEach((r, i) => {
+    if (r.balance == null) return;
+    if (running != null) {
+      checked++;
+      const expected = running + r.amount_in - r.amount_out;
+      if (!near(expected, r.balance)) {
+        breaks++;
+        if (firstBreak === null) firstBreak = r.row_no ?? i + 1;
+      }
+    }
+    running = r.balance; // resynchronise, so one bad row does not condemn the rest
+  });
+
+  return {
+    bank_identity: {
+      ok: identity.looks_like_bank, resaved: identity.resaved,
+      application: identity.application, creator: identity.creator, title: identity.title,
+    },
+    account_number: summary.account_number,
+    totals: { ok: totalsOk, parsed_in: parsedIn, parsed_out: parsedOut, stated_in: summary.total_in, stated_out: summary.total_out },
+    closing: { ok: closingOk, computed, stated: summary.closing_balance },
+    balance_chain: { ok: breaks === 0, breaks, first_break_row: firstBreak, checked },
+    arithmetic_ok: totalsOk && closingOk && breaks === 0,
+  };
 }

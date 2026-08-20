@@ -39,6 +39,11 @@ CREATE TABLE `entities` (
   `password`       VARCHAR(255) NOT NULL,
   `is_superadmin`  TINYINT(1) NOT NULL DEFAULT 0,
   `entity_type`    ENUM('Operational','Support','System') NOT NULL DEFAULT 'Operational',
+  -- Default farmer share for ProfitSharing plots under this PT, e.g. 50.00.
+  -- Only the farmer's half is stored; the company's is 100 minus it, so the two
+  -- can never contradict each other. A settlement copies the value in force at
+  -- the time into `profit_sharing`, so changing it here never rewrites history.
+  `profit_share_farmer_pct` DECIMAL(5,2) NULL,
   `created_at`     DATETIME NULL,
   `updated_at`     DATETIME NULL,
   KEY `idx_entities_type` (`entity_type`)
@@ -318,11 +323,32 @@ CREATE TABLE `selling` (
   `rejected_volume`  DECIMAL(15,3) GENERATED ALWAYS AS (`delivered_volume` - `accepted_volume`) STORED,
   `price_per_unit`   DECIMAL(15,2) NOT NULL DEFAULT 0,
   `total_revenue`    DECIMAL(18,2) GENERATED ALWAYS AS (`accepted_volume` * `price_per_unit`) STORED,
+  -- Overrides the selling PT's default farmer share for this one sale. NULL =
+  -- use `entities.profit_share_farmer_pct`.
+  `profit_share_farmer_pct` DECIMAL(5,2) NULL,
   `created_at`       DATETIME NULL,
   `updated_at`       DATETIME NULL,
   CONSTRAINT `fk_selling_processing` FOREIGN KEY (`processing_id`) REFERENCES `processing`(`id`) ON DELETE CASCADE,
   CONSTRAINT `fk_selling_offtaker`   FOREIGN KEY (`offtaker_id`)   REFERENCES `offtaker`(`id`) ON DELETE SET NULL,
   CONSTRAINT `fk_selling_warehouse`  FOREIGN KEY (`warehouse_id`)  REFERENCES `warehouse`(`id`) ON DELETE SET NULL
+) ENGINE=InnoDB;
+
+-- Costs that belong to one sale — freight, sorting, loading. They are document
+-- lines: deleting the sale deletes them. Land costs are the opposite (they stand
+-- on their own and outlive any single sale), which is why those stay in
+-- `profit_sharing_investments` rather than here. Reuses `pre_finance_types` as
+-- the category master instead of introducing a second taxonomy.
+CREATE TABLE `selling_costs` (
+  `id`                  INT AUTO_INCREMENT PRIMARY KEY,
+  `selling_id`          INT NOT NULL,
+  `pre_finance_type_id` INT NULL,
+  `description`         VARCHAR(255) NULL,
+  `amount`              DECIMAL(18,2) NOT NULL DEFAULT 0,
+  `created_at`          DATETIME NULL,
+  `updated_at`          DATETIME NULL,
+  KEY `idx_sc_selling` (`selling_id`),
+  CONSTRAINT `fk_sc_selling` FOREIGN KEY (`selling_id`)          REFERENCES `selling`(`id`) ON DELETE CASCADE,
+  CONSTRAINT `fk_sc_type`    FOREIGN KEY (`pre_finance_type_id`) REFERENCES `pre_finance_types`(`id`) ON DELETE SET NULL
 ) ENGINE=InnoDB;
 
 -- -----------------------------------------------------------------------------
@@ -719,15 +745,35 @@ CREATE TABLE `profit_sharing_investments` (
   CONSTRAINT `fk_psi_unit`   FOREIGN KEY (`unit_id`)             REFERENCES `units`(`id`) ON DELETE SET NULL
 ) ENGINE=InnoDB;
 
+-- One settled row per (sale, plot). The unit is the plot, not the farmer: the
+-- scheme is a property of the plot, and one farmer may hold a Beli Putus plot and
+-- a Profit Sharing plot at the same time.
+--
+-- Every figure here is a SNAPSHOT taken when the settlement was made. The four
+-- cost columns are stored rather than recomputed so that a later edit to a cost
+-- sheet, a price, or an entity's percentage cannot silently restate a settlement
+-- that has already been paid out.
 CREATE TABLE `profit_sharing` (
   `id`             INT AUTO_INCREMENT PRIMARY KEY,
   `period`         VARCHAR(20) NOT NULL,
+  `selling_id`     INT NULL,                  -- NULL = legacy row entered before per-sale settlement
   `farmer_id`      INT NOT NULL,
   `plot_id`        INT NULL,
   `commodities_id` INT NULL,
+  `volume_share`   DECIMAL(15,3) NOT NULL DEFAULT 0,   -- kg this plot put into the batch
+  `share_pct`      DECIMAL(9,6) NOT NULL DEFAULT 0,    -- volume_share / batch volume, x100
   `total_revenue`     DECIMAL(18,2) NOT NULL DEFAULT 0,
-  `total_investment`  DECIMAL(18,2) NOT NULL DEFAULT 0,
-  `net_profit`     DECIMAL(18,2) GENERATED ALWAYS AS (`total_revenue` - `total_investment`) STORED,
+  `cost_processing`   DECIMAL(18,2) NOT NULL DEFAULT 0,  -- shared, per kg
+  `cost_selling`      DECIMAL(18,2) NOT NULL DEFAULT 0,  -- shared, per kg
+  `cost_saprodi`      DECIMAL(18,2) NOT NULL DEFAULT 0,  -- this plot only
+  `cost_land`         DECIMAL(18,2) NOT NULL DEFAULT 0,  -- this plot only
+  `total_investment`  DECIMAL(18,2) NOT NULL DEFAULT 0,  -- sum of the four above
+  -- Deficit brought forward from this plot's previous settlement (<= 0). Cost the
+  -- plot has not earned back yet follows it to the next sale instead of being
+  -- forgiven, which is what stops a second sale reading as profit while the plot
+  -- as a whole is still under water.
+  `carry_in`       DECIMAL(18,2) NOT NULL DEFAULT 0,
+  `net_profit`     DECIMAL(18,2) GENERATED ALWAYS AS (`total_revenue` - `total_investment` + `carry_in`) STORED,
   `pct_farmer`     DECIMAL(5,2) NOT NULL DEFAULT 0,
   `pct_company`    DECIMAL(5,2) NOT NULL DEFAULT 0,
   `value_farmer`   DECIMAL(18,2) NOT NULL DEFAULT 0,
@@ -735,8 +781,12 @@ CREATE TABLE `profit_sharing` (
   `status`         VARCHAR(40) NOT NULL DEFAULT 'Draft',
   `created_at`     DATETIME NULL,
   `updated_at`     DATETIME NULL,
+  -- A sale may only be settled once per plot. MariaDB allows repeated NULLs, so
+  -- the legacy hand-entered rows are unaffected.
+  UNIQUE KEY `uq_ps_selling_plot` (`selling_id`, `plot_id`),
   CONSTRAINT `fk_ps_farmer`    FOREIGN KEY (`farmer_id`)      REFERENCES `farmers`(`id`) ON DELETE CASCADE,
   CONSTRAINT `fk_ps_plot`      FOREIGN KEY (`plot_id`)        REFERENCES `plot`(`id`) ON DELETE SET NULL,
+  CONSTRAINT `fk_ps_selling`   FOREIGN KEY (`selling_id`)     REFERENCES `selling`(`id`) ON DELETE SET NULL,
   CONSTRAINT `fk_ps_commodity` FOREIGN KEY (`commodities_id`) REFERENCES `commodities`(`id`) ON DELETE SET NULL
 ) ENGINE=InnoDB;
 
