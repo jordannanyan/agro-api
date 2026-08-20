@@ -14,6 +14,7 @@
 
 import ExcelJS from 'exceljs';
 import crypto from 'crypto';
+import officecrypto from 'officecrypto-tool';
 
 export interface StatementRow {
   /** Row number as printed in the file's own "No" column, when it has one. */
@@ -158,8 +159,43 @@ function lineHash(r: Omit<StatementRow, 'hash'>): string {
 
 // ── Reading the sheet ─────────────────────────────────────────────────────────
 
+/**
+ * Undo the bank's password, if there is one.
+ *
+ * A Mandiri e-statement arrives from the bank encrypted — the password is a
+ * convention the account holder knows, not a secret the system should hold. So it
+ * is asked for at upload time, used here, and never written anywhere: not to the
+ * database, not to the log, not into the stored copy of the file.
+ *
+ * Note the two different things people call "password protected". This handles the
+ * one that encrypts the whole file (it will not open without the password). A
+ * workbook merely *protected* against editing is not encrypted at all and has
+ * always been readable — asking for a password there would only confuse.
+ */
+async function unlock(buffer: Buffer, password?: string | null): Promise<Buffer> {
+  let encrypted = false;
+  try {
+    encrypted = officecrypto.isEncrypted(buffer);
+  } catch {
+    encrypted = false; // not an Office container at all (a CSV, say)
+  }
+  if (!encrypted) return buffer;
+
+  if (!password) {
+    throw new StatementFormatError(
+      'File ini terkunci password. Masukkan password file di kolom yang tersedia, lalu unggah ulang.');
+  }
+  try {
+    return await officecrypto.decrypt(buffer, { password });
+  } catch {
+    // The library's own message names the failure but not the file; be explicit,
+    // and never echo the password back in any form.
+    throw new StatementFormatError('Password file salah — file tidak bisa dibuka.');
+  }
+}
+
 /** The file as a rectangle of raw cell values, whatever its type. */
-async function toMatrix(buffer: Buffer, filename: string): Promise<any[][]> {
+async function toMatrix(buffer: Buffer, filename: string, password?: string | null): Promise<any[][]> {
   const ext = (filename.split('.').pop() || '').toLowerCase();
   const wb = new ExcelJS.Workbook();
 
@@ -171,7 +207,7 @@ async function toMatrix(buffer: Buffer, filename: string): Promise<any[][]> {
     return text.split(/\r?\n/).map((line) => splitCsvLine(line, delim));
   }
 
-  await wb.xlsx.load(buffer as any);
+  await wb.xlsx.load((await unlock(buffer, password)) as any);
   const ws = wb.worksheets[0];
   if (!ws) throw new StatementFormatError('File tidak berisi lembar kerja apa pun.');
 
@@ -205,12 +241,19 @@ function splitCsvLine(line: string, delim: string): string[] {
 /**
  * Parse a statement export into transaction rows.
  *
+ * `password` is only needed for the encrypted exports the bank e-mails out; it is
+ * used to open the file and then dropped.
+ *
  * Throws {@link StatementFormatError} with a message meant for the person who
- * uploaded the file — they can fix "the Keterangan column is missing", they cannot
- * fix a stack trace.
+ * uploaded the file — they can fix "the Keterangan column is missing" or "the
+ * password is wrong", they cannot fix a stack trace.
  */
-export async function parseStatement(buffer: Buffer, filename: string): Promise<ParsedStatement> {
-  const matrix = await toMatrix(buffer, filename);
+export async function parseStatement(
+  buffer: Buffer,
+  filename: string,
+  password?: string | null,
+): Promise<ParsedStatement> {
+  const matrix = await toMatrix(buffer, filename, password);
   if (!matrix.length) throw new StatementFormatError('File kosong.');
 
   // ── Find the header row. Two columns have to agree before a row is believed:

@@ -145,8 +145,8 @@ async function judge(
 const fmt = (n: number) => `Rp ${Number(n || 0).toLocaleString('id-ID')}`;
 
 /** Read the upload, parse it, and judge every line. Writes nothing. */
-async function analyse(file: Express.Multer.File) {
-  const parsed = await parseStatement(file.buffer, file.originalname);
+async function analyse(file: Express.Multer.File, password?: string | null) {
+  const parsed = await parseStatement(file.buffer, file.originalname, password);
 
   // Lines already on record — one query rather than one per line.
   const hashes = parsed.rows.map((r) => r.hash);
@@ -218,7 +218,9 @@ router.post('/preview', authenticate, requireRole(...RECONCILERS),
   uploadStatement.single('file'), async (req: Request, res: Response) => {
     if (rejectUpload(req, res)) return;
     try {
-      const { parsed, verdicts } = await analyse(req.file!);
+      // The password only ever lives in this request: it opens the file and is
+      // never stored, logged, or written into the import record.
+      const { parsed, verdicts } = await analyse(req.file!, req.body?.password);
       return res.json({
         message: 'Pratinjau rekonsiliasi',
         data: {
@@ -240,13 +242,16 @@ router.post('/', authenticate, requireRole(...RECONCILERS),
     if (rejectUpload(req, res)) return;
     try {
       const user = req.user!;
-      const { parsed, verdicts } = await analyse(req.file!);
+      const { parsed, verdicts } = await analyse(req.file!, req.body?.password);
       const summary = summarise(verdicts);
 
       const dates = parsed.rows.map((r) => r.date).filter(Boolean).sort() as string[];
 
       // Keep the file itself: the statement is the evidence behind every payment
       // this import settles, and a reconciliation nobody can re-check is not one.
+      // Stored exactly as it arrived — an encrypted export stays encrypted, because
+      // the artefact behind a payment should be the bank's file, not our copy of it.
+      // Re-opening it later needs the same password from the bank.
       fs.mkdirSync(STATEMENT_PATH, { recursive: true });
       const safe = path.basename(req.file!.originalname).replace(/[^a-zA-Z0-9._-]/g, '_');
       const stored = `${Date.now()}_${safe}`;

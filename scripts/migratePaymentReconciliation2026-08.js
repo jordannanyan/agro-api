@@ -38,7 +38,7 @@ function checkChar(body) {
 function generatePaymentCode(year) {
   let body = '';
   for (let i = 0; i < 4; i++) body += ALPHABET[Math.floor(Math.random() * MOD)];
-  return `PAY${String(year % 100).padStart(2, '0')}-${body}${checkChar(body)}`;
+  return `PAY${String(year % 100).padStart(2, '0')} ${body}${checkChar(body)}`;
 }
 
 async function columnExists(conn, table, column) {

@@ -4,6 +4,10 @@
 // into the transfer remark on their phone. Every property below follows from that.
 //
 //  - Short. Eleven characters, of which the person types five that carry meaning.
+//  - Written with a space, not a hyphen: the bank's remark field rejects "-".
+//    The space is kept rather than dropped because a code broken into chunks is
+//    transcribed correctly far more often than an unbroken run of characters —
+//    and whatever the bank does to the space, the scan below still finds it.
 //  - No confusable characters. 0/O, 1/I/L, 5/S, U/V and Z are all absent from the
 //    alphabet, so there is nothing to squint at.
 //  - A check character. Without one a single mistyped character silently addresses
@@ -11,7 +15,7 @@
 //    the only thing standing between that and paying the wrong invoice. With one,
 //    a typo fails loudly and the row goes to the manual queue where it belongs.
 //
-// Shape: PAY<YY>-<4 random><1 check>   e.g. PAY26-7K4Q3
+// Shape: PAY<YY> <4 random><1 check>   e.g. PAY26 7K4Q3
 //
 // Source: mandiri-quickbooks-reconciliation-plan.html §0.2.
 
@@ -55,44 +59,48 @@ export function generatePaymentCode(now = new Date()): string {
   for (let i = 0; i < BODY_LEN; i++) {
     body += ALPHABET[Math.floor(Math.random() * MOD)];
   }
-  return `${yearPrefix(now)}-${body}${checkChar(body)}`;
+  return `${yearPrefix(now)} ${body}${checkChar(body)}`;
 }
 
 /** Is this a well-formed code whose check character agrees with its body? */
 export function isValidPaymentCode(code: string): boolean {
-  const m = /^PAY(\d{2})-([A-Z0-9]{5})$/.exec(normalisePaymentCode(code));
+  const m = /^PAY(\d{2}) ([A-Z0-9]{5})$/.exec(normalisePaymentCode(code));
   if (!m) return false;
   const body = m[2].slice(0, BODY_LEN);
   return checkChar(body) === m[2][BODY_LEN];
 }
 
 /**
- * Tidy up what a human typed: case, and the separators they may or may not have
- * used. "pay 26 7k4q3" and "PAY26-7K4Q3" are the same reference, and refusing the
- * first would push a perfectly good payment into the manual queue.
+ * Tidy up what a human typed into the one written form.
+ *
+ * "pay26 7k4q3", "PAY267K4Q3" and "PAY26-7K4Q3" are all the same reference: the
+ * space may be swallowed by the bank, doubled by a person, or replaced with the
+ * hyphen somebody remembers from an older note. Refusing any of them would push a
+ * perfectly good payment into the manual queue for a punctuation mark.
  */
 export function normalisePaymentCode(raw: string): string {
-  const s = String(raw || '').toUpperCase().replace(/[\s._/]+/g, '');
-  const m = /^PAY-?(\d{2})-?([A-Z0-9]{5})$/.exec(s);
-  return m ? `PAY${m[1]}-${m[2]}` : s;
+  const s = String(raw || '').toUpperCase().replace(/[\s\-._/]+/g, '');
+  const m = /^PAY(\d{2})([A-Z0-9]{5})$/.exec(s);
+  return m ? `PAY${m[1]} ${m[2]}` : s;
 }
 
 /**
  * Every valid code inside a free-text bank remark, in the order they appear.
  *
  * The remark is a sentence somebody typed around the reference ("PEMBAYARAN
- * PAY26-7K4Q3 PUPUK"), sometimes with the dash dropped or a space in its place, so
- * the scan is deliberately loose and the check character does the deciding. Strings
- * that merely look like a code but fail the check are not returned — that is the
- * whole point of having one.
+ * PAY26 7K4Q3 PUPUK"), and the separator is the least reliable part of it: banks
+ * strip or collapse spaces, people add their own, and the hyphen still turns up out
+ * of habit. So the scan treats separators as noise — zero or more of any of them —
+ * and the check character does the deciding. Strings that merely look like a code
+ * but fail the check are not returned; that is the whole point of having one.
  */
 export function findPaymentCodes(remark: string): string[] {
   const text = String(remark || '').toUpperCase();
   const found: string[] = [];
-  const re = /PAY[\s\-._]?(\d{2})[\s\-._]?([A-Z0-9]{5})/g;
+  const re = /PAY[\s\-._]*(\d{2})[\s\-._]*([A-Z0-9]{5})/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(text)) !== null) {
-    const code = `PAY${m[1]}-${m[2]}`;
+    const code = `PAY${m[1]} ${m[2]}`;
     if (isValidPaymentCode(code) && !found.includes(code)) found.push(code);
   }
   return found;
