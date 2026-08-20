@@ -2,7 +2,8 @@ import { Router, Request, Response } from 'express';
 import pool from '../db/connection';
 import { authenticate, AuthUser } from '../middleware/auth';
 import { upload, fileToPath } from '../middleware/upload';
-import { SYSTEM_ADMIN_ROLES, WRITE_OVERRIDE_ROLES, ROLE } from '../utils/roles';
+import { SYSTEM_ADMIN_ROLES, WRITE_OVERRIDE_ROLES, PAYMENT_EXECUTOR_ROLES, ROLE } from '../utils/roles';
+import { entityScope } from '../utils/entityScope';
 
 // Polymorphic document layer: approvals / attachments / activities.
 // Mounted at /api/documents/:type/:id/(approvals|attachments|activities)
@@ -52,6 +53,128 @@ async function loadScopedDocument(req: Request, res: Response): Promise<any | nu
   }
   return doc;
 }
+
+// ---- Inbox counts ----
+//
+// How many documents are actually waiting on the person looking at the screen.
+//
+// The lists already highlight those rows, but only once you have opened the list —
+// a Project Manager with three requests to sign saw nothing until they went
+// looking. This answers the same question for the sidebar, in one round trip, so
+// the count can sit next to the menu item.
+//
+// Three things count as "yours", and nothing else does:
+//   1. the earliest unfinished approval step belongs to your role (the document is
+//      Pending on you — later steps are somebody else's turn, not yours yet);
+//   2. the document was sent back for revision and you are the one who filed it;
+//   3. a fully approved payment request still waiting to be disbursed, for the two
+//      finance roles that may release it.
+// Drafts are left out on purpose: an unfinished draft is not a queue, and counting
+// them would make the badge a number nobody could ever bring to zero.
+
+/** The role that filed a document, read off its own chain — mirrors requesterRoleCode(). */
+function requesterRoleSql(docType: DocType): string {
+  return `COALESCE((
+            SELECT r.role_code FROM document_approvals da
+            JOIN roles r ON r.id = da.role_id
+            WHERE da.document_type = '${docType}' AND da.document_id = d.id
+            ORDER BY (COALESCE(da.step_label, '') = 'Requested') DESC, da.step_order ASC
+            LIMIT 1
+          ), '${DEFAULT_REQUESTER_ROLE[docType]}')`;
+}
+
+async function countOne(sql: string, args: any[]): Promise<number> {
+  const [rows] = await pool.query(sql, args);
+  return Number((rows as any[])[0]?.n || 0);
+}
+
+/** Documents whose current step is assigned to this role. */
+function pendingOnRole(docType: DocType, roleCode: string, scope: number | null) {
+  const args: any[] = [roleCode];
+  let scoped = '';
+  if (scope != null) { scoped = ' AND d.entity_id = ?'; args.push(scope); }
+  return countOne(
+    `SELECT COUNT(*) AS n
+       FROM ${DOC_TABLE[docType]} d
+       JOIN (SELECT da.document_id, MIN(da.step_order) AS step_order
+               FROM document_approvals da
+              WHERE da.document_type = '${docType}' AND da.status = 'Pending'
+                AND COALESCE(da.step_label, '') <> 'Payment'
+              GROUP BY da.document_id) nx ON nx.document_id = d.id
+       JOIN document_approvals nda ON nda.document_type = '${docType}'
+                                  AND nda.document_id = d.id
+                                  AND nda.step_order = nx.step_order
+       JOIN roles r ON r.id = nda.role_id AND r.role_code = ?
+      WHERE d.status = 'Pending'${scoped}`, args);
+}
+
+/** Documents handed back for revision to the person who raised them. */
+function revisionForUser(docType: DocType, user: AuthUser, scope: number | null) {
+  const args: any[] = [];
+  let scoped = '';
+  if (scope != null) { scoped = ' AND d.entity_id = ?'; args.push(scope); }
+  // Only purchase requests record who filed them; for PO and PayReq the chain is
+  // the only record of it, exactly as guardRequester() reads it.
+  const byUser = docType === 'PR' ? 'd.requested_by_user_id = ? OR ' : '';
+  if (docType === 'PR') args.push(user.id);
+  args.push(user.roleCode);
+  return countOne(
+    `SELECT COUNT(*) AS n FROM ${DOC_TABLE[docType]} d
+      WHERE d.status = 'Revision'${scoped}
+        AND (${byUser}${requesterRoleSql(docType)} = ?)`, args);
+}
+
+// GET /api/documents/inbox → { PR, PO, PayReq, total }
+router.get('/inbox', authenticate, async (req: Request, res: Response) => {
+  const empty = {
+    PR: { approval: 0, revision: 0, total: 0 },
+    PO: { approval: 0, revision: 0, total: 0 },
+    PayReq: { approval: 0, revision: 0, payment: 0, total: 0 },
+    total: 0,
+  };
+  const user = req.user;
+  // Only staff take part in the flow. The administrators fall out naturally too:
+  // no approval step is ever assigned to them, so every count is zero without a
+  // special case — which is the honest answer, since they may not act either.
+  if (!user || user.type !== 'User' || !user.roleCode) return res.json({ data: empty });
+
+  const scope = entityScope(req);
+  const roleCode = user.roleCode;
+
+  const [prApproval, prRevision, poApproval, poRevision, payApproval, payRevision] =
+    await Promise.all([
+      pendingOnRole('PR', roleCode, scope),
+      revisionForUser('PR', user, scope),
+      pendingOnRole('PO', roleCode, scope),
+      revisionForUser('PO', user, scope),
+      pendingOnRole('PayReq', roleCode, scope),
+      revisionForUser('PayReq', user, scope),
+    ]);
+
+  // Releasing the cash is the last thing the flow asks of anybody, and it has no
+  // approval step waiting on it — the request simply sits at Approved until
+  // finance records the payment. Without this the final task would never show.
+  let payment = 0;
+  if (PAYMENT_EXECUTOR_ROLES.includes(roleCode as any)) {
+    const args: any[] = [];
+    let scoped = '';
+    if (scope != null) { scoped = ' AND d.entity_id = ?'; args.push(scope); }
+    payment = await countOne(
+      `SELECT COUNT(*) AS n FROM payment_requests d WHERE d.status = 'Approved'${scoped}`, args);
+  }
+
+  const data = {
+    PR: { approval: prApproval, revision: prRevision, total: prApproval + prRevision },
+    PO: { approval: poApproval, revision: poRevision, total: poApproval + poRevision },
+    PayReq: {
+      approval: payApproval, revision: payRevision, payment,
+      total: payApproval + payRevision + payment,
+    },
+    total: 0,
+  };
+  data.total = data.PR.total + data.PO.total + data.PayReq.total;
+  return res.json({ data });
+});
 
 // ---- Approvals ----
 router.get('/:type/:id/approvals', authenticate, async (req, res) => {
