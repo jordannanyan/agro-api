@@ -6,7 +6,8 @@ import {
   seedApprovalSteps, syncDocumentStatus, resetRevisionSteps,
   guardEdit, guardRequester, guardDelete, deleteDocumentChildren,
 } from './documents';
-import { ROLE, PAYMENT_EXECUTOR_ROLES } from '../utils/roles';
+import { ROLE, PAYMENT_EXECUTOR_ROLES, WRITE_OVERRIDE_ROLES } from '../utils/roles';
+import { settlePaymentRequest } from '../utils/payments';
 import { inheritEntity, entityScope, canSeeEntity } from '../utils/entityScope';
 import { PENDING_STEP_COLUMNS, pendingStepJoin } from '../utils/pendingStep';
 
@@ -237,61 +238,35 @@ router.post('/:id', authenticate, requireRole(...PAYREQ_WRITERS), (req, res) => 
 // Director acknowledging. Finance then executes, and both the Finance Manager and
 // the Finance Staff may do it (per the 2026-08 role documentation, the Finance Staff
 // is the one who normally keys the payment in).
-router.post('/:id/pay', authenticate, requireRole(...PAYMENT_EXECUTOR_ROLES), async (req: Request, res: Response) => {
+// The role gate lets finance in so they meet the explanation below rather than a
+// bare "requires role"; the override account is the only one that gets past it.
+router.post('/:id/pay', authenticate, requireRole(...PAYMENT_EXECUTOR_ROLES, ...WRITE_OVERRIDE_ROLES), async (req: Request, res: Response) => {
   try {
     const id = Number(req.params.id);
-    const user = req.user!;
     const b = req.body || {};
 
-    const [ex] = await pool.query('SELECT id, status FROM payment_requests WHERE id = ? LIMIT 1', [id]);
-    const payreq = (ex as any[])[0];
-    if (!payreq) return res.status(404).json({ message: 'Payment request not found' });
-    if (payreq.status === 'Paid') return res.status(409).json({ message: 'This payment request is already paid.' });
-
-    // Gate: every approval step must be Approved before cash can move.
-    const [steps] = await pool.query(
-      `SELECT da.step_order, da.status, r.role_name
-       FROM document_approvals da
-       LEFT JOIN roles r ON r.id = da.role_id
-       WHERE da.document_type = 'PayReq' AND da.document_id = ?
-         AND COALESCE(da.step_label, '') <> 'Payment'
-       ORDER BY da.step_order ASC`,
-      [id]
-    );
-    const chain = steps as any[];
-    if (!chain.length) {
-      return res.status(409).json({ message: 'This payment request has no approval chain yet.' });
-    }
-    const outstanding = chain.find((s) => s.status !== 'Approved');
-    if (outstanding) {
-      return res.status(409).json({
-        message: `Cannot pay yet — step ${outstanding.step_order} (${outstanding.role_name ?? 'unassigned'}) is ${outstanding.status}.`,
+    // Kept as a manual override, not the normal way to settle a payment. The flow
+    // is: finance transfers the money quoting the request's payment code, then
+    // uploads the bank statement, and the matching line is what marks it Paid —
+    // see routes/bankStatements.ts. Pressing a button here asserts that a transfer
+    // happened with nothing to show for it, so the reason is recorded and only the
+    // break-glass account may do it.
+    if (!WRITE_OVERRIDE_ROLES.includes(req.user?.roleCode as any)) {
+      return res.status(403).json({
+        message: 'Pembayaran diverifikasi dengan mengunggah rekening koran, bukan ditandai manual. '
+          + 'Unggah file mutasi di menu Rekonsiliasi Pembayaran; baris yang kodenya cocok akan otomatis menjadi Paid.',
       });
     }
+    if (!String(b.note || '').trim()) {
+      return res.status(422).json({ message: 'Alasan wajib diisi untuk pelunasan manual (tanpa bukti rekening koran).' });
+    }
 
-    const releasedDate = b.released_pay_date || new Date().toISOString().slice(0, 10);
-    await pool.query(
-      `UPDATE payment_requests
-       SET status = 'Paid', released_pay_date = ?, payment_method_id = ?, paid_by_user_id = ?, updated_at = NOW()
-       WHERE id = ?`,
-      [releasedDate, b.payment_method_id != null && b.payment_method_id !== '' ? Number(b.payment_method_id) : null,
-       user.id, id]
-    );
-
-    // Leave a trace on the timeline so the 5-step view in the UI is complete.
-    const nextOrder = Math.max(...chain.map((s) => Number(s.step_order))) + 1;
-    await pool.query(
-      `INSERT INTO document_approvals
-         (document_type, document_id, step_order, step_label, role_id, user_id, name, position, action_date, note, status, created_at, updated_at)
-       VALUES ('PayReq', ?, ?, 'Payment', ?, ?, ?, ?, ?, ?, 'Approved', NOW(), NOW())`,
-      [id, nextOrder, user.roleId ?? null, user.id, user.data?.name ?? null, user.data?.position ?? null,
-       releasedDate, b.note ?? null]
-    );
-    await pool.query(
-      `INSERT INTO document_activities (document_type, document_id, action, user_id, note, created_at)
-       VALUES ('PayReq', ?, 'Payment released', ?, ?, NOW())`,
-      [id, user.id, b.note ?? null]
-    );
+    const result = await settlePaymentRequest(req.user!, id, {
+      released_pay_date: b.released_pay_date,
+      payment_method_id: b.payment_method_id,
+      note: `[MANUAL] ${String(b.note).trim()}`,
+    });
+    if (!result.ok) return res.status(result.status).json({ message: result.message });
 
     const [rows] = await pool.query(SELECT + ' WHERE pay.id = ? LIMIT 1', [id]);
     return res.json({ message: 'Payment recorded', data: (rows as any[])[0] });

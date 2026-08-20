@@ -4,6 +4,7 @@ import { authenticate, AuthUser } from '../middleware/auth';
 import { upload, fileToPath } from '../middleware/upload';
 import { SYSTEM_ADMIN_ROLES, WRITE_OVERRIDE_ROLES, PAYMENT_EXECUTOR_ROLES, ROLE } from '../utils/roles';
 import { entityScope } from '../utils/entityScope';
+import { issuePaymentCode } from '../utils/payments';
 
 // Polymorphic document layer: approvals / attachments / activities.
 // Mounted at /api/documents/:type/:id/(approvals|attachments|activities)
@@ -581,6 +582,15 @@ export async function syncDocumentStatus(docType: DocType, docId: number): Promi
   }
 
   await pool.query(`UPDATE ${table} SET status = ?, updated_at = NOW() WHERE id = ?`, [status, docId]);
+
+  // The moment the chain closes on a payment request, it needs the reference that
+  // will identify it on the bank statement — issued here rather than in the
+  // approval handler so that every route into 'Approved' produces one, including
+  // a resubmitted document whose last step is signed off elsewhere.
+  if (docType === 'PayReq' && status === 'Approved') {
+    await issuePaymentCode(docId);
+  }
+
   return status;
 }
 

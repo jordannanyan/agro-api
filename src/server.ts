@@ -18,6 +18,7 @@ import paymentRequestsRoutes from './routes/paymentRequests';
 import stockInRoutes from './routes/stockIn';
 import stockOutRoutes from './routes/stockOut';
 import documentsRoutes from './routes/documents';
+import bankStatementsRoutes from './routes/bankStatements';
 import warehouseStockRoutes from './routes/warehouseStock';
 import financeRoutes from './routes/finance';
 import dashboardRoutes from './routes/dashboard';
@@ -108,6 +109,8 @@ app.use('/api/payment-requests', ...opsGuard, paymentRequestsRoutes);
 app.use('/api/stock-in', ...opsGuard, stockInRoutes);
 app.use('/api/stock-out', ...opsGuard, stockOutRoutes);
 app.use('/api/documents', ...opsGuard, documentsRoutes);
+// Bank statement reconciliation — what marks a payment request Paid.
+app.use('/api/bank-statements', ...opsGuard, bankStatementsRoutes);
 
 // Warehouse (calculated stock)
 app.use('/api/warehouse-stock', warehouseStockRoutes);

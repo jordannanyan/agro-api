@@ -474,6 +474,11 @@ CREATE TABLE `purchase_order_extra_costs` (
 CREATE TABLE `payment_requests` (
   `id`                  INT AUTO_INCREMENT PRIMARY KEY,
   `payreq_number`       VARCHAR(60) NOT NULL UNIQUE,
+  -- The reference a person types into the transfer remark at the bank, issued
+  -- the moment the approval chain completes. It is what links this request to a
+  -- line on the statement, so it is short and carries a check character.
+  `payment_code`        VARCHAR(16) NULL UNIQUE,
+  `payment_code_issued_at` DATETIME NULL,
   `purchase_request_id` INT NULL,
   `purchase_order_id`   INT NULL,
   `entity_id`           INT NOT NULL,
@@ -750,6 +755,64 @@ CREATE TABLE `budgets` (
   `updated_at`     DATETIME NULL,
   CONSTRAINT `fk_budget_entity` FOREIGN KEY (`entity_id`)      REFERENCES `entities`(`id`),
   CONSTRAINT `fk_budget_code`   FOREIGN KEY (`budget_code_id`) REFERENCES `budget_codes`(`id`)
+) ENGINE=InnoDB;
+
+-- -----------------------------------------------------------------------------
+-- Bank statement reconciliation
+--
+-- Transfers are executed by a person in the bank's own channel; agro-api never
+-- moves money. So a payment is not "done" because somebody pressed a button here —
+-- it is done when it appears on the bank statement. These two tables hold the
+-- statement as uploaded and what each line was matched against, which is the only
+-- mechanism that can detect the divergences manual execution allows: a different
+-- amount, a payment never made, or money that left with nothing authorising it.
+--
+-- Design: mandiri-quickbooks-reconciliation-plan.html §0.4–0.5. The Mandiri API
+-- feed replaces the upload later; the matching engine is written against these
+-- tables either way.
+-- -----------------------------------------------------------------------------
+CREATE TABLE `bank_statement_imports` (
+  `id`                  INT AUTO_INCREMENT PRIMARY KEY,
+  `file_name`           VARCHAR(255) NOT NULL,
+  `file_path`           VARCHAR(255) NULL,          -- kept for audit: the file as uploaded
+  `uploaded_by_user_id` INT NULL,
+  `period_start`        DATE NULL,
+  `period_end`          DATE NULL,
+  `total_rows`          INT NOT NULL DEFAULT 0,
+  `paid_count`          INT NOT NULL DEFAULT 0,     -- payment requests settled by this file
+  `mismatch_count`      INT NOT NULL DEFAULT 0,     -- code found, amount disagreed
+  `unmatched_count`     INT NOT NULL DEFAULT 0,     -- no code, or a code nobody issued
+  `duplicate_count`     INT NOT NULL DEFAULT 0,     -- lines already seen in an earlier upload
+  `note`                VARCHAR(255) NULL,
+  `created_at`          DATETIME NULL,
+  `updated_at`          DATETIME NULL,
+  CONSTRAINT `fk_bsi_user` FOREIGN KEY (`uploaded_by_user_id`) REFERENCES `users`(`id`) ON DELETE SET NULL
+) ENGINE=InnoDB;
+
+CREATE TABLE `bank_statement_lines` (
+  `id`                 INT AUTO_INCREMENT PRIMARY KEY,
+  `import_id`          INT NOT NULL,
+  `row_no`             INT NULL,                    -- the file's own "No" column
+  `tx_date`            DATE NULL,
+  `remark`             TEXT NULL,
+  `amount_in`          DECIMAL(18,2) NOT NULL DEFAULT 0,
+  `amount_out`         DECIMAL(18,2) NOT NULL DEFAULT 0,
+  `balance`            DECIMAL(18,2) NULL,
+  -- Fingerprint of the line's own content. Statement exports overlap, so the same
+  -- transfer arrives again in the next upload; this is how it is recognised.
+  `line_hash`          CHAR(40) NOT NULL,
+  `detected_code`      VARCHAR(16) NULL,
+  `payment_request_id` INT NULL,
+  -- matched | matched_with_fee | amount_mismatch | code_unknown | no_code
+  -- | already_paid | not_approved | duplicate | incoming
+  `match_status`       VARCHAR(30) NOT NULL,
+  `fee_amount`         DECIMAL(18,2) NOT NULL DEFAULT 0,   -- shortfall absorbed as bank charge
+  `match_note`         VARCHAR(255) NULL,
+  `created_at`         DATETIME NULL,
+  KEY `idx_bsl_hash` (`line_hash`),
+  KEY `idx_bsl_status` (`match_status`),
+  CONSTRAINT `fk_bsl_import` FOREIGN KEY (`import_id`)          REFERENCES `bank_statement_imports`(`id`) ON DELETE CASCADE,
+  CONSTRAINT `fk_bsl_payreq` FOREIGN KEY (`payment_request_id`) REFERENCES `payment_requests`(`id`) ON DELETE SET NULL
 ) ENGINE=InnoDB;
 
 -- -----------------------------------------------------------------------------
