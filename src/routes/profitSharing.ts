@@ -226,21 +226,28 @@ router.get('/pl', authenticate, async (req: Request, res: Response) => {
 // standing cost minus what earlier settlements already took. Nothing is charged
 // twice, and nothing is lost.
 //
-// The split then follows the model in the source workbook (SNBS Cavendish,
-// "1 Hitungan Simulasi"):
+// The split follows the operational ledgers — "Buku Besar - SJ - Banana" and
+// "Buku Besar - AML - Banana", sheet `* - Farmer Database`:
 //
-//   value_farmer  = pct_farmer x net                      (row 30: 0.3 x NCF)
-//   value_kth     = (net - value_farmer) x pct_kth         (row 20: (NCF x 0.7) x 0.07)
-//   value_company = net - value_farmer - value_kth         (row 21)
+//   value_farmer  = pct_farmer x net
+//   value_kth     = pct_kth    x net
+//   value_company = net - value_farmer - value_kth
+//
+// All three take their cut of the SAME base. SJ column N reads `P * 7/30` where
+// P is the farmer's 30% — that is 7% of the base, leaving SNBS 63%. An earlier
+// version took the KTH out of the company's half instead (4.9% of the base),
+// following the projection in "1 Hitungan Simulasi"; the ledger is the document
+// actually used to pay people, so it wins. AML has no KTH cut at all: its farmer
+// share is a plain 50% (`Total Profit Generated = K/0.5`).
 //
 // A LOSS is shared by the very same percentages — the sheet multiplies a negative
 // NCF through unchanged, so a bad harvest lands 30% in the farmer's own balance
 // rather than being absorbed entirely by the company. Nothing is floored here.
 //
-// What each party has actually earned is the running balance (`cum_*`), the
-// sheet's "Cumulative PETANI / SNBS / KTH" rows. Money may be paid out only while
-// that balance is positive — the note at K13, "menentukan waktu kita share ketika
-// cumulative +". `payable_farmer` below reports it.
+// What each party has actually earned is the running balance (`cum_*`). Money may
+// be paid out only while that balance is positive — the ledgers gate it the same
+// way (`IF((profit - cost - already paid) > 0, ...)`), and `payable_farmer` below
+// reports what that comes to today.
 // -----------------------------------------------------------------------------
 const SETTLE_SQL = `
 ${ALLOC}
@@ -335,7 +342,7 @@ async function buildSettlement(sellingId: number) {
     // Percentages are applied to `net` as it stands, sign included. A loss is
     // divided exactly like a profit, which is what the source model does.
     const valueFarmer = pct == null ? 0 : money(net * (pct / 100));
-    const valueKth = pct == null ? 0 : money((net - valueFarmer) * (pctKth / 100));
+    const valueKth = pct == null ? 0 : money(net * (pctKth / 100));
     const valueCompany = money(net - valueFarmer - valueKth);
     // Closing balances = opening balances plus this settlement's shares.
     const cumFarmer = money(Number(r.prev_cum_farmer) + valueFarmer);
@@ -351,7 +358,7 @@ async function buildSettlement(sellingId: number) {
       total_investment: totalInvestment,
       net_profit: net,
       pct_farmer: pct,
-      pct_company: pct == null ? null : money(100 - pct),
+      pct_company: pct == null ? null : money(100 - pct - pctKth),
       pct_kth: pctKth,
       value_farmer: valueFarmer,
       value_company: valueCompany,

@@ -44,9 +44,10 @@ CREATE TABLE `entities` (
   -- can never contradict each other. A settlement copies the value in force at
   -- the time into `profit_sharing`, so changing it here never rewrites history.
   `profit_share_farmer_pct` DECIMAL(5,2) NULL,
-  -- The KTH's cut, taken OUT of the company's half rather than added on top:
-  -- the source model computes it as (NCF x 0.7) x 0.07, so farmer + company
-  -- still add up to 100 and the KTH is paid from the company side.
+  -- The KTH's cut of the SAME base the farmer's share is taken from, not a slice
+  -- of the company's half. Ledger "Buku Besar - SJ - Banana", column N, reads
+  -- `P * 7/30` where P is the farmer's 30% — i.e. 7% of the base, leaving the
+  -- company 63%. AML (JNBS) has no KTH cut: farmer 50, company 50.
   `profit_share_kth_pct`    DECIMAL(5,2) NULL,
   `created_at`     DATETIME NULL,
   `updated_at`     DATETIME NULL,
