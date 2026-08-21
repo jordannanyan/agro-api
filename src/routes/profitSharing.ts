@@ -16,12 +16,11 @@ export const router = Router();
 //
 //   share  = kg the plot contributed / kg the batch received
 //
-// Layer 1 — revenue, processing cost and selling cost are of the batch, so each
-//           is multiplied by `share`. Weight lost in processing and sales made in
-//           instalments are then carried proportionally by every depositor,
-//           without either being handled as a special case.
-// Layer 2 — saprodi and land cost belong to one plot and are not shared.
-// Layer 3 — what remains is divided by the entity's percentage.
+// The margin is the ledgers' own: revenue less the purchase paid to farmers, a
+// harvesting charge per kg, and PNBP per kg. Saprodi and land cost are NOT in it
+// — the ledgers hold those as the farmer's debt and use them to gate payout.
+// Everything is multiplied by the share, so weight lost in processing and sales
+// made in instalments are carried proportionally without special cases.
 //
 // `contrib` groups by (batch, plot) BEFORE anything is multiplied. That is the
 // step the old query lacked: it joined the deposits straight onto the sale, so a
@@ -31,46 +30,72 @@ export const router = Router();
 // -----------------------------------------------------------------------------
 const ALLOC = `
 WITH batch AS (
-  SELECT pp.processing_id, SUM(pp.volume_contributed) AS batch_volume
+  SELECT pp.processing_id,
+         SUM(pp.volume_contributed) AS batch_volume,
+         SUM(pp.volume_contributed * COALESCE(pu.price_per_unit, 0)) AS batch_purchase_value
   FROM processing_purchasings pp
+  JOIN purchasing pu ON pu.id = pp.purchasing_id
   GROUP BY pp.processing_id
 ),
 contrib AS (
-  SELECT pp.processing_id, pu.plot_id, SUM(pp.volume_contributed) AS volume_share
+  SELECT pp.processing_id, pu.plot_id,
+         SUM(pp.volume_contributed) AS volume_share,
+         SUM(pp.volume_contributed * COALESCE(pu.price_per_unit, 0)) AS plot_purchase_value
   FROM processing_purchasings pp
   JOIN purchasing pu ON pu.id = pp.purchasing_id
   WHERE pu.plot_id IS NOT NULL
   GROUP BY pp.processing_id, pu.plot_id
 ),
-scost AS (
-  SELECT selling_id, SUM(amount) AS amount FROM selling_costs GROUP BY selling_id
-),
 sold AS (
   SELECT processing_id, SUM(accepted_volume) AS sold_volume
   FROM selling GROUP BY processing_id
 ),
-alloc AS (
-  SELECT s.id AS selling_id, s.date AS sale_date, c.plot_id,
-         c.volume_share,
-         c.volume_share / b.batch_volume AS share,
-         s.total_revenue * c.volume_share / b.batch_volume AS revenue,
-         -- Processing cost belongs to the BATCH, not to a sale. Multiplying it by
-         -- the plot's share alone would charge it again on every instalment: a
-         -- batch sold twice would carry its processing twice. Spreading it over
-         -- what has been sold charges it exactly once across all the instalments,
-         -- and leaves the unsold part uncharged until it sells.
-         COALESCE(pr.total_processing_cost, 0)
-           * (s.accepted_volume / NULLIF(sv.sold_volume, 0))
-           * c.volume_share / b.batch_volume AS cost_processing,
-         -- Selling cost is already per-sale, so it only needs the plot's share.
-         COALESCE(sc.amount, 0) * c.volume_share / b.batch_volume AS cost_selling
+-- The PT a batch belongs to, read from its largest contributor. The cost rates
+-- differ per PT, so the batch has to name one before anything can be charged.
+bent AS (
+  SELECT c.processing_id,
+         (SELECT k.entities_id
+          FROM contrib c2
+          JOIN plot pl2    ON pl2.id = c2.plot_id
+          JOIN farmers f2  ON f2.id = pl2.farmer_id
+          JOIN kth k       ON k.id = f2.kth_id
+          WHERE c2.processing_id = c.processing_id
+          ORDER BY c2.volume_share DESC LIMIT 1) AS entity_id
+  FROM contrib c GROUP BY c.processing_id
+),
+-- Gross margin of one sale, exactly as the ledgers define it. frac spreads the
+-- purchase-side charges over instalment sales so a batch sold twice is charged
+-- once in total.
+sale AS (
+  SELECT s.id AS selling_id, s.date AS sale_date, s.processing_id,
+         b.batch_volume, be.entity_id,
+         s.accepted_volume / NULLIF(sv.sold_volume, 0) AS frac,
+         b.batch_purchase_value * s.accepted_volume / NULLIF(sv.sold_volume, 0) AS cost_purchase,
+         CASE WHEN e.harvest_cost_basis = 'Offtake'
+              THEN COALESCE(e.harvest_cost_per_kg, 0) * s.accepted_volume
+              ELSE COALESCE(e.harvest_cost_per_kg, 0) * b.batch_volume
+                   * s.accepted_volume / NULLIF(sv.sold_volume, 0)
+         END AS cost_harvest,
+         COALESCE(e.pnbp_per_kg, 0) * b.batch_volume
+           * s.accepted_volume / NULLIF(sv.sold_volume, 0) AS cost_pnbp,
+         s.total_revenue
   FROM selling s
-  JOIN processing pr ON pr.id = s.processing_id
-  JOIN batch b       ON b.processing_id = pr.id
-  JOIN contrib c     ON c.processing_id = pr.id
-  JOIN sold sv       ON sv.processing_id = pr.id
-  LEFT JOIN scost sc ON sc.selling_id = s.id
+  JOIN batch b  ON b.processing_id = s.processing_id
+  JOIN sold sv  ON sv.processing_id = s.processing_id
+  JOIN bent be  ON be.processing_id = s.processing_id
+  LEFT JOIN entities e ON e.id = be.entity_id
   WHERE b.batch_volume > 0
+),
+alloc AS (
+  SELECT sa.selling_id, sa.sale_date, sa.entity_id, c.plot_id,
+         c.volume_share, c.plot_purchase_value,
+         c.volume_share / sa.batch_volume AS share,
+         sa.total_revenue  * c.volume_share / sa.batch_volume AS revenue,
+         sa.cost_purchase  * c.volume_share / sa.batch_volume AS cost_purchase,
+         sa.cost_harvest   * c.volume_share / sa.batch_volume AS cost_harvest,
+         sa.cost_pnbp      * c.volume_share / sa.batch_volume AS cost_pnbp
+  FROM sale sa
+  JOIN contrib c ON c.processing_id = sa.processing_id
 )`;
 
 // Operational Cost / investment per farmer+plot+period.
@@ -89,13 +114,15 @@ router.use('/investments', crudRouter({
 router.use('/shares', crudRouter({
   table: 'profit_sharing',
   columns: ['period', 'selling_id', 'farmer_id', 'plot_id', 'commodities_id', 'volume_share', 'share_pct',
-            'total_revenue', 'cost_processing', 'cost_selling', 'cost_saprodi', 'cost_land',
+            'total_revenue', 'cost_purchase', 'cost_harvest', 'cost_pnbp',
+            'cost_processing', 'cost_selling', 'cost_saprodi', 'cost_land',
             'total_investment', 'pct_farmer', 'pct_company', 'pct_kth',
             'value_farmer', 'value_company', 'value_kth',
             'cum_farmer', 'cum_company', 'cum_kth', 'status'],
   required: ['period', 'farmer_id'],
   numeric: ['selling_id', 'farmer_id', 'plot_id', 'commodities_id', 'volume_share', 'share_pct',
-            'total_revenue', 'cost_processing', 'cost_selling', 'cost_saprodi', 'cost_land',
+            'total_revenue', 'cost_purchase', 'cost_harvest', 'cost_pnbp',
+            'cost_processing', 'cost_selling', 'cost_saprodi', 'cost_land',
             'total_investment', 'pct_farmer', 'pct_company', 'pct_kth',
             'value_farmer', 'value_company', 'value_kth',
             'cum_farmer', 'cum_company', 'cum_kth'],
@@ -170,21 +197,26 @@ router.get('/pl', authenticate, async (req: Request, res: Response) => {
        SELECT pl.id AS plot_id, pl.plot_name, f.id AS farmer_id, f.farmer_name,
               COALESCE(r.volume_sold, 0)      AS volume_sold,
               COALESCE(r.total_revenue, 0)    AS total_revenue,
-              COALESCE(r.cost_processing, 0)  AS cost_processing,
-              COALESCE(r.cost_selling, 0)     AS cost_selling,
-              COALESCE(sap.amount, 0)         AS cost_saprodi,
-              COALESCE(land.amount, 0)        AS cost_land,
-              COALESCE(r.cost_processing, 0) + COALESCE(r.cost_selling, 0)
-                + COALESCE(sap.amount, 0) + COALESCE(land.amount, 0) AS total_investment,
+              COALESCE(r.cost_purchase, 0)    AS cost_purchase,
+              COALESCE(r.cost_harvest, 0)     AS cost_harvest,
+              COALESCE(r.cost_pnbp, 0)        AS cost_pnbp,
+              COALESCE(r.cost_purchase, 0) + COALESCE(r.cost_harvest, 0)
+                + COALESCE(r.cost_pnbp, 0)    AS total_investment,
               COALESCE(r.total_revenue, 0)
-                - COALESCE(r.cost_processing, 0) - COALESCE(r.cost_selling, 0)
-                - COALESCE(sap.amount, 0) - COALESCE(land.amount, 0) AS net_profit,
+                - COALESCE(r.cost_purchase, 0) - COALESCE(r.cost_harvest, 0)
+                - COALESCE(r.cost_pnbp, 0)    AS net_profit,
+              -- Debt, not cost: shown beside the margin because it decides whether
+              -- anything may actually be paid out, never subtracted from it.
+              COALESCE(sap.amount, 0)         AS debt_saprodi,
+              COALESCE(land.amount, 0)        AS debt_land,
+              COALESCE(sap.amount, 0) + COALESCE(land.amount, 0) AS debt_total,
               COALESCE(st.settled_farmer, 0)  AS settled_farmer
        FROM plot pl
        LEFT JOIN farmers f ON f.id = pl.farmer_id
        LEFT JOIN (
          SELECT plot_id, SUM(volume_share) AS volume_sold, SUM(revenue) AS total_revenue,
-                SUM(cost_processing) AS cost_processing, SUM(cost_selling) AS cost_selling
+                SUM(cost_purchase) AS cost_purchase, SUM(cost_harvest) AS cost_harvest,
+                SUM(cost_pnbp) AS cost_pnbp
          FROM alloc ${allocWhere} GROUP BY plot_id
        ) r ON r.plot_id = pl.id
        LEFT JOIN (
@@ -253,7 +285,8 @@ const SETTLE_SQL = `
 ${ALLOC}
 SELECT a.plot_id, pl.plot_name, pl.farmer_id, f.farmer_name,
        a.volume_share, a.share * 100 AS share_pct,
-       a.revenue, a.cost_processing, a.cost_selling,
+       a.revenue, a.cost_purchase, a.cost_harvest, a.cost_pnbp,
+       a.plot_purchase_value, pl.inside_kth,
        COALESCE(sap.amount, 0)  AS saprodi_total,
        COALESCE(land.amount, 0) AS land_total,
        COALESCE(ch.saprodi, 0)  AS saprodi_charged,
@@ -335,14 +368,20 @@ async function buildSettlement(sellingId: number) {
     const costSaprodi = money(Math.max(0, Number(r.saprodi_total) - Number(r.saprodi_charged)));
     const costLand = money(Math.max(0, Number(r.land_total) - Number(r.land_charged)));
     const revenue = money(Number(r.revenue));
-    const costProcessing = money(Number(r.cost_processing));
-    const costSelling = money(Number(r.cost_selling));
-    const totalInvestment = money(costProcessing + costSelling + costSaprodi + costLand);
+    const costPurchase = money(Number(r.cost_purchase));
+    const costHarvest = money(Number(r.cost_harvest));
+    const costPnbp = money(Number(r.cost_pnbp));
+    const totalInvestment = money(costPurchase + costHarvest + costPnbp);
     const net = money(revenue - totalInvestment);
+    // A farmer already paid for the delivery earns no share of it — the ledger's
+    // `x IF(purchase value <> 0, 0, 1)`. Saprodi and land stay out of the margin
+    // entirely; they are the debt this settlement is measured against.
+    const wasPaid = Number(r.plot_purchase_value) > 0;
+    const insideKth = Number(r.inside_kth) !== 0;
     // Percentages are applied to `net` as it stands, sign included. A loss is
     // divided exactly like a profit, which is what the source model does.
-    const valueFarmer = pct == null ? 0 : money(net * (pct / 100));
-    const valueKth = pct == null ? 0 : money(net * (pctKth / 100));
+    const valueFarmer = pct == null || wasPaid ? 0 : money(net * (pct / 100));
+    const valueKth = pct == null || !insideKth ? 0 : money(net * (pctKth / 100));
     const valueCompany = money(net - valueFarmer - valueKth);
     // Closing balances = opening balances plus this settlement's shares.
     const cumFarmer = money(Number(r.prev_cum_farmer) + valueFarmer);
@@ -353,9 +392,10 @@ async function buildSettlement(sellingId: number) {
       farmer_id: r.farmer_id, farmer_name: r.farmer_name,
       volume_share: Number(r.volume_share), share_pct: money(Number(r.share_pct)),
       total_revenue: revenue,
-      cost_processing: costProcessing, cost_selling: costSelling,
-      cost_saprodi: costSaprodi, cost_land: costLand,
+      cost_purchase: costPurchase, cost_harvest: costHarvest, cost_pnbp: costPnbp,
+      debt_saprodi: costSaprodi, debt_land: costLand,
       total_investment: totalInvestment,
+      farmer_was_paid: wasPaid, inside_kth: insideKth,
       net_profit: net,
       pct_farmer: pct,
       pct_company: pct == null ? null : money(100 - pct - pctKth),
@@ -430,14 +470,16 @@ router.post('/settle', authenticate, async (req: Request, res: Response) => {
       await conn.query(
         `INSERT INTO profit_sharing
            (period, selling_id, farmer_id, plot_id, commodities_id, volume_share, share_pct,
-            total_revenue, cost_processing, cost_selling, cost_saprodi, cost_land,
+            total_revenue, cost_purchase, cost_harvest, cost_pnbp,
+            cost_saprodi, cost_land,
             total_investment, pct_farmer, pct_company, pct_kth,
             value_farmer, value_company, value_kth, cum_farmer, cum_company, cum_kth,
             status, created_at, updated_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         [period, sellingId, l.farmer_id, l.plot_id, sale.commodities_id ?? null,
-         l.volume_share, l.share_pct, l.total_revenue, l.cost_processing, l.cost_selling,
-         l.cost_saprodi, l.cost_land, l.total_investment,
+         l.volume_share, l.share_pct, l.total_revenue,
+         l.cost_purchase, l.cost_harvest, l.cost_pnbp,
+         l.debt_saprodi, l.debt_land, l.total_investment,
          l.pct_farmer, l.pct_company, l.pct_kth,
          l.value_farmer, l.value_company, l.value_kth,
          l.cum_farmer, l.cum_company, l.cum_kth, 'Draft', now, now]);

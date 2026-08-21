@@ -49,6 +49,14 @@ CREATE TABLE `entities` (
   -- `P * 7/30` where P is the farmer's 30% — i.e. 7% of the base, leaving the
   -- company 63%. AML (JNBS) has no KTH cut: farmer 50, company 50.
   `profit_share_kth_pct`    DECIMAL(5,2) NULL,
+  -- Cost rates the ledgers charge against a delivery before anything is shared.
+  -- AML bills harvesting on the volume bought (Rp 1.125/kg); SJ bills it on the
+  -- volume shipped (Rp 950/kg, its harvesting + washing lines). PNBP is Rp 30 per
+  -- kg bought in both. Saprodi and land cost are deliberately NOT here: the
+  -- ledgers treat them as the farmer's debt, which gates payout instead.
+  `harvest_cost_per_kg`     DECIMAL(15,2) NULL,
+  `harvest_cost_basis`      ENUM('Purchase','Offtake') NOT NULL DEFAULT 'Purchase',
+  `pnbp_per_kg`             DECIMAL(15,2) NULL,
   `created_at`     DATETIME NULL,
   `updated_at`     DATETIME NULL,
   KEY `idx_entities_type` (`entity_type`)
@@ -240,6 +248,9 @@ CREATE TABLE `plot` (
   `polygon`          GEOMETRY NULL,
   `farmer_id`        INT NULL,
   `scheme`           ENUM('BeliPutus','PreFinance','ProfitSharing') NOT NULL DEFAULT 'BeliPutus',
+  -- The ledger's `Inside KTH SJ` column. A plot outside the farmer group earns no
+  -- KTH cut when its share of a sale is worked out.
+  `inside_kth`       TINYINT(1) NOT NULL DEFAULT 1,
   `created_at`       DATETIME NULL,
   `updated_at`       DATETIME NULL,
   CONSTRAINT `fk_plot_farmer` FOREIGN KEY (`farmer_id`) REFERENCES `farmers`(`id`) ON DELETE CASCADE
@@ -767,6 +778,12 @@ CREATE TABLE `profit_sharing` (
   `commodities_id` INT NULL,
   `volume_share`   DECIMAL(15,3) NOT NULL DEFAULT 0,   -- kg this plot put into the batch
   `share_pct`      DECIMAL(9,6) NOT NULL DEFAULT 0,    -- volume_share / batch volume, x100
+  -- The three costs the ledgers subtract before sharing. Together they are
+  -- `total_investment`; the saprodi/land columns below are recorded for the
+  -- payout gate but are NOT part of the margin.
+  `cost_purchase`  DECIMAL(18,2) NOT NULL DEFAULT 0,
+  `cost_harvest`   DECIMAL(18,2) NOT NULL DEFAULT 0,
+  `cost_pnbp`      DECIMAL(18,2) NOT NULL DEFAULT 0,
   `total_revenue`     DECIMAL(18,2) NOT NULL DEFAULT 0,
   `cost_processing`   DECIMAL(18,2) NOT NULL DEFAULT 0,  -- shared, per kg
   `cost_selling`      DECIMAL(18,2) NOT NULL DEFAULT 0,  -- shared, per kg
