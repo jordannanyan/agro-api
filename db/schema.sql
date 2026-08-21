@@ -44,6 +44,10 @@ CREATE TABLE `entities` (
   -- can never contradict each other. A settlement copies the value in force at
   -- the time into `profit_sharing`, so changing it here never rewrites history.
   `profit_share_farmer_pct` DECIMAL(5,2) NULL,
+  -- The KTH's cut, taken OUT of the company's half rather than added on top:
+  -- the source model computes it as (NCF x 0.7) x 0.07, so farmer + company
+  -- still add up to 100 and the KTH is paid from the company side.
+  `profit_share_kth_pct`    DECIMAL(5,2) NULL,
   `created_at`     DATETIME NULL,
   `updated_at`     DATETIME NULL,
   KEY `idx_entities_type` (`entity_type`)
@@ -768,16 +772,21 @@ CREATE TABLE `profit_sharing` (
   `cost_saprodi`      DECIMAL(18,2) NOT NULL DEFAULT 0,  -- this plot only
   `cost_land`         DECIMAL(18,2) NOT NULL DEFAULT 0,  -- this plot only
   `total_investment`  DECIMAL(18,2) NOT NULL DEFAULT 0,  -- sum of the four above
-  -- Deficit brought forward from this plot's previous settlement (<= 0). Cost the
-  -- plot has not earned back yet follows it to the next sale instead of being
-  -- forgiven, which is what stops a second sale reading as profit while the plot
-  -- as a whole is still under water.
-  `carry_in`       DECIMAL(18,2) NOT NULL DEFAULT 0,
-  `net_profit`     DECIMAL(18,2) GENERATED ALWAYS AS (`total_revenue` - `total_investment` + `carry_in`) STORED,
+  `net_profit`     DECIMAL(18,2) GENERATED ALWAYS AS (`total_revenue` - `total_investment`) STORED,
   `pct_farmer`     DECIMAL(5,2) NOT NULL DEFAULT 0,
   `pct_company`    DECIMAL(5,2) NOT NULL DEFAULT 0,
+  `pct_kth`        DECIMAL(5,2) NOT NULL DEFAULT 0,
   `value_farmer`   DECIMAL(18,2) NOT NULL DEFAULT 0,
   `value_company`  DECIMAL(18,2) NOT NULL DEFAULT 0,
+  `value_kth`      DECIMAL(18,2) NOT NULL DEFAULT 0,
+  -- Running balance each party carries AFTER this settlement — the source
+  -- model's "Cumulative PETANI / SNBS / KTH" rows. A loss is shared by the same
+  -- percentages as a profit, so a bad harvest lands in the farmer's balance
+  -- rather than being absorbed entirely by the company; money is paid out only
+  -- while the balance is positive.
+  `cum_farmer`     DECIMAL(18,2) NOT NULL DEFAULT 0,
+  `cum_company`    DECIMAL(18,2) NOT NULL DEFAULT 0,
+  `cum_kth`        DECIMAL(18,2) NOT NULL DEFAULT 0,
   `status`         VARCHAR(40) NOT NULL DEFAULT 'Draft',
   `created_at`     DATETIME NULL,
   `updated_at`     DATETIME NULL,

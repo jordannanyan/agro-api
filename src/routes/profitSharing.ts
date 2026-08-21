@@ -90,11 +90,15 @@ router.use('/shares', crudRouter({
   table: 'profit_sharing',
   columns: ['period', 'selling_id', 'farmer_id', 'plot_id', 'commodities_id', 'volume_share', 'share_pct',
             'total_revenue', 'cost_processing', 'cost_selling', 'cost_saprodi', 'cost_land',
-            'total_investment', 'carry_in', 'pct_farmer', 'pct_company', 'value_farmer', 'value_company', 'status'],
+            'total_investment', 'pct_farmer', 'pct_company', 'pct_kth',
+            'value_farmer', 'value_company', 'value_kth',
+            'cum_farmer', 'cum_company', 'cum_kth', 'status'],
   required: ['period', 'farmer_id'],
   numeric: ['selling_id', 'farmer_id', 'plot_id', 'commodities_id', 'volume_share', 'share_pct',
             'total_revenue', 'cost_processing', 'cost_selling', 'cost_saprodi', 'cost_land',
-            'total_investment', 'carry_in', 'pct_farmer', 'pct_company', 'value_farmer', 'value_company'],
+            'total_investment', 'pct_farmer', 'pct_company', 'pct_kth',
+            'value_farmer', 'value_company', 'value_kth',
+            'cum_farmer', 'cum_company', 'cum_kth'],
   filterColumns: ['period', 'farmer_id', 'plot_id', 'selling_id', 'status'],
   orderBy: 'period DESC, id DESC',
   label: 'Profit sharing',
@@ -219,14 +223,24 @@ router.get('/pl', authenticate, async (req: Request, res: Response) => {
 // subtract it again and again.
 //
 // So a settlement charges what has NOT been charged yet — the plot's total
-// standing cost minus what earlier settlements already took. The remainder is
-// carried to the next sale on its own, which is also what makes a loss behave:
-// while a plot is under water the farmer's share is nil and the shortfall stays
-// on the plot until later sales clear it.
+// standing cost minus what earlier settlements already took. Nothing is charged
+// twice, and nothing is lost.
 //
-// The farmer's share is floored at zero. Profit sharing shares profit; a farmer
-// does not owe money back because a harvest sold for less than it cost. The
-// company therefore absorbs a negative, which `value_company` records as such.
+// The split then follows the model in the source workbook (SNBS Cavendish,
+// "1 Hitungan Simulasi"):
+//
+//   value_farmer  = pct_farmer x net                      (row 30: 0.3 x NCF)
+//   value_kth     = (net - value_farmer) x pct_kth         (row 20: (NCF x 0.7) x 0.07)
+//   value_company = net - value_farmer - value_kth         (row 21)
+//
+// A LOSS is shared by the very same percentages — the sheet multiplies a negative
+// NCF through unchanged, so a bad harvest lands 30% in the farmer's own balance
+// rather than being absorbed entirely by the company. Nothing is floored here.
+//
+// What each party has actually earned is the running balance (`cum_*`), the
+// sheet's "Cumulative PETANI / SNBS / KTH" rows. Money may be paid out only while
+// that balance is positive — the note at K13, "menentukan waktu kita share ketika
+// cumulative +". `payable_farmer` below reports it.
 // -----------------------------------------------------------------------------
 const SETTLE_SQL = `
 ${ALLOC}
@@ -237,28 +251,34 @@ SELECT a.plot_id, pl.plot_name, pl.farmer_id, f.farmer_name,
        COALESCE(land.amount, 0) AS land_total,
        COALESCE(ch.saprodi, 0)  AS saprodi_charged,
        COALESCE(ch.land, 0)     AS land_charged,
-       COALESCE(prev.net_profit, 0) AS prev_net,
+       COALESCE(prev.cum_farmer, 0)  AS prev_cum_farmer,
+       COALESCE(prev.cum_company, 0) AS prev_cum_company,
+       COALESCE(prev.cum_kth, 0)     AS prev_cum_kth,
        done.id AS settled_id
 FROM alloc a
 JOIN plot pl        ON pl.id = a.plot_id
 LEFT JOIN farmers f ON f.id = pl.farmer_id
+-- Only cost incurred UP TO the day of this sale. A harvest cannot be charged
+-- with money spent after it was sold; without the date bound the first
+-- settlement swallowed every cost the plot would ever carry, and the sale it
+-- belonged to read as a huge loss while later ones read as pure profit.
 LEFT JOIN (
   SELECT plot_id, SUM(total_amount) AS amount FROM pre_finance_distributions
-  WHERE plot_id IS NOT NULL GROUP BY plot_id
+  WHERE plot_id IS NOT NULL AND date <= ? GROUP BY plot_id
 ) sap ON sap.plot_id = pl.id
 LEFT JOIN (
   SELECT plot_id, SUM(amount) AS amount FROM profit_sharing_investments
-  WHERE plot_id IS NOT NULL GROUP BY plot_id
+  WHERE plot_id IS NOT NULL AND period <= DATE_FORMAT(?, '%Y-%m') GROUP BY plot_id
 ) land ON land.plot_id = pl.id
 LEFT JOIN (
   SELECT plot_id, SUM(cost_saprodi) AS saprodi, SUM(cost_land) AS land
   FROM profit_sharing WHERE plot_id IS NOT NULL GROUP BY plot_id
 ) ch ON ch.plot_id = pl.id
--- The deficit carried in is the net of the plot's LAST settlement, not the sum of
--- them: each settlement's net already rolls up the one before it, so adding them
--- together would count the same shortfall again and again.
+-- Opening balances = the closing balances of this plot's LAST settlement. Taken
+-- from the latest row rather than summed, because each row already carries the
+-- running total of everything before it.
 LEFT JOIN (
-  SELECT p.plot_id, p.net_profit
+  SELECT p.plot_id, p.cum_farmer, p.cum_company, p.cum_kth
   FROM profit_sharing p
   JOIN (SELECT plot_id, MAX(id) AS id FROM profit_sharing
         WHERE plot_id IS NOT NULL GROUP BY plot_id) last
@@ -290,14 +310,19 @@ async function buildSettlement(sellingId: number) {
   if (!sale) return { error: 'Selling not found' as const };
 
   let pct = sale.sale_pct != null ? Number(sale.sale_pct) : null;
-  if (pct == null && sale.entity_id != null) {
+  // The KTH cut has no per-sale override — it is a standing agreement of the PT.
+  let pctKth = 0;
+  if (sale.entity_id != null) {
     const [eRows] = await pool.query(
-      'SELECT profit_share_farmer_pct FROM entities WHERE id = ? LIMIT 1', [sale.entity_id]);
-    const v = (eRows as any[])[0]?.profit_share_farmer_pct;
-    if (v != null) pct = Number(v);
+      'SELECT profit_share_farmer_pct, profit_share_kth_pct FROM entities WHERE id = ? LIMIT 1',
+      [sale.entity_id]);
+    const e = (eRows as any[])[0] || {};
+    if (pct == null && e.profit_share_farmer_pct != null) pct = Number(e.profit_share_farmer_pct);
+    if (e.profit_share_kth_pct != null) pctKth = Number(e.profit_share_kth_pct);
   }
 
-  const [rows] = await pool.query(SETTLE_SQL, [sellingId]);
+  const saleDate = String(sale.date).slice(0, 10);
+  const [rows] = await pool.query(SETTLE_SQL, [saleDate, saleDate, sellingId]);
   const lines = (rows as any[]).map((r) => {
     // Only the part not yet charged to an earlier settlement of this plot.
     const costSaprodi = money(Math.max(0, Number(r.saprodi_total) - Number(r.saprodi_charged)));
@@ -306,11 +331,16 @@ async function buildSettlement(sellingId: number) {
     const costProcessing = money(Number(r.cost_processing));
     const costSelling = money(Number(r.cost_selling));
     const totalInvestment = money(costProcessing + costSelling + costSaprodi + costLand);
-    // Only a shortfall follows the plot. A previous settlement that ended in
-    // profit was already paid out, so carrying it forward would credit it twice.
-    const carryIn = money(Math.min(0, Number(r.prev_net)));
-    const net = money(revenue - totalInvestment + carryIn);
-    const valueFarmer = pct == null ? 0 : money(Math.max(0, net) * (pct / 100));
+    const net = money(revenue - totalInvestment);
+    // Percentages are applied to `net` as it stands, sign included. A loss is
+    // divided exactly like a profit, which is what the source model does.
+    const valueFarmer = pct == null ? 0 : money(net * (pct / 100));
+    const valueKth = pct == null ? 0 : money((net - valueFarmer) * (pctKth / 100));
+    const valueCompany = money(net - valueFarmer - valueKth);
+    // Closing balances = opening balances plus this settlement's shares.
+    const cumFarmer = money(Number(r.prev_cum_farmer) + valueFarmer);
+    const cumKth = money(Number(r.prev_cum_kth) + valueKth);
+    const cumCompany = money(Number(r.prev_cum_company) + valueCompany);
     return {
       plot_id: r.plot_id, plot_name: r.plot_name,
       farmer_id: r.farmer_id, farmer_name: r.farmer_name,
@@ -319,15 +349,23 @@ async function buildSettlement(sellingId: number) {
       cost_processing: costProcessing, cost_selling: costSelling,
       cost_saprodi: costSaprodi, cost_land: costLand,
       total_investment: totalInvestment,
-      carry_in: carryIn,
       net_profit: net,
-      pct_farmer: pct, pct_company: pct == null ? null : money(100 - pct),
+      pct_farmer: pct,
+      pct_company: pct == null ? null : money(100 - pct),
+      pct_kth: pctKth,
       value_farmer: valueFarmer,
-      value_company: money(net - valueFarmer),
+      value_company: valueCompany,
+      value_kth: valueKth,
+      cum_farmer: cumFarmer,
+      cum_company: cumCompany,
+      cum_kth: cumKth,
+      // What could actually be handed over today. The source model pays out of
+      // the running balance and only while it is positive.
+      payable_farmer: money(Math.max(0, cumFarmer)),
       already_settled_id: r.settled_id ?? null,
     };
   });
-  return { sale, pct, lines };
+  return { sale, pct, pctKth, lines };
 }
 
 // GET /api/profit-sharing/settlement/:sellingId — preview, nothing is written.
@@ -335,11 +373,11 @@ router.get('/settlement/:sellingId', authenticate, async (req: Request, res: Res
   try {
     const built = await buildSettlement(Number(req.params.sellingId));
     if ('error' in built) return res.status(404).json({ message: built.error });
-    const { sale, pct, lines } = built;
+    const { sale, pct, pctKth, lines } = built;
     return res.json({
       data: {
         selling_id: sale.id, date: sale.date, total_revenue: Number(sale.total_revenue),
-        entity_id: sale.entity_id, pct_farmer: pct,
+        entity_id: sale.entity_id, pct_farmer: pct, pct_kth: pctKth,
         settled: lines.some((l) => l.already_settled_id != null),
         lines,
       },
@@ -386,13 +424,16 @@ router.post('/settle', authenticate, async (req: Request, res: Response) => {
         `INSERT INTO profit_sharing
            (period, selling_id, farmer_id, plot_id, commodities_id, volume_share, share_pct,
             total_revenue, cost_processing, cost_selling, cost_saprodi, cost_land,
-            total_investment, carry_in, pct_farmer, pct_company, value_farmer, value_company,
+            total_investment, pct_farmer, pct_company, pct_kth,
+            value_farmer, value_company, value_kth, cum_farmer, cum_company, cum_kth,
             status, created_at, updated_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         [period, sellingId, l.farmer_id, l.plot_id, sale.commodities_id ?? null,
          l.volume_share, l.share_pct, l.total_revenue, l.cost_processing, l.cost_selling,
-         l.cost_saprodi, l.cost_land, l.total_investment, l.carry_in, l.pct_farmer, l.pct_company,
-         l.value_farmer, l.value_company, 'Draft', now, now]);
+         l.cost_saprodi, l.cost_land, l.total_investment,
+         l.pct_farmer, l.pct_company, l.pct_kth,
+         l.value_farmer, l.value_company, l.value_kth,
+         l.cum_farmer, l.cum_company, l.cum_kth, 'Draft', now, now]);
     }
     await conn.commit();
     return res.status(201).json({

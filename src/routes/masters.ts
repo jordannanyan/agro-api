@@ -9,9 +9,9 @@ import { authenticate } from '../middleware/auth';
 const entitiesCrud = crudRouter({
   table: 'entities',
   columns: ['entities_name', 'location', 'username', 'password', 'is_superadmin', 'entity_type',
-            'profit_share_farmer_pct'],
+            'profit_share_farmer_pct', 'profit_share_kth_pct'],
   required: ['entities_name', 'username'],
-  numeric: ['profit_share_farmer_pct'],
+  numeric: ['profit_share_farmer_pct', 'profit_share_kth_pct'],
   boolean: ['is_superadmin'],
   hashColumns: ['password'],
   hideColumns: ['password'],
