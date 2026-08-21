@@ -207,6 +207,15 @@ router.get('/pl', authenticate, async (req: Request, res: Response) => {
                 - COALESCE(r.cost_pnbp, 0)    AS net_profit,
               -- Debt, not cost: shown beside the margin because it decides whether
               -- anything may actually be paid out, never subtracted from it.
+              --
+              -- The two tables are added because they hold different things: the
+              -- distributions are what was handed to the farmer, the investments
+              -- are what was spent on the plot. They overlapped once — SNBS
+              -- imported the same material spend into both, from the Cavendish
+              -- Stock card and Daily Update sheets respectively, making this
+              -- figure 77% too large. Those rows now carry counts_as_debt = 0 and
+              -- drop out here while still counting against warehouse stock.
+              -- See docs/rekonsiliasi-buku-besar-2026-08.md.
               COALESCE(sap.amount, 0)         AS debt_saprodi,
               COALESCE(land.amount, 0)        AS debt_land,
               COALESCE(sap.amount, 0) + COALESCE(land.amount, 0) AS debt_total,
@@ -222,7 +231,7 @@ router.get('/pl', authenticate, async (req: Request, res: Response) => {
        LEFT JOIN (
          SELECT plot_id, SUM(total_amount) AS amount
          FROM pre_finance_distributions
-         WHERE plot_id IS NOT NULL ${sapWhere} GROUP BY plot_id
+         WHERE plot_id IS NOT NULL AND counts_as_debt = 1 ${sapWhere} GROUP BY plot_id
        ) sap ON sap.plot_id = pl.id
        LEFT JOIN (
          SELECT plot_id, SUM(amount) AS amount
@@ -304,7 +313,7 @@ LEFT JOIN farmers f ON f.id = pl.farmer_id
 -- belonged to read as a huge loss while later ones read as pure profit.
 LEFT JOIN (
   SELECT plot_id, SUM(total_amount) AS amount FROM pre_finance_distributions
-  WHERE plot_id IS NOT NULL AND date <= ? GROUP BY plot_id
+  WHERE plot_id IS NOT NULL AND counts_as_debt = 1 AND date <= ? GROUP BY plot_id
 ) sap ON sap.plot_id = pl.id
 LEFT JOIN (
   SELECT plot_id, SUM(amount) AS amount FROM profit_sharing_investments

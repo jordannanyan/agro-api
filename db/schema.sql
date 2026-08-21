@@ -694,6 +694,12 @@ CREATE TABLE `pre_finance_distributions` (
   `unit_id`             INT NULL,
   `price_per_unit`      DECIMAL(15,2) NULL,
   `total_amount`        DECIMAL(18,2) NOT NULL DEFAULT 0,
+  -- Whether this issue also counts as farmer debt. Normally it does. It is 0 for
+  -- the 1.066 SNBS Profit Sharing rows imported from the Cavendish `Stock card`,
+  -- whose cost is already booked in `profit_sharing_investments` as the
+  -- `Daily Update` material column — counting both made SNBS debt 77% too large.
+  -- The rows themselves must stay: `v_saprodi_stock` subtracts them to get stock.
+  `counts_as_debt`      TINYINT(1) NOT NULL DEFAULT 1,
   `description`         TEXT NULL,
   `upload_proof`        VARCHAR(255) NULL,
   `shipped_at`          DATETIME NULL,            -- "barang dikirim" (pengganti Stock Out)

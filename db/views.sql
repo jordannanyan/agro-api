@@ -47,7 +47,11 @@ LEFT JOIN (
 WHERE si.total_in IS NOT NULL OR d.total_out IS NOT NULL;
 
 -- Outstanding petani per pre-finance type:
---   Σ distributions.total_amount(type=T) − Σ installment_details.amount(type=T)
+--   Σ distributions.total_amount(type=T, counts_as_debt=1) − Σ installment_details.amount(type=T)
+--
+-- `counts_as_debt = 0` rows are goods that did leave the warehouse but whose cost
+-- is already booked as farmer debt elsewhere; counting them here too made the same
+-- rupiah owed twice. See `pre_finance_distributions.counts_as_debt` in schema.sql.
 DROP VIEW IF EXISTS `v_pre_finance_outstanding`;
 CREATE VIEW `v_pre_finance_outstanding` AS
 SELECT
@@ -63,6 +67,7 @@ CROSS JOIN pre_finance_types t
 LEFT JOIN (
   SELECT farmer_id, pre_finance_type_id, SUM(total_amount) AS dist_total
   FROM pre_finance_distributions
+  WHERE counts_as_debt = 1
   GROUP BY farmer_id, pre_finance_type_id
 ) d ON d.farmer_id = f.id AND d.pre_finance_type_id = t.id
 LEFT JOIN (
