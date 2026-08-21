@@ -49,6 +49,13 @@ CREATE TABLE `entities` (
   -- `P * 7/30` where P is the farmer's 30% — i.e. 7% of the base, leaving the
   -- company 63%. AML (JNBS) has no KTH cut: farmer 50, company 50.
   `profit_share_kth_pct`    DECIMAL(5,2) NULL,
+  -- Which gate decides what a farmer may actually be paid. The two operational
+  -- ledgers disagree and both are in force:
+  --   NetSurplus (SJ)  IF((margin - debt - already paid) > 0, that x pct, 0)
+  --   Gate       (AML) IF((margin - debt) > 0, standing share - already paid, 0)
+  -- SJ nets the debt out of the base and pays a percentage of what is left; AML
+  -- uses the debt only as a switch and then pays the whole standing share.
+  `payout_rule`             ENUM('Gate','NetSurplus') NOT NULL DEFAULT 'Gate',
   -- Cost rates the ledgers charge against a delivery before anything is shared.
   -- AML bills harvesting on the volume bought (Rp 1.125/kg); SJ bills it on the
   -- volume shipped (Rp 950/kg, its harvesting + washing lines). PNBP is Rp 30 per

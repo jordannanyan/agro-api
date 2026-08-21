@@ -285,10 +285,10 @@ router.get('/pl', authenticate, async (req: Request, res: Response) => {
 // NCF through unchanged, so a bad harvest lands 30% in the farmer's own balance
 // rather than being absorbed entirely by the company. Nothing is floored here.
 //
-// What each party has actually earned is the running balance (`cum_*`). Money may
-// be paid out only while that balance is positive — the ledgers gate it the same
-// way (`IF((profit - cost - already paid) > 0, ...)`), and `payable_farmer` below
-// reports what that comes to today.
+// What each party has actually earned is the running balance (`cum_*`). A
+// positive balance is NOT enough to be paid, though: the plot has to have earned
+// back what was spent on it. Both ledgers gate on that and they do it
+// differently, so the rule lives on `entities.payout_rule` — see `payoutFarmer`.
 // -----------------------------------------------------------------------------
 const SETTLE_SQL = `
 ${ALLOC}
@@ -339,6 +339,45 @@ ORDER BY pl.plot_name`;
 
 const money = (n: number) => Math.round(n * 100) / 100;
 
+// What has already been handed to the farmer — the ledgers' `Total Historic
+// Profit Share`. There is nowhere to record an outgoing payment yet, so it is
+// always 0 and every settlement reports the full amount as still payable. When
+// payment recording arrives this is the one place that has to start reading it.
+const alreadyPaidToFarmer = (_plotId: number) => 0;
+
+/**
+ * What may actually be handed to the farmer today.
+ *
+ * A positive running balance is not enough: the plot has to have earned back
+ * what was spent on it first. Both ledgers gate on that, and they do it
+ * differently — so the rule is a property of the PT, stored on `entities`.
+ *
+ *   NetSurplus — "Buku Besar - SJ - Banana", Farmer Database column P:
+ *       =IF((J-E-F-Q) > 0, (J-E-F-Q) * 0.3, 0)
+ *     The debt comes out of the base and the farmer gets his percentage of
+ *     whatever is left. Verified: AG1 → Rp 1.007.953,75, AG2 → 0.
+ *
+ *   Gate — "Buku Besar - AML - Banana", Farmer Database column L:
+ *       =IF((J-O) > 0, (K-Q), 0)
+ *     The debt is only a switch. Once the plot's margin clears it, the farmer's
+ *     whole standing share becomes payable. Verified: SM003002 → 0, because its
+ *     Rp 83,7 juta debt still exceeds the Rp 53,6 juta the plot has generated.
+ *
+ * `cumNet` is the plot's cumulative margin — the three running balances add back
+ * up to it — and `debt` is its whole standing debt, not the slice this
+ * settlement charged.
+ */
+function payoutFarmer(
+  rule: string, cumNet: number, debt: number, cumFarmer: number, paid: number, pct: number | null,
+): number {
+  if (pct == null) return 0;
+  if (rule === 'NetSurplus') {
+    const surplus = cumNet - debt - paid;
+    return surplus > 0 ? money(surplus * (pct / 100)) : 0;
+  }
+  return cumNet - debt > 0 ? money(Math.max(0, cumFarmer - paid)) : 0;
+}
+
 /** Read the sale, the percentage in force, and the lines it would settle. */
 async function buildSettlement(sellingId: number) {
   const [sRows] = await pool.query(
@@ -361,13 +400,16 @@ async function buildSettlement(sellingId: number) {
   let pct = sale.sale_pct != null ? Number(sale.sale_pct) : null;
   // The KTH cut has no per-sale override — it is a standing agreement of the PT.
   let pctKth = 0;
+  // Which payout gate this PT's ledger uses. See `payoutFarmer` below.
+  let payoutRule = 'Gate';
   if (sale.entity_id != null) {
     const [eRows] = await pool.query(
-      'SELECT profit_share_farmer_pct, profit_share_kth_pct FROM entities WHERE id = ? LIMIT 1',
+      'SELECT profit_share_farmer_pct, profit_share_kth_pct, payout_rule FROM entities WHERE id = ? LIMIT 1',
       [sale.entity_id]);
     const e = (eRows as any[])[0] || {};
     if (pct == null && e.profit_share_farmer_pct != null) pct = Number(e.profit_share_farmer_pct);
     if (e.profit_share_kth_pct != null) pctKth = Number(e.profit_share_kth_pct);
+    if (e.payout_rule) payoutRule = String(e.payout_rule);
   }
 
   const saleDate = String(sale.date).slice(0, 10);
@@ -415,9 +457,20 @@ async function buildSettlement(sellingId: number) {
       cum_farmer: cumFarmer,
       cum_company: cumCompany,
       cum_kth: cumKth,
-      // What could actually be handed over today. The source model pays out of
-      // the running balance and only while it is positive.
-      payable_farmer: money(Math.max(0, cumFarmer)),
+      // The whole standing debt of the plot, which the payout gate measures the
+      // plot's cumulative margin against. Not the slice charged by this
+      // settlement — that is `debt_saprodi` + `debt_land` above.
+      debt_total: money(Number(r.saprodi_total) + Number(r.land_total)),
+      payout_rule: payoutRule,
+      // What could actually be handed over today, per this PT's ledger.
+      payable_farmer: payoutFarmer(
+        payoutRule,
+        money(cumFarmer + cumKth + cumCompany),
+        money(Number(r.saprodi_total) + Number(r.land_total)),
+        cumFarmer,
+        alreadyPaidToFarmer(r.plot_id),
+        pct,
+      ),
       already_settled_id: r.settled_id ?? null,
     };
   });

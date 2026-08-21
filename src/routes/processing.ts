@@ -9,6 +9,24 @@ export const router = Router();
 
 const STATUSES = ['open', 'processing', 'closed'] as const;
 
+/**
+ * Processing can only lose weight, never gain it. Nothing enforced that, and 50
+ * of the 185 imported batches came out heavier than they went in, which makes
+ * the derived `loss` negative and quietly inflates every volume downstream of
+ * them. Historic rows are left alone — see docs/rekonsiliasi-buku-besar-2026-08.md
+ * — but nothing new may be written that way.
+ *
+ * Returns an error message, or null when the pair is acceptable.
+ */
+function checkVolumes(input: number, output: number): string | null {
+  if (!Number.isFinite(input) || input < 0) return 'volume_input tidak boleh negatif';
+  if (!Number.isFinite(output) || output < 0) return 'volume_output tidak boleh negatif';
+  if (output > input) {
+    return `volume_output (${output}) tidak boleh melebihi volume_input (${input})`;
+  }
+  return null;
+}
+
 const SELECT = `
   SELECT pr.*, c.commodities_name AS commodity__commodities_name, w.warehouse_name AS warehouse__warehouse_name,
          (pr.volume_input - pr.volume_output) AS loss
@@ -78,6 +96,10 @@ router.post('/', authenticate, async (req: Request, res: Response) => {
       return res.status(422).json({ message: 'processing_code, date, commodities_id are required' });
     }
     if (b.status && !STATUSES.includes(b.status)) return res.status(422).json({ message: 'Invalid status' });
+    const vIn = b.volume_input != null ? Number(b.volume_input) : 0;
+    const vOut = b.volume_output != null ? Number(b.volume_output) : 0;
+    const badVolume = checkVolumes(vIn, vOut);
+    if (badVolume) return res.status(422).json({ message: badVolume });
 
     await conn.beginTransaction();
     const cols: any = {
@@ -127,10 +149,19 @@ const update = async (req: Request, res: Response) => {
   const conn = await pool.getConnection();
   try {
     const id = req.params.id;
-    const [ex] = await conn.query('SELECT id FROM processing WHERE id = ? LIMIT 1', [id]);
+    const [ex] = await conn.query(
+      'SELECT id, volume_input, volume_output FROM processing WHERE id = ? LIMIT 1', [id]);
     if (!(ex as any[]).length) { conn.release(); return res.status(404).json({ message: 'Processing not found' }); }
     const b = req.body || {};
     if (b.status && !STATUSES.includes(b.status)) { conn.release(); return res.status(422).json({ message: 'Invalid status' }); }
+    // A PUT may send either volume, so the pair is checked as it will END UP,
+    // not as it arrived — otherwise raising the output alone slips through.
+    const cur = (ex as any[])[0];
+    const badVolume = checkVolumes(
+      b.volume_input != null ? Number(b.volume_input) : Number(cur.volume_input),
+      b.volume_output != null ? Number(b.volume_output) : Number(cur.volume_output),
+    );
+    if (badVolume) { conn.release(); return res.status(422).json({ message: badVolume }); }
 
     await conn.beginTransaction();
     const updates: Record<string, any> = {};
