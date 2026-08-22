@@ -7,7 +7,7 @@
 // forming part of it, and a fully approved PayReq awaiting payment should not read
 // as "waiting for approval".
 
-export type DocType = 'PR' | 'PO' | 'PayReq';
+export type DocType = 'PR' | 'PO' | 'PayReq' | 'Reimbursement';
 
 /** Columns to append to a SELECT list. Pairs with {@link pendingStepJoin}. */
 export const PENDING_STEP_COLUMNS = `

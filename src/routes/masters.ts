@@ -125,7 +125,11 @@ export const offtakersRouter = crudRouter({
 
 export const kthRouter = crudRouter({
   table: 'kth',
-  columns: ['kth_name', 'address', 'regency', 'partnership_period', 'entities_id', 'username', 'password'],
+  // bank_* is the account a reimbursement is transferred to. It lives on the KTH
+  // rather than on each document so the same account is not transcribed afresh
+  // every time somebody pays the farmers under it.
+  columns: ['kth_name', 'address', 'regency', 'partnership_period',
+    'bank_name', 'bank_account', 'bank_account_name', 'entities_id', 'username', 'password'],
   required: ['kth_name'],
   numeric: ['entities_id'],
   filterColumns: ['entities_id'],

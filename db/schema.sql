@@ -102,7 +102,7 @@ CREATE TABLE `users` (
 -- Approval routing config (per document type, per entity, per step).
 CREATE TABLE `approval_routes` (
   `id`             INT AUTO_INCREMENT PRIMARY KEY,
-  `document_type`  ENUM('PR','PO','PayReq') NOT NULL,
+  `document_type`  ENUM('PR','PO','PayReq','Reimbursement') NOT NULL,
   `entity_id`      INT NULL,                          -- NULL = berlaku semua entitas
   `step_order`     INT NOT NULL,
   -- 'Payment' is the cash-execution step (PayReq step 5). It is not an approval:
@@ -206,6 +206,11 @@ CREATE TABLE `kth` (
   `address`            VARCHAR(255) NULL,
   `regency`            VARCHAR(255) NULL,
   `partnership_period` VARCHAR(255) NULL,
+  -- The account a reimbursement is transferred to. Farmers have `no_rek`; the KTH
+  -- had nothing, so the account was typed afresh on every document that needed it.
+  `bank_name`          VARCHAR(80) NULL,
+  `bank_account`       VARCHAR(60) NULL,
+  `bank_account_name`  VARCHAR(150) NULL,
   `entities_id`        INT NULL,
   `username`           VARCHAR(150) NULL UNIQUE,
   `password`           VARCHAR(255) NULL,
@@ -528,12 +533,21 @@ CREATE TABLE `payment_requests` (
   -- line on the statement, so it is short and carries a check character.
   `payment_code`        VARCHAR(16) NULL UNIQUE,
   `payment_code_issued_at` DATETIME NULL,
+  -- Two kinds of payment request share this table, because everything around one
+  -- is what the other needs: the chain, the code, the statement matching, the
+  -- attachments. 'Reimbursement' pays farmers through their KTH and descends from
+  -- no purchase at all; see `reimbursement_items` and approval_routes.
+  `payreq_kind`         ENUM('Procurement','Reimbursement') NOT NULL DEFAULT 'Procurement',
   `purchase_request_id` INT NULL,
   `purchase_order_id`   INT NULL,
   `entity_id`           INT NOT NULL,
+  `kth_id`              INT NULL,      -- Reimbursement only: whose account is paid
   `budget_code_id`      INT NULL,
   `reason`              TEXT NULL,
   `person_in_charge`    VARCHAR(150) NULL,
+  -- Who filed it. Without this, guardDelete could only fall back to "whoever holds
+  -- the requester role", which let one Field Admin discard another's draft.
+  `requested_by_user_id` INT NULL,
   `activity_date`       DATE NULL,
   `estimated_pay_date`  DATE NULL,
   `released_pay_date`   DATE NULL,
@@ -554,6 +568,8 @@ CREATE TABLE `payment_requests` (
   CONSTRAINT `fk_payreq_pr`     FOREIGN KEY (`purchase_request_id`) REFERENCES `purchase_requests`(`id`) ON DELETE SET NULL,
   CONSTRAINT `fk_payreq_po`     FOREIGN KEY (`purchase_order_id`)   REFERENCES `purchase_orders`(`id`) ON DELETE SET NULL,
   CONSTRAINT `fk_payreq_entity` FOREIGN KEY (`entity_id`)           REFERENCES `entities`(`id`),
+  CONSTRAINT `fk_payreq_kth`    FOREIGN KEY (`kth_id`)              REFERENCES `kth`(`id`) ON DELETE SET NULL,
+  CONSTRAINT `fk_payreq_requester` FOREIGN KEY (`requested_by_user_id`) REFERENCES `users`(`id`) ON DELETE SET NULL,
   CONSTRAINT `fk_payreq_budget` FOREIGN KEY (`budget_code_id`)      REFERENCES `budget_codes`(`id`) ON DELETE SET NULL,
   CONSTRAINT `fk_payreq_method` FOREIGN KEY (`payment_method_id`)   REFERENCES `payment_methods`(`id`) ON DELETE SET NULL,
   CONSTRAINT `fk_payreq_paidby` FOREIGN KEY (`paid_by_user_id`)     REFERENCES `users`(`id`) ON DELETE SET NULL
@@ -561,12 +577,34 @@ CREATE TABLE `payment_requests` (
   -- A CHECK constraint was intentionally omitted for MySQL/MariaDB portability.
 ) ENGINE=InnoDB;
 
+-- The farmers one reimbursement settles, and how much each is owed.
+--
+-- The money moves once, to the KTH's account; this is the breakdown that says who
+-- it was for. `payment_requests.amount` is the sum of these rows and is derived
+-- from them by the API, never typed — a header that disagrees with its own lines
+-- is a payment nobody can account for.
+--
+-- `farmer_name` is a snapshot rather than a join: farmers get renamed and deleted,
+-- and a payment record has to keep saying who was paid.
+CREATE TABLE `reimbursement_items` (
+  `id`                 INT AUTO_INCREMENT PRIMARY KEY,
+  `payment_request_id` INT NOT NULL,
+  `farmer_id`          INT NULL,
+  `farmer_name`        VARCHAR(255) NOT NULL,
+  `description`        VARCHAR(255) NULL,
+  `amount`             DECIMAL(18,2) NOT NULL DEFAULT 0,
+  `created_at`         DATETIME NULL,
+  `updated_at`         DATETIME NULL,
+  CONSTRAINT `fk_ri_payreq` FOREIGN KEY (`payment_request_id`) REFERENCES `payment_requests`(`id`) ON DELETE CASCADE,
+  CONSTRAINT `fk_ri_farmer` FOREIGN KEY (`farmer_id`)          REFERENCES `farmers`(`id`) ON DELETE SET NULL
+) ENGINE=InnoDB;
+
 -- -----------------------------------------------------------------------------
 -- CLUSTER: Dokumen Generic (polymorphic doc_type + doc_id)
 -- -----------------------------------------------------------------------------
 CREATE TABLE `document_approvals` (
   `id`            INT AUTO_INCREMENT PRIMARY KEY,
-  `document_type` ENUM('PR','PO','PayReq') NOT NULL,
+  `document_type` ENUM('PR','PO','PayReq','Reimbursement') NOT NULL,
   `document_id`   INT NOT NULL,
   `step_order`    INT NOT NULL,
   `step_label`    ENUM('Requested','Approved','Acknowledged','Payment') NULL,
@@ -586,7 +624,7 @@ CREATE TABLE `document_approvals` (
 
 CREATE TABLE `document_attachments` (
   `id`            INT AUTO_INCREMENT PRIMARY KEY,
-  `document_type` ENUM('PR','PO','PayReq') NOT NULL,
+  `document_type` ENUM('PR','PO','PayReq','Reimbursement') NOT NULL,
   `document_id`   INT NOT NULL,
   `category`      VARCHAR(80) NULL,
   `subcategory`   VARCHAR(80) NULL,
@@ -598,7 +636,7 @@ CREATE TABLE `document_attachments` (
 
 CREATE TABLE `document_activities` (
   `id`            INT AUTO_INCREMENT PRIMARY KEY,
-  `document_type` ENUM('PR','PO','PayReq') NOT NULL,
+  `document_type` ENUM('PR','PO','PayReq','Reimbursement') NOT NULL,
   `document_id`   INT NOT NULL,
   `action`        VARCHAR(120) NOT NULL,
   `user_id`       INT NULL,

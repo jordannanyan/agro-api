@@ -10,15 +10,28 @@ import { issuePaymentCode } from '../utils/payments';
 // Mounted at /api/documents/:type/:id/(approvals|attachments|activities)
 export const router = Router({ mergeParams: true });
 
-const DOC_TYPES = ['PR', 'PO', 'PayReq'] as const;
+const DOC_TYPES = ['PR', 'PO', 'PayReq', 'Reimbursement'] as const;
 export type DocType = (typeof DOC_TYPES)[number];
 
-/** Where each document type keeps its own status column. */
+/**
+ * Where each document type keeps its own status column.
+ *
+ * PayReq and Reimbursement share `payment_requests` deliberately: a reimbursement
+ * is a payment request with no purchase behind it, and everything a payment
+ * request already has — the chain, the code, the statement matching — is what it
+ * needs. They stay distinguishable because ids come from the one table, so
+ * ('PayReq', 7) and ('Reimbursement', 7) can never both exist.
+ */
 const DOC_TABLE: Record<DocType, string> = {
   PR: 'purchase_requests',
   PO: 'purchase_orders',
   PayReq: 'payment_requests',
+  Reimbursement: 'payment_requests',
 };
+
+/** The document types that end in money leaving the account. */
+export const PAYMENT_DOC_TYPES: DocType[] = ['PayReq', 'Reimbursement'];
+const isPaymentDoc = (t: DocType) => PAYMENT_DOC_TYPES.includes(t);
 
 function checkType(req: Request, res: Response): boolean {
   if (!DOC_TYPES.includes(req.params.type as any)) {
@@ -125,12 +138,13 @@ function revisionForUser(docType: DocType, user: AuthUser, scope: number | null)
         AND (${byUser}${requesterRoleSql(docType)} = ?)`, args);
 }
 
-// GET /api/documents/inbox → { PR, PO, PayReq, total }
+// GET /api/documents/inbox → { PR, PO, PayReq, Reimbursement, total }
 router.get('/inbox', authenticate, async (req: Request, res: Response) => {
   const empty = {
     PR: { approval: 0, revision: 0, total: 0 },
     PO: { approval: 0, revision: 0, total: 0 },
     PayReq: { approval: 0, revision: 0, payment: 0, total: 0 },
+    Reimbursement: { approval: 0, revision: 0, payment: 0, total: 0 },
     total: 0,
   };
   const user = req.user;
@@ -142,7 +156,8 @@ router.get('/inbox', authenticate, async (req: Request, res: Response) => {
   const scope = entityScope(req);
   const roleCode = user.roleCode;
 
-  const [prApproval, prRevision, poApproval, poRevision, payApproval, payRevision] =
+  const [prApproval, prRevision, poApproval, poRevision, payApproval, payRevision,
+         rbApproval, rbRevision] =
     await Promise.all([
       pendingOnRole('PR', roleCode, scope),
       revisionForUser('PR', user, scope),
@@ -150,18 +165,27 @@ router.get('/inbox', authenticate, async (req: Request, res: Response) => {
       revisionForUser('PO', user, scope),
       pendingOnRole('PayReq', roleCode, scope),
       revisionForUser('PayReq', user, scope),
+      pendingOnRole('Reimbursement', roleCode, scope),
+      revisionForUser('Reimbursement', user, scope),
     ]);
 
   // Releasing the cash is the last thing the flow asks of anybody, and it has no
   // approval step waiting on it — the request simply sits at Approved until
   // finance records the payment. Without this the final task would never show.
   let payment = 0;
+  let rbPayment = 0;
   if (PAYMENT_EXECUTOR_ROLES.includes(roleCode as any)) {
     const args: any[] = [];
     let scoped = '';
     if (scope != null) { scoped = ' AND d.entity_id = ?'; args.push(scope); }
-    payment = await countOne(
-      `SELECT COUNT(*) AS n FROM payment_requests d WHERE d.status = 'Approved'${scoped}`, args);
+    // Counted per kind so the two never appear as one queue: a reimbursement is
+    // paid out of the same screen but chased by different people.
+    const awaitingPayment = (kind: string) => countOne(
+      `SELECT COUNT(*) AS n FROM payment_requests d
+       WHERE d.status = 'Approved' AND d.payreq_kind = ?${scoped}`, [kind, ...args]);
+    [payment, rbPayment] = await Promise.all([
+      awaitingPayment('Procurement'), awaitingPayment('Reimbursement'),
+    ]);
   }
 
   const data = {
@@ -171,9 +195,13 @@ router.get('/inbox', authenticate, async (req: Request, res: Response) => {
       approval: payApproval, revision: payRevision, payment,
       total: payApproval + payRevision + payment,
     },
+    Reimbursement: {
+      approval: rbApproval, revision: rbRevision, payment: rbPayment,
+      total: rbApproval + rbRevision + rbPayment,
+    },
     total: 0,
   };
-  data.total = data.PR.total + data.PO.total + data.PayReq.total;
+  data.total = data.PR.total + data.PO.total + data.PayReq.total + data.Reimbursement.total;
   return res.json({ data });
 });
 
@@ -324,21 +352,51 @@ router.get('/:type/:id/attachments', authenticate, async (req, res) => {
   return res.json({ data: rows });
 });
 
-router.post('/:type/:id/attachments', authenticate, upload.single('file'), async (req: Request, res: Response) => {
+// Several files at once.
+//
+// One-at-a-time was fine while an attachment was a single signed PO. A
+// reimbursement arrives as a stack — the signed farmer list, a photo of each
+// receipt, the transfer slip — and uploading them one round trip at a time is how
+// people end up attaching three of the five.
+//
+// `file` (one) is still accepted so nothing that already worked stops working;
+// `files` takes up to twenty. The response is always the array of what was stored.
+const attachmentUpload = upload.fields([
+  { name: 'file', maxCount: 1 },
+  { name: 'files', maxCount: 20 },
+]);
+
+router.post('/:type/:id/attachments', authenticate, attachmentUpload, async (req: Request, res: Response) => {
   if (!checkType(req, res)) return;
   // Deliberately not gated on status: Finance uploads the transfer receipt after a
   // payment request is already Paid, and a requester uploads revision evidence
   // while the document sits in Revision. The entity is the line that matters.
   if (!(await loadScopedDocument(req, res))) return;
-  const path = fileToPath(req.file);
-  if (!path) return res.status(422).json({ message: 'file is required' });
-  const [result] = await pool.query(
-    `INSERT INTO document_attachments (document_type, document_id, category, subcategory, file_path, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, NOW(), NOW())`,
-    [req.params.type, req.params.id, req.body?.category ?? null, req.body?.subcategory ?? null, path]
-  );
-  const [rows] = await pool.query('SELECT * FROM document_attachments WHERE id = ? LIMIT 1', [(result as any).insertId]);
-  return res.status(201).json({ message: 'Attachment uploaded', data: (rows as any[])[0] });
+
+  const grouped = (req.files ?? {}) as Record<string, Express.Multer.File[]>;
+  const files = [...(grouped.file ?? []), ...(grouped.files ?? [])];
+  const paths = files.map(fileToPath).filter(Boolean) as string[];
+  if (!paths.length) {
+    return res.status(422).json({
+      message: 'Tidak ada berkas yang diterima. Lampirkan gambar atau PDF (maksimal 5 MB per berkas).',
+    });
+  }
+
+  const ids: number[] = [];
+  for (const path of paths) {
+    const [result] = await pool.query(
+      `INSERT INTO document_attachments (document_type, document_id, category, subcategory, file_path, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, NOW(), NOW())`,
+      [req.params.type, req.params.id, req.body?.category ?? null, req.body?.subcategory ?? null, path]
+    );
+    ids.push((result as any).insertId);
+  }
+  const [rows] = await pool.query(
+    'SELECT * FROM document_attachments WHERE id IN (?) ORDER BY id ASC', [ids]);
+  return res.status(201).json({
+    message: ids.length > 1 ? `${ids.length} lampiran diunggah` : 'Attachment uploaded',
+    data: rows,
+  });
 });
 
 router.delete('/:type/:id/attachments/:attId', authenticate, async (req, res) => {
@@ -420,6 +478,9 @@ const DEFAULT_REQUESTER_ROLE: Record<DocType, string> = {
   PR: ROLE.FIELD_ADMIN,
   PO: ROLE.PROCUREMENT,
   PayReq: ROLE.PROCUREMENT,
+  // Nothing is procured on a reimbursement, and Field Admin is who deals with the
+  // KTH and its farmers.
+  Reimbursement: ROLE.FIELD_ADMIN,
 };
 
 async function requesterRoleCode(docType: DocType, docId: number): Promise<string | null> {
@@ -574,9 +635,9 @@ export async function syncDocumentStatus(docType: DocType, docId: number): Promi
   else if (steps.every((s) => s.status === 'Approved')) status = 'Approved';
   else status = 'Pending';
 
-  // A PayReq already marked Paid must not be dragged back to Approved.
+  // A payment already marked Paid must not be dragged back to Approved.
   const table = DOC_TABLE[docType];
-  if (docType === 'PayReq') {
+  if (isPaymentDoc(docType)) {
     const [cur] = await pool.query(`SELECT status FROM ${table} WHERE id = ? LIMIT 1`, [docId]);
     if ((cur as any[])[0]?.status === 'Paid') return 'Paid';
   }
@@ -587,7 +648,7 @@ export async function syncDocumentStatus(docType: DocType, docId: number): Promi
   // will identify it on the bank statement — issued here rather than in the
   // approval handler so that every route into 'Approved' produces one, including
   // a resubmitted document whose last step is signed off elsewhere.
-  if (docType === 'PayReq' && status === 'Approved') {
+  if (isPaymentDoc(docType) && status === 'Approved') {
     await issuePaymentCode(docId);
   }
 

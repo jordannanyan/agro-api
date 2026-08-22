@@ -439,9 +439,14 @@ router.get('/outstanding', authenticate, requireRole(...RECONCILERS), async (req
     `SELECT pay.id, pay.payreq_number, pay.payment_code, pay.payment_code_issued_at,
             pay.amount, pay.beneficiary_name, pay.bank_name, pay.bank_account,
             pay.estimated_pay_date, e.entities_name AS entity_name,
+            -- Reimbursements are chased from this same list: they are approved
+            -- payments awaiting a transfer like any other. Named so the person
+            -- working the list knows a farmer group is waiting, not a supplier.
+            pay.payreq_kind, k.kth_name,
             DATEDIFF(CURDATE(), COALESCE(pay.payment_code_issued_at, pay.updated_at)) AS age_days
      FROM payment_requests pay
      LEFT JOIN entities e ON e.id = pay.entity_id
+     LEFT JOIN kth k      ON k.id = pay.kth_id
      WHERE pay.status = 'Approved'
      ORDER BY age_days DESC, pay.id DESC`);
   return res.json({ data: rows });

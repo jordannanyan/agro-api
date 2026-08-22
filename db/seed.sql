@@ -168,7 +168,20 @@ INSERT INTO `approval_routes` (document_type, entity_id, step_order, step_label,
 ('PayReq', 2, 1, 'Requested',    3, NULL, NULL),
 ('PayReq', 2, 2, 'Approved',     2, NULL, NULL),
 ('PayReq', 2, 3, 'Approved',     4, NULL, NULL),
-('PayReq', 2, 4, 'Acknowledged', 6, NULL, NULL);
+('PayReq', 2, 4, 'Acknowledged', 6, NULL, NULL),
+-- ---- Reimbursement: the same chain as a PayReq, filed by the Field Admin ----
+-- Nothing is procured, so Procurement does not raise it; Field Admin is who deals
+-- with the KTH and its farmers. Steps 2-4 are deliberately identical to PayReq,
+-- and scripts/migrateReimbursement2026-08.js derives them from the PayReq rows
+-- for exactly that reason.
+('Reimbursement', 1, 1, 'Requested',    1, NULL, NULL),
+('Reimbursement', 1, 2, 'Approved',     2, NULL, NULL),
+('Reimbursement', 1, 3, 'Approved',     4, NULL, NULL),
+('Reimbursement', 1, 4, 'Acknowledged', 6, NULL, NULL),
+('Reimbursement', 2, 1, 'Requested',    1, NULL, NULL),
+('Reimbursement', 2, 2, 'Approved',     2, NULL, NULL),
+('Reimbursement', 2, 3, 'Approved',     4, NULL, NULL),
+('Reimbursement', 2, 4, 'Acknowledged', 6, NULL, NULL);
 -- PayReq step 5 (Payment Process) is intentionally NOT a route row: it is cash
 -- execution, not approval. POST /api/payment-requests/:id/pay writes it, and both
 -- Finance Manager and Finance Staff may call that endpoint.

@@ -28,7 +28,10 @@ ${pendingStepJoin('PayReq', 'pay')}
 
 // GET /api/payment-requests?entity_id=&status=&route=
 router.get('/', authenticate, async (req: Request, res: Response) => {
-  const where: string[] = [];
+  // Reimbursements live in the same table but are a different document with a
+  // different chain and their own screen; mixing them into the procurement queue
+  // would put farmer payments in front of people looking for supplier invoices.
+  const where: string[] = ["pay.payreq_kind = 'Procurement'"];
   const args: any[] = [];
   // Same rule as PR and PO: entity-bound staff see their own PT only.
   const scope = entityScope(req);

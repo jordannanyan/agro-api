@@ -36,20 +36,26 @@ export async function settlePaymentRequest(
   opts: SettleOptions = {},
 ): Promise<SettleResult> {
   const [ex] = await pool.query(
-    'SELECT id, status FROM payment_requests WHERE id = ? LIMIT 1', [payreqId]);
+    'SELECT id, status, payreq_kind FROM payment_requests WHERE id = ? LIMIT 1', [payreqId]);
   const payreq = (ex as any[])[0];
   if (!payreq) return { ok: false, status: 404, message: 'Payment request not found' };
   if (payreq.status === 'Paid') {
     return { ok: false, status: 409, message: 'This payment request is already paid.' };
   }
 
+  // A reimbursement keeps its chain under its own document_type, so the steps this
+  // has to check — and the Payment step it appends — belong to that type, not to
+  // 'PayReq'. Reading it from the row rather than taking it as an argument means
+  // the statement importer, which knows only a payment code, cannot get it wrong.
+  const docType = payreq.payreq_kind === 'Reimbursement' ? 'Reimbursement' : 'PayReq';
+
   const [steps] = await pool.query(
     `SELECT da.step_order, da.status, r.role_name
      FROM document_approvals da
      LEFT JOIN roles r ON r.id = da.role_id
-     WHERE da.document_type = 'PayReq' AND da.document_id = ?
+     WHERE da.document_type = ? AND da.document_id = ?
        AND COALESCE(da.step_label, '') <> 'Payment'
-     ORDER BY da.step_order ASC`, [payreqId]);
+     ORDER BY da.step_order ASC`, [docType, payreqId]);
   const chain = steps as any[];
   if (!chain.length) {
     return { ok: false, status: 409, message: 'This payment request has no approval chain yet.' };
@@ -77,13 +83,13 @@ export async function settlePaymentRequest(
   await pool.query(
     `INSERT INTO document_approvals
        (document_type, document_id, step_order, step_label, role_id, user_id, name, position, action_date, note, status, created_at, updated_at)
-     VALUES ('PayReq', ?, ?, 'Payment', ?, ?, ?, ?, ?, ?, 'Approved', NOW(), NOW())`,
-    [payreqId, nextOrder, user.roleId ?? null, user.id, user.data?.name ?? null,
+     VALUES (?, ?, ?, 'Payment', ?, ?, ?, ?, ?, ?, 'Approved', NOW(), NOW())`,
+    [docType, payreqId, nextOrder, user.roleId ?? null, user.id, user.data?.name ?? null,
      user.data?.position ?? null, releasedDate, opts.note ?? null]);
   await pool.query(
     `INSERT INTO document_activities (document_type, document_id, action, user_id, note, created_at)
-     VALUES ('PayReq', ?, 'Payment released', ?, ?, NOW())`,
-    [payreqId, user.id, opts.note ?? null]);
+     VALUES (?, ?, 'Payment released', ?, ?, NOW())`,
+    [docType, payreqId, user.id, opts.note ?? null]);
 
   return { ok: true };
 }
