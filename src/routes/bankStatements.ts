@@ -16,6 +16,7 @@
 // automatically. Everything else is reported for a person to look at.
 
 import { Router, Request, Response } from 'express';
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import pool from '../db/connection';
@@ -23,7 +24,10 @@ import { authenticate, requireRole } from '../middleware/auth';
 import { uploadStatement, STATEMENT_PATH } from '../middleware/upload';
 import { PAYMENT_EXECUTOR_ROLES, WRITE_OVERRIDE_ROLES } from '../utils/roles';
 import { findPaymentCodes } from '../utils/paymentCode';
-import { parseStatement, checkStatement, StatementFormatError, StatementRow } from '../utils/statementParser';
+import {
+  parseStatement, checkStatement, applyStatementPolicy,
+  StatementFormatError, StatementRow,
+} from '../utils/statementParser';
 import { settlePaymentRequest } from '../utils/payments';
 import { respondList } from '../utils/pagination';
 
@@ -154,12 +158,71 @@ const fmt = (n: number) => `Rp ${Number(n || 0).toLocaleString('id-ID')}`;
 const KNOWN_ACCOUNTS = String(process.env.BANK_ACCOUNTS || '')
   .split(',').map((s) => s.trim()).filter(Boolean);
 
+/**
+ * Whether only the bank's own export may settle payments.
+ *
+ * On by default, and it should stay on. Off is for one situation: the bank
+ * changes its exporter and every genuine file starts failing the provenance
+ * checks at once. Then this buys the time to re-measure the new format instead
+ * of leaving finance unable to reconcile anything — the arithmetic checks and
+ * the duplicate-file check keep working either way, because those do not depend
+ * on recognising the producer.
+ */
+const STRICT_SOURCE = String(process.env.STATEMENT_STRICT ?? '1') !== '0';
+
+/**
+ * Has this exact file been imported before?
+ *
+ * The per-line hashes already stop a line paying twice, but they answer the
+ * question one row at a time and after the fact. A digest of the whole upload
+ * answers it before anything is read: re-uploading yesterday's file is an
+ * ordinary mistake, and "every line duplicate" is a confusing way to be told so.
+ */
+/**
+ * Does this database have `file_hash` yet?
+ *
+ * It arrives with `migrateStatementGuardrails2026-08`, and deploying the build
+ * before the migration is a mistake this repository has already made once. The
+ * failure mode matters here: a preview that succeeds followed by an apply that
+ * 500s, halfway through settling payments, is far worse than losing the
+ * duplicate-file check for an hour. So the column is probed once and the code
+ * simply does without it when it is absent.
+ */
+let fileHashColumn: boolean | null = null;
+async function hasFileHashColumn(): Promise<boolean> {
+  if (fileHashColumn !== null) return fileHashColumn;
+  try {
+    const [rows] = await pool.query(
+      `SELECT COUNT(*) n FROM information_schema.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'bank_statement_imports'
+         AND COLUMN_NAME = 'file_hash'`);
+    fileHashColumn = Number((rows as any[])[0].n) > 0;
+  } catch {
+    fileHashColumn = false;
+  }
+  return fileHashColumn;
+}
+
+async function findPreviousImport(digest: string) {
+  if (!(await hasFileHashColumn())) return null;
+  const [rows] = await pool.query(
+    `SELECT id, file_name, created_at FROM bank_statement_imports
+     WHERE file_hash = ? ORDER BY id ASC LIMIT 1`, [digest]);
+  return (rows as any[])[0] ?? null;
+}
+
 /** Read the upload, parse it, and judge every line. Writes nothing. */
 async function analyse(file: Express.Multer.File, password?: string | null) {
+  const digest = crypto.createHash('sha256').update(file.buffer).digest('hex');
   const parsed = await parseStatement(file.buffer, file.originalname, password);
   const checks = checkStatement(parsed);
   const accountKnown = !KNOWN_ACCOUNTS.length
     || (!!checks.account_number && KNOWN_ACCOUNTS.includes(checks.account_number));
+  const policy = applyStatementPolicy(checks, {
+    strict: STRICT_SOURCE,
+    knownAccounts: KNOWN_ACCOUNTS,
+    previousImport: await findPreviousImport(digest),
+  });
 
   // Lines already on record — one query rather than one per line.
   const hashes = parsed.rows.map((r) => r.hash);
@@ -178,7 +241,7 @@ async function analyse(file: Express.Multer.File, password?: string | null) {
     seen.add(line.hash); // a repeated line inside one file is still a repeat
     verdicts.push(v);
   }
-  return { parsed, verdicts, checks: { ...checks, account_known: accountKnown } };
+  return { parsed, verdicts, policy, digest, checks: { ...checks, account_known: accountKnown } };
 }
 
 function summarise(verdicts: LineVerdict[]) {
@@ -233,14 +296,18 @@ router.post('/preview', authenticate, requireRole(...RECONCILERS),
     try {
       // The password only ever lives in this request: it opens the file and is
       // never stored, logged, or written into the import record.
-      const { parsed, verdicts, checks } = await analyse(req.file!, req.body?.password);
+      const { parsed, verdicts, checks, policy } = await analyse(req.file!, req.body?.password);
       return res.json({
-        message: 'Pratinjau rekonsiliasi',
+        message: policy.ok ? 'Pratinjau rekonsiliasi' : 'Pratinjau — file ini akan ditolak saat diterapkan',
         data: {
           file_name: req.file!.originalname,
           columns: parsed.columns,
           statement: parsed.summary,
           checks,
+          // The preview still shows what is inside a file that will be refused:
+          // seeing the rows is how a person works out whether they downloaded the
+          // wrong file or opened the right one by accident.
+          policy,
           summary: summarise(verdicts),
           lines: verdicts.map(shape),
         },
@@ -257,26 +324,19 @@ router.post('/', authenticate, requireRole(...RECONCILERS),
     if (rejectUpload(req, res)) return;
     try {
       const user = req.user!;
-      const { parsed, verdicts, checks } = await analyse(req.file!, req.body?.password);
+      const { parsed, verdicts, checks, policy, digest } = await analyse(req.file!, req.body?.password);
       const summary = summarise(verdicts);
 
-      // A statement that contradicts its own totals is not evidence of anything, and
-      // settling payments from it would put that contradiction into the payment
-      // record. Refused outright rather than partially applied: the preview already
-      // showed the person what the file contains, so nothing here is a surprise.
-      if (!checks.arithmetic_ok) {
-        const why: string[] = [];
-        if (!checks.totals.ok) {
-          why.push(`total transaksi tidak sama dengan ringkasan bank (terbaca masuk ${fmt(checks.totals.parsed_in)} / keluar ${fmt(checks.totals.parsed_out)}, tertulis masuk ${fmt(checks.totals.stated_in ?? 0)} / keluar ${fmt(checks.totals.stated_out ?? 0)})`);
-        }
-        if (!checks.closing.ok) why.push('saldo akhir tidak sama dengan saldo awal ditambah mutasi');
-        if (!checks.balance_chain.ok) {
-          why.push(`rantai saldo putus di ${checks.balance_chain.breaks} baris (pertama di baris ${checks.balance_chain.first_break_row})`);
-        }
+      // The gate. A file that is not the bank's own export, or that contradicts its
+      // own totals, is not evidence of anything — settling payments from it would
+      // put that into the payment record permanently. Refused outright rather than
+      // partially applied, and the preview already showed the same verdict, so
+      // nothing here is a surprise.
+      if (!policy.ok) {
+        const reasons = policy.findings.filter((f) => f.level === 'reject');
         return res.status(422).json({
-          message: 'File ditolak — aritmetika di dalamnya tidak konsisten, yang berarti isinya sudah berubah '
-            + 'sejak diterbitkan bank: ' + why.join('; ') + '. Unduh ulang rekening koran langsung dari bank.',
-          data: { checks },
+          message: 'File ditolak — ' + reasons.map((f) => `${f.title.toLowerCase()}: ${f.message}`).join(' · '),
+          data: { checks, policy },
         });
       }
 
@@ -292,12 +352,14 @@ router.post('/', authenticate, requireRole(...RECONCILERS),
       const stored = `${Date.now()}_${safe}`;
       fs.writeFileSync(path.join(STATEMENT_PATH, stored), req.file!.buffer);
 
+      const withHash = await hasFileHashColumn();
       const [ins] = await pool.query(
         `INSERT INTO bank_statement_imports
-           (file_name, file_path, uploaded_by_user_id, period_start, period_end, total_rows,
+           (file_name, file_path, ${withHash ? 'file_hash, ' : ''}uploaded_by_user_id, period_start, period_end, total_rows,
             paid_count, mismatch_count, unmatched_count, duplicate_count, note, created_at, updated_at)
-         VALUES (?,?,?,?,?,?,0,?,?,?,?,NOW(),NOW())`,
+         VALUES (?,?,${withHash ? '?,' : ''}?,?,?,?,0,?,?,?,?,NOW(),NOW())`,
         [req.file!.originalname, `${process.env.PUBLIC_STATEMENT_BASE || '/storage/statements'}/${stored}`,
+         ...(withHash ? [digest] : []),
          user.id, dates[0] ?? null, dates[dates.length - 1] ?? null, verdicts.length,
          summary.mismatch, summary.unmatched, summary.duplicate, req.body?.note || null]);
       const importId = (ins as any).insertId;
@@ -346,7 +408,7 @@ router.post('/', authenticate, requireRole(...RECONCILERS),
           ? `${paid} payment request ditandai Paid dari rekening koran`
           : 'Tidak ada payment request yang cocok pada file ini',
         data: {
-          id: importId, file_name: req.file!.originalname, statement: parsed.summary, checks,
+          id: importId, file_name: req.file!.originalname, statement: parsed.summary, checks, policy,
           summary: { ...summary, paid }, lines: results,
         },
       });

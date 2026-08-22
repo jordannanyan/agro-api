@@ -865,6 +865,7 @@ CREATE TABLE `bank_statement_imports` (
   `id`                  INT AUTO_INCREMENT PRIMARY KEY,
   `file_name`           VARCHAR(255) NOT NULL,
   `file_path`           VARCHAR(255) NULL,          -- kept for audit: the file as uploaded
+  `file_hash`           CHAR(64) NULL,              -- sha256 of the upload: the same file twice is refused
   `uploaded_by_user_id` INT NULL,
   `period_start`        DATE NULL,
   `period_end`          DATE NULL,
@@ -876,6 +877,7 @@ CREATE TABLE `bank_statement_imports` (
   `note`                VARCHAR(255) NULL,
   `created_at`          DATETIME NULL,
   `updated_at`          DATETIME NULL,
+  KEY `idx_bsi_file_hash` (`file_hash`),
   CONSTRAINT `fk_bsi_user` FOREIGN KEY (`uploaded_by_user_id`) REFERENCES `users`(`id`) ON DELETE SET NULL
 ) ENGINE=InnoDB;
 

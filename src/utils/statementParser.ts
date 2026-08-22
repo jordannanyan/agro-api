@@ -78,12 +78,130 @@ export interface StatementIdentity {
   resaved: boolean;
 }
 
+// ── What kind of file is this, before anything is opened ─────────────────────
+//
+// The cheapest question, and the one that turned out to matter most: a Livin
+// export is always the same kind of container. Not a spreadsheet — an OLE
+// compound file (`d0cf11e0`) holding an `EncryptedPackage`. The bank has no
+// setting that produces anything else, so a plain `.xlsx` that opens without a
+// password is, by construction, not the file the bank sent. Whatever is inside
+// it, it has been through something on the way here.
+//
+// The encryption descriptor is readable *without* the password: `EncryptionInfo`
+// keeps it as plain XML next to the ciphertext. Worth reading, because the
+// parameters differ per generator and are not something a person picks:
+//
+//   Livin export        AES-128 · CBC · SHA-1   · 100.000 spins · dataIntegrity
+//   Microsoft Excel     AES-256 · CBC · SHA-512 · 100.000 spins
+//
+// So a file taken apart and re-encrypted by hand does not come back looking like
+// this. Like every other marker here it is forgeable by someone who knows the
+// format — it raises the cost, it does not close the door.
+
+export interface StatementCrypto {
+  cipher: string | null;
+  chaining: string | null;
+  hash: string | null;
+  key_bits: number | null;
+  spin_count: number | null;
+  /** HMAC over the encrypted package — the bank's export carries one. */
+  data_integrity: boolean;
+}
+
+export type ContainerKind =
+  | 'encrypted-ooxml'  // what the bank sends
+  | 'plain-ooxml'      // an .xlsx that opens with no password
+  | 'legacy-xls'       // an OLE workbook that is not an encrypted package
+  | 'csv'
+  | 'unknown';
+
+export interface StatementContainer {
+  kind: ContainerKind;
+  encrypted: boolean;
+  crypto: StatementCrypto | null;
+  /** The descriptor matches the profile the bank's exporter writes. */
+  crypto_profile_ok: boolean;
+}
+
+/** Measured from a fresh export, not guessed: see the table above. */
+export const LIVIN_CRYPTO_PROFILE = {
+  cipher: 'AES', chaining: 'ChainingModeCBC', hash: 'SHA1',
+  key_bits: 128, spin_count: 100000,
+} as const;
+
+const OLE_MAGIC = Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]);
+const ZIP_MAGIC = Buffer.from([0x50, 0x4b, 0x03, 0x04]);
+
+/**
+ * The agile-encryption descriptor, read straight out of the container.
+ *
+ * Anchored on the namespace URI rather than on `<encryption`, so a byte sequence
+ * that happens to occur inside the ciphertext cannot be mistaken for it.
+ */
+function readCryptoDescriptor(buffer: Buffer): StatementCrypto | null {
+  const text = buffer.toString('latin1');
+  const ns = text.indexOf('http://schemas.microsoft.com/office/2006/encryption');
+  if (ns < 0) return null;
+  const start = text.lastIndexOf('<encryption', ns);
+  const end = text.indexOf('</encryption>', ns);
+  if (start < 0 || end < 0) return null;
+  const xml = text.slice(start, end);
+
+  // The first occurrence of each attribute is the one on <keyData>, which
+  // describes the package itself rather than the password key encryptor.
+  const attr = (name: string) => {
+    const m = new RegExp(' ' + name + '="([^"]*)"').exec(xml);
+    return m ? m[1] : null;
+  };
+  const num = (name: string) => {
+    const v = attr(name);
+    return v == null || v === '' ? null : Number(v);
+  };
+  return {
+    cipher: attr('cipherAlgorithm'),
+    chaining: attr('cipherChaining'),
+    hash: attr('hashAlgorithm'),
+    key_bits: num('keyBits'),
+    spin_count: num('spinCount'),
+    data_integrity: xml.indexOf('<dataIntegrity') >= 0,
+  };
+}
+
+function matchesBankProfile(c: StatementCrypto): boolean {
+  return c.cipher === LIVIN_CRYPTO_PROFILE.cipher
+    && c.chaining === LIVIN_CRYPTO_PROFILE.chaining
+    && c.hash === LIVIN_CRYPTO_PROFILE.hash
+    && c.key_bits === LIVIN_CRYPTO_PROFILE.key_bits
+    && c.spin_count === LIVIN_CRYPTO_PROFILE.spin_count
+    && c.data_integrity;
+}
+
+/** Classify the upload by its first bytes. Reads nothing, decrypts nothing. */
+export function inspectContainer(buffer: Buffer, filename: string): StatementContainer {
+  const ext = (filename.split('.').pop() || '').toLowerCase();
+  const bare = { crypto: null, crypto_profile_ok: false };
+  if (ext === 'csv') return { kind: 'csv', encrypted: false, ...bare };
+  if (buffer.length >= 8 && buffer.subarray(0, 8).equals(OLE_MAGIC)) {
+    const descriptor = readCryptoDescriptor(buffer);
+    if (!descriptor) return { kind: 'legacy-xls', encrypted: false, ...bare };
+    return {
+      kind: 'encrypted-ooxml', encrypted: true,
+      crypto: descriptor, crypto_profile_ok: matchesBankProfile(descriptor),
+    };
+  }
+  if (buffer.length >= 4 && buffer.subarray(0, 4).equals(ZIP_MAGIC)) {
+    return { kind: 'plain-ooxml', encrypted: false, ...bare };
+  }
+  return { kind: 'unknown', encrypted: false, ...bare };
+}
+
 export interface ParsedStatement {
   rows: StatementRow[];
   /** Which header names were found, for the error message when they were not. */
   columns: Record<string, number>;
   summary: StatementSummary;
   identity: StatementIdentity;
+  container: StatementContainer;
 }
 
 export class StatementFormatError extends Error {}
@@ -418,7 +536,8 @@ export async function parseStatement(
   filename: string,
   password?: string | null,
 ): Promise<ParsedStatement> {
-  const isCsv = (filename.split('.').pop() || '').toLowerCase() === 'csv';
+  const container = inspectContainer(buffer, filename);
+  const isCsv = container.kind === 'csv';
   // Unlocked once and shared: decrypting twice would ask the same password to do
   // the same work, and the properties have to come from the same bytes as the rows.
   const plain = isCsv ? buffer : await unlock(buffer, password);
@@ -535,6 +654,7 @@ export async function parseStatement(
     columns: columns as Record<string, number>,
     summary: readSummary(matrix, headerIdx),
     identity,
+    container,
   };
 }
 
@@ -552,6 +672,11 @@ export async function parseStatement(
 // number in Excel, which is the realistic threat here.
 
 export interface StatementChecks {
+  /**
+   * The container is the bank's: an encrypted OOXML package whose encryption
+   * parameters match the ones its exporter writes.
+   */
+  container: StatementContainer & { ok: boolean };
   /**
    * The producing application names the bank. Forgeable, but rewritten by any
    * editor that saves the file, so `resaved` catches the ordinary case.
@@ -572,7 +697,7 @@ export interface StatementChecks {
 const near = (a: number, b: number) => Math.abs(a - b) < 0.01;
 
 export function checkStatement(parsed: ParsedStatement): StatementChecks {
-  const { rows, summary, identity } = parsed;
+  const { rows, summary, identity, container } = parsed;
 
   const parsedIn = rows.reduce((s, r) => s + r.amount_in, 0);
   const parsedOut = rows.reduce((s, r) => s + r.amount_out, 0);
@@ -602,6 +727,7 @@ export function checkStatement(parsed: ParsedStatement): StatementChecks {
   });
 
   return {
+    container: { ...container, ok: container.kind === 'encrypted-ooxml' && container.crypto_profile_ok },
     bank_identity: {
       ok: identity.looks_like_bank, resaved: identity.resaved,
       application: identity.application, creator: identity.creator, title: identity.title,
@@ -612,4 +738,142 @@ export function checkStatement(parsed: ParsedStatement): StatementChecks {
     balance_chain: { ok: breaks === 0, breaks, first_break_row: firstBreak, checked },
     arithmetic_ok: totalsOk && closingOk && breaks === 0,
   };
+}
+
+// ── Policy: may this file settle payments? ────────────────────────────────────
+//
+// The checks above describe the file; this decides what to do about it. It lives
+// here, next to them, so the preview screen, the import endpoint and the offline
+// verifier cannot drift into three different opinions about the same file — the
+// preview promising an import that the apply step then refuses is exactly the
+// kind of thing that teaches people to stop reading previews.
+//
+// The reasoning behind the levels: a genuine Livin export is encrypted, carries
+// the bank's own encryption parameters, names the bank as its producing
+// application, belongs to one of our accounts, and adds up. Each of those can be
+// forged individually by someone who knows the file format. None of them is
+// missing by accident. So in strict mode any one of them missing is a refusal,
+// and the message says which door to go back through.
+
+export type PolicyLevel = 'reject' | 'warn';
+
+export interface PolicyFinding {
+  /** Stable identifier, so the UI can key on it. */
+  code: 'container' | 'crypto_profile' | 'bank_identity' | 'account' | 'arithmetic' | 'duplicate_file';
+  level: PolicyLevel;
+  title: string;
+  message: string;
+}
+
+export interface StatementPolicy {
+  ok: boolean;
+  strict: boolean;
+  findings: PolicyFinding[];
+}
+
+export interface PolicyOptions {
+  /** Refuse anything that is not the bank's own encrypted export. */
+  strict: boolean;
+  /** Accounts the deployment says its statements may belong to; empty = unchecked. */
+  knownAccounts: string[];
+  /** The caller found this exact file already imported. */
+  previousImport?: { id: number; file_name: string; created_at: string | Date | null } | null;
+}
+
+const rp = (n: number) => `Rp ${Number(n || 0).toLocaleString('id-ID')}`;
+
+const CONTAINER_COMPLAINT: Record<ContainerKind, string> = {
+  'encrypted-ooxml': '',
+  'plain-ooxml':
+    'File ini terbuka tanpa password. E-statement Livin selalu terkunci password, '
+    + 'jadi file yang bisa dibuka begitu saja sudah pernah dibuka dan disimpan ulang '
+    + 'di luar bank — apa pun isinya sekarang, itu bukan berkas yang dikirim bank.',
+  'legacy-xls':
+    'File ini format Excel lama (.xls) dan tidak terenkripsi. Livin menerbitkan '
+    + 'e-statement sebagai .xlsx terkunci password.',
+  csv:
+    'CSV tidak membawa satu pun penanda asal — tidak ada properti dokumen, tidak ada '
+    + 'enkripsi, dan isinya bisa diketik ulang seluruhnya. Unggah file .xlsx asli dari Livin.',
+  unknown:
+    'Isi file tidak dikenali sebagai workbook Excel. Unggah file .xlsx asli dari Livin, '
+    + 'apa adanya — jangan dibuka, disimpan ulang, atau dikonversi.',
+};
+
+export function applyStatementPolicy(checks: StatementChecks, opts: PolicyOptions): StatementPolicy {
+  const findings: PolicyFinding[] = [];
+  const strict = opts.strict;
+  /** Provenance is what strict mode governs; arithmetic is refused either way. */
+  const provenance: PolicyLevel = strict ? 'reject' : 'warn';
+
+  if (checks.container.kind !== 'encrypted-ooxml') {
+    findings.push({
+      code: 'container', level: provenance,
+      title: 'Bukan berkas terkunci dari bank',
+      message: CONTAINER_COMPLAINT[checks.container.kind],
+    });
+  } else if (!checks.container.crypto_profile_ok) {
+    const c = checks.container.crypto;
+    findings.push({
+      code: 'crypto_profile', level: provenance,
+      title: 'Kunci file bukan buatan bank',
+      message:
+        `Enkripsi file ini ${c?.cipher ?? '?'}-${c?.key_bits ?? '?'} / ${c?.hash ?? '?'}`
+        + `, sedangkan Livin menerbitkan AES-128 / SHA-1. Pola ini muncul kalau file dibuka, `
+        + `lalu dikunci ulang sendiri — Excel memakai AES-256 / SHA-512. Unduh ulang dari Livin.`,
+    });
+  }
+
+  if (!checks.bank_identity.ok) {
+    findings.push({
+      code: 'bank_identity', level: provenance,
+      title: checks.bank_identity.resaved ? 'File sudah disimpan ulang' : 'Tidak ada penanda bank',
+      message: checks.bank_identity.resaved
+        ? `File mengaku terbitan ${checks.bank_identity.creator || 'bank'}, tetapi terakhir disimpan `
+          + `oleh ${checks.bank_identity.application || 'aplikasi lain'}. Artinya pernah dibuka dan `
+          + `disimpan ulang; yang diunggah harus berkas mentah dari Livin.`
+        : 'Properti dokumen tidak menyebut e-statement bank sama sekali.',
+    });
+  }
+
+  if (opts.knownAccounts.length && !opts.knownAccounts.includes(checks.account_number || '')) {
+    findings.push({
+      code: 'account', level: 'reject',
+      title: 'Rekening bukan rekening perusahaan',
+      message: `Rekening di file ini ${checks.account_number || 'tidak terbaca'}, tidak ada dalam `
+        + `daftar rekening resmi. Pembayaran tidak boleh dilunasi dari mutasi rekening lain.`,
+    });
+  }
+
+  if (!checks.arithmetic_ok) {
+    const why: string[] = [];
+    if (!checks.totals.ok) {
+      why.push(`total transaksi tidak sama dengan ringkasan bank (terbaca masuk ${rp(checks.totals.parsed_in)}`
+        + ` / keluar ${rp(checks.totals.parsed_out)}, tertulis masuk ${rp(checks.totals.stated_in ?? 0)}`
+        + ` / keluar ${rp(checks.totals.stated_out ?? 0)})`);
+    }
+    if (!checks.closing.ok) why.push('saldo akhir tidak sama dengan saldo awal ditambah mutasi');
+    if (!checks.balance_chain.ok) {
+      why.push(`rantai saldo putus di ${checks.balance_chain.breaks} baris`
+        + ` (pertama di baris ${checks.balance_chain.first_break_row})`);
+    }
+    findings.push({
+      code: 'arithmetic', level: 'reject',
+      title: 'Angka di dalam file bertentangan',
+      message: why.join('; ') + '. Isinya berubah sejak diterbitkan bank — unduh ulang rekening koran langsung dari bank.',
+    });
+  }
+
+  if (opts.previousImport) {
+    const when = opts.previousImport.created_at
+      ? new Date(opts.previousImport.created_at).toLocaleDateString('id-ID')
+      : 'sebelumnya';
+    findings.push({
+      code: 'duplicate_file', level: 'reject',
+      title: 'File ini sudah pernah diimpor',
+      message: `Isi file identik dengan impor #${opts.previousImport.id} `
+        + `("${opts.previousImport.file_name}", ${when}). Tidak ada yang baru untuk dicocokkan.`,
+    });
+  }
+
+  return { ok: !findings.some((f) => f.level === 'reject'), strict, findings };
 }
