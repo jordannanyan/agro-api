@@ -44,10 +44,13 @@ CREATE TABLE `entities` (
   -- can never contradict each other. A settlement copies the value in force at
   -- the time into `profit_sharing`, so changing it here never rewrites history.
   `profit_share_farmer_pct` DECIMAL(5,2) NULL,
-  -- The KTH's cut of the SAME base the farmer's share is taken from, not a slice
-  -- of the company's half. Ledger "Buku Besar - SJ - Banana", column N, reads
-  -- `P * 7/30` where P is the farmer's 30% — i.e. 7% of the base, leaving the
-  -- company 63%. AML (JNBS) has no KTH cut: farmer 50, company 50.
+  -- The KTH's cut OF THE COMPANY'S PORTION, not of the base: SNBS's 7% is 7% of
+  -- the 70% left after the farmer's 30%, i.e. 4.9% of the margin, leaving the
+  -- company 65.1%. That is how sheet `SJ - Data Entry Banana` divides every one
+  -- of its 15 Delivery rows (BE 30.00 / BD 4.90 / BC 65.10). The plain 7% in
+  -- `SJ - Farmer Database` column N is 7% of the DISTRIBUTABLE amount — margin
+  -- already net of labour and material — a different base, not a different rate.
+  -- AML (JNBS) has no KTH cut: farmer 50, company 50.
   `profit_share_kth_pct`    DECIMAL(5,2) NULL,
   -- Which gate decides what a farmer may actually be paid. The two operational
   -- ledgers disagree and both are in force:
@@ -844,6 +847,10 @@ CREATE TABLE `profit_sharing` (
   `net_profit`     DECIMAL(18,2) GENERATED ALWAYS AS (`total_revenue` - `total_investment`) STORED,
   `pct_farmer`     DECIMAL(5,2) NOT NULL DEFAULT 0,
   `pct_company`    DECIMAL(5,2) NOT NULL DEFAULT 0,
+  -- Effective share of the margin, so the three add up to 100 and each value is
+  -- its percentage of `net_profit`. The KTH's agreed rate is a cut of the
+  -- company's portion (`entities.profit_share_kth_pct`), so SNBS's 7% of the
+  -- remaining 70% is stored here as 4.90.
   `pct_kth`        DECIMAL(5,2) NOT NULL DEFAULT 0,
   `value_farmer`   DECIMAL(18,2) NOT NULL DEFAULT 0,
   `value_company`  DECIMAL(18,2) NOT NULL DEFAULT 0,

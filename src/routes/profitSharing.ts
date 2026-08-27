@@ -268,18 +268,25 @@ router.get('/pl', authenticate, async (req: Request, res: Response) => {
 // twice, and nothing is lost.
 //
 // The split follows the operational ledgers — "Buku Besar - SJ - Banana" and
-// "Buku Besar - AML - Banana", sheet `* - Farmer Database`:
+// "Buku Besar - AML - Banana":
 //
 //   value_farmer  = pct_farmer x net
-//   value_kth     = pct_kth    x net
+//   value_kth     = pct_kth x (100 - pct_farmer)% x net
 //   value_company = net - value_farmer - value_kth
 //
-// All three take their cut of the SAME base. SJ column N reads `P * 7/30` where
-// P is the farmer's 30% — that is 7% of the base, leaving SNBS 63%. An earlier
-// version took the KTH out of the company's half instead (4.9% of the base),
-// following the projection in "1 Hitungan Simulasi"; the ledger is the document
-// actually used to pay people, so it wins. AML has no KTH cut at all: its farmer
-// share is a plain 50% (`Total Profit Generated = K/0.5`).
+// The farmer takes his cut of the whole margin; the KTH takes its cut of what is
+// LEFT — `entities.profit_share_kth_pct` is a slice of the company's portion, not
+// of the base. For SNBS that is 7% of 70% = 4.9% of the margin, leaving 65.1%.
+// Read off sheet `SJ - Data Entry Banana`, where every one of the 15 Delivery
+// rows divides column BA into BE 30.00% / BD 4.90% / BC 65.10%.
+//
+// Sheet `SJ - Farmer Database` does show a plain 7% (column N is 7% of column L),
+// but its base is not the margin: L is `Total Distributable Profit` — the
+// cumulative margin already net of labour and material. Between 2026-08-21 and
+// 2026-08-24 this code took the 7% from there and applied it to the gross margin,
+// which is neither sheet's rule; the per-sale sheet governs a per-sale split.
+// AML has no KTH cut at all: its farmer share is a plain 50%
+// (`Total Profit Generated = K/0.5`).
 //
 // A LOSS is shared by the very same percentages — the sheet multiplies a negative
 // NCF through unchanged, so a bad harvest lands 30% in the farmer's own balance
@@ -432,7 +439,12 @@ async function buildSettlement(sellingId: number) {
     // Percentages are applied to `net` as it stands, sign included. A loss is
     // divided exactly like a profit, which is what the source model does.
     const valueFarmer = pct == null || wasPaid ? 0 : money(net * (pct / 100));
-    const valueKth = pct == null || !insideKth ? 0 : money(net * (pctKth / 100));
+    // The KTH's percentage is a cut of the company's portion, so its share of the
+    // base is `pctKth x (100 - pct_farmer)%` — 7% of 70% = 4.9% for SNBS. It is
+    // taken off the nominal split, not off `valueFarmer`, so a plot whose farmer
+    // was already paid still yields the KTH the same 4.9% the ledger gives it.
+    const pctKthEff = pct == null ? 0 : money(((100 - pct) * pctKth) / 100);
+    const valueKth = pct == null || !insideKth ? 0 : money(net * (pctKthEff / 100));
     const valueCompany = money(net - valueFarmer - valueKth);
     // Closing balances = opening balances plus this settlement's shares.
     const cumFarmer = money(Number(r.prev_cum_farmer) + valueFarmer);
@@ -449,8 +461,11 @@ async function buildSettlement(sellingId: number) {
       farmer_was_paid: wasPaid, inside_kth: insideKth,
       net_profit: net,
       pct_farmer: pct,
-      pct_company: pct == null ? null : money(100 - pct - pctKth),
-      pct_kth: pctKth,
+      pct_company: pct == null ? null : money(100 - pct - pctKthEff),
+      // Effective share of the base, so `value_kth = net x pct_kth` holds for the
+      // stored row. The agreed rate itself is `pct_kth_of_company`.
+      pct_kth: pctKthEff,
+      pct_kth_of_company: pctKth,
       value_farmer: valueFarmer,
       value_company: valueCompany,
       value_kth: valueKth,
@@ -486,7 +501,11 @@ router.get('/settlement/:sellingId', authenticate, async (req: Request, res: Res
     return res.json({
       data: {
         selling_id: sale.id, date: sale.date, total_revenue: Number(sale.total_revenue),
-        entity_id: sale.entity_id, pct_farmer: pct, pct_kth: pctKth,
+        entity_id: sale.entity_id, pct_farmer: pct,
+        // Nominal rate (a cut of the company's portion) and what it works out to
+        // against the margin — the page shows both.
+        pct_kth: pctKth,
+        pct_kth_effective: pct == null ? null : money(((100 - pct) * pctKth) / 100),
         settled: lines.some((l) => l.already_settled_id != null),
         lines,
       },
