@@ -30,6 +30,7 @@ router.get('/executive', authenticate, async (req: Request, res: Response) => {
     const [
       farmers, plots, purchasingQty, purchasingValue, sellingRevenue,
       openProcessing, pendingPR, pendingPO, outstanding,
+      expensesPaid, expensesPaidCount,
     ] = await Promise.all([
       scalar(`SELECT COUNT(*) AS v FROM farmers f ${kthScope('f')}${whereClause(byEntity)}`, a),
       scalar(`SELECT COUNT(*) AS v FROM plot p ${farmerRefScope('p')}${whereClause(byEntity)}`, a),
@@ -40,7 +41,27 @@ router.get('/executive', authenticate, async (req: Request, res: Response) => {
       scalar(`SELECT COUNT(*) AS v FROM purchase_requests WHERE status = 'Pending'${docScope}`, a),
       scalar(`SELECT COUNT(*) AS v FROM purchase_orders WHERE status = 'Pending'${docScope}`, a),
       scalar(`SELECT COALESCE(SUM(o.outstanding),0) AS v FROM v_pre_finance_outstanding o ${farmerRefScope('o')}${whereClause(byEntity)}`, a),
+      // Money actually out the door. A payment request only reaches 'Paid' through
+      // the bank statement (or a logged manual override), so this is spend that has
+      // left the account — not what has merely been approved.
+      scalar(`SELECT COALESCE(SUM(amount),0) AS v FROM payment_requests WHERE status = 'Paid'${docScope}`, a),
+      scalar(`SELECT COUNT(*) AS v FROM payment_requests WHERE status = 'Paid'${docScope}`, a),
     ]);
+
+    // Paid spend split by what it paid for — buying goods vs. paying farmers back
+    // through their KTH — and by budget code, which is how the office reads it.
+    const [expensesByKind] = await pool.query(
+      `SELECT payreq_kind AS kind, COUNT(*) AS count, COALESCE(SUM(amount),0) AS value
+       FROM payment_requests WHERE status = 'Paid'${docScope}
+       GROUP BY payreq_kind`, a);
+    const [expensesByCode] = await pool.query(
+      `SELECT COALESCE(bc.code, '(tanpa kode)') AS code, COUNT(*) AS count,
+              COALESCE(SUM(pay.amount),0) AS value
+       FROM payment_requests pay
+       LEFT JOIN budget_codes bc ON bc.id = pay.budget_code_id
+       WHERE pay.status = 'Paid'${scope != null ? ' AND pay.entity_id = ?' : ''}
+       GROUP BY COALESCE(bc.code, '(tanpa kode)')
+       ORDER BY value DESC LIMIT 6`, a);
 
     // Purchasing by scheme. The scope fragment brings its own plot join (es_pl) —
     // the scheme is read from the one already joined here.
@@ -59,10 +80,13 @@ router.get('/executive', authenticate, async (req: Request, res: Response) => {
     const [trend] = await pool.query(
       `SELECT m.period,
               COALESCE(pu.value, 0) AS purchasing_value,
-              COALESCE(se.revenue, 0) AS selling_revenue
+              COALESCE(se.revenue, 0) AS selling_revenue,
+              COALESCE(ex.expense, 0) AS expenses_paid
        FROM (
          SELECT DATE_FORMAT(p.date, '%Y-%m') AS period FROM purchasing p ${purchasingScope('p')}${whereClause(byEntity)}
          UNION SELECT DATE_FORMAT(s.date, '%Y-%m') FROM selling s ${sellingScope('s')}${whereClause(byEntity)}
+         UNION SELECT DATE_FORMAT(pay.released_pay_date, '%Y-%m') FROM payment_requests pay
+                WHERE pay.status = 'Paid' AND pay.released_pay_date IS NOT NULL${scope != null ? ' AND pay.entity_id = ?' : ''}
        ) m
        LEFT JOIN (
          SELECT DATE_FORMAT(p.date,'%Y-%m') AS period, SUM(p.total_value) AS value
@@ -72,8 +96,14 @@ router.get('/executive', authenticate, async (req: Request, res: Response) => {
          SELECT DATE_FORMAT(s.date,'%Y-%m') AS period, SUM(s.total_revenue) AS revenue
          FROM selling s ${sellingScope('s')}${whereClause(byEntity)} GROUP BY 1
        ) se ON se.period = m.period
+       LEFT JOIN (
+         SELECT DATE_FORMAT(pay.released_pay_date,'%Y-%m') AS period, SUM(pay.amount) AS expense
+         FROM payment_requests pay
+         WHERE pay.status = 'Paid' AND pay.released_pay_date IS NOT NULL${scope != null ? ' AND pay.entity_id = ?' : ''}
+         GROUP BY 1
+       ) ex ON ex.period = m.period
        GROUP BY m.period ORDER BY m.period DESC LIMIT 6`,
-      [...a, ...a, ...a, ...a]);
+      [...a, ...a, ...a, ...a, ...a, ...a]);
 
     return res.json({
       data: {
@@ -89,8 +119,12 @@ router.get('/executive', authenticate, async (req: Request, res: Response) => {
           pending_pr: pendingPR,
           pending_po: pendingPO,
           outstanding_total: outstanding,
+          expenses_paid: expensesPaid,
+          expenses_paid_count: expensesPaidCount,
         },
         purchasing_by_scheme: bySchemeRows,
+        expenses_by_kind: expensesByKind,
+        expenses_by_code: expensesByCode,
         trend: (trend as any[]).reverse(),
       },
     });

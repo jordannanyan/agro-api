@@ -24,13 +24,33 @@ ${PENDING_STEP_COLUMNS}
 ${pendingStepJoin('PO', 'po')}
 `;
 
+// A PO line only stores quantity and price; what the line IS lives on the request
+// item behind it. Stock In receives against this list and has to name the saprodi,
+// so the item carries it here rather than making every caller join back to the PR.
 async function loadItems(poId: number) {
   const [rows] = await pool.query(
-    `SELECT poi.*, pri.description AS pr_item_description
+    `SELECT poi.*, pri.description AS pr_item_description,
+            pri.sapropdi_id, sp.sapropdi_name,
+            pri.unit_id, un.unit_name,
+            pri.budget_code_id, bc.code AS budget_code
      FROM purchase_order_items poi
      LEFT JOIN purchase_request_items pri ON pri.id = poi.pr_item_id
+     LEFT JOIN sapropdi sp     ON sp.id = pri.sapropdi_id
+     LEFT JOIN units un        ON un.id = pri.unit_id
+     LEFT JOIN budget_codes bc ON bc.id = pri.budget_code_id
      WHERE poi.po_id = ? ORDER BY poi.id ASC`, [poId]);
   return rows;
+}
+
+// The budget code a request already carries, so the order does not ask for it a
+// second time. Request items each hold one; a PO holds a single code, so this
+// only answers when the items agree — a mixed request still has to be told.
+export async function budgetCodeFromPR(prId: number): Promise<number | null> {
+  const [rows] = await pool.query(
+    'SELECT DISTINCT budget_code_id FROM purchase_request_items WHERE pr_id = ? AND budget_code_id IS NOT NULL',
+    [prId]);
+  const list = rows as any[];
+  return list.length === 1 ? Number(list[0].budget_code_id) : null;
 }
 async function loadExtras(poId: number) {
   const [rows] = await pool.query('SELECT * FROM purchase_order_extra_costs WHERE po_id = ? ORDER BY id ASC', [poId]);
@@ -111,6 +131,13 @@ router.post('/', authenticate, requireRole(
     if ('error' in scoped) return res.status(422).json({ message: scoped.error });
     const entityId = scoped.entityId;
 
+    // Budget code is chosen once in the chain. If the caller did not send one, the
+    // request's own code carries over, so the same spend is not re-classified on
+    // the way down to the payment.
+    const budgetCodeId = b.budget_code_id != null && b.budget_code_id !== ''
+      ? Number(b.budget_code_id)
+      : await budgetCodeFromPR(prId);
+
     await conn.beginTransaction();
     const poNumber = b.po_number || await nextDocNumber('purchase_orders', 'po_number', 'PO');
     const [result] = await conn.query(
@@ -118,7 +145,7 @@ router.post('/', authenticate, requireRole(
        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NOW(),NOW())`,
       [poNumber, prId,
        Number(b.vendor_id), entityId,
-       b.budget_code_id != null && b.budget_code_id !== '' ? Number(b.budget_code_id) : null,
+       budgetCodeId,
        b.order_date, b.due_date || null, b.payment_terms || null, b.delivery_address || null,
        b.is_tax_included ? 1 : 0, b.tax_rate != null ? Number(b.tax_rate) : 11, b.status || 'Draft']
     );

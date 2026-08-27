@@ -8,6 +8,7 @@ import {
 } from './documents';
 import { ROLE, PAYMENT_EXECUTOR_ROLES, WRITE_OVERRIDE_ROLES } from '../utils/roles';
 import { settlePaymentRequest } from '../utils/payments';
+import { budgetCodeFromPR } from './purchaseOrders';
 import { inheritEntity, entityScope, canSeeEntity } from '../utils/entityScope';
 import { PENDING_STEP_COLUMNS, pendingStepJoin } from '../utils/pendingStep';
 
@@ -96,6 +97,28 @@ async function entityFromSource(b: any): Promise<{ entityId: number } | { error:
   return { entityId };
 }
 
+/**
+ * The budget code the source document already carries.
+ *
+ * The code is chosen once in the chain — on the request, or on the order raised
+ * from it — and everything downstream follows it. Asking for it again on the
+ * payment invited a second, different answer for the same spend; the payment is
+ * the document the money leaves by, so it is the worst place to re-classify.
+ * A direct PR -> PayReq payment takes the request's own code, which only answers
+ * when its items agree on one.
+ */
+async function budgetCodeFromSource(b: any): Promise<number | null> {
+  const poId = b.purchase_order_id != null && b.purchase_order_id !== '' ? Number(b.purchase_order_id) : null;
+  const prId = b.purchase_request_id != null && b.purchase_request_id !== '' ? Number(b.purchase_request_id) : null;
+  if (poId != null) {
+    const [r] = await pool.query('SELECT budget_code_id FROM purchase_orders WHERE id = ? LIMIT 1', [poId]);
+    const code = (r as any[])[0]?.budget_code_id;
+    if (code != null) return Number(code);
+  }
+  if (prId != null) return budgetCodeFromPR(prId);
+  return null;
+}
+
 function bodyToCols(b: any) {
   return {
     purchase_request_id: b.purchase_request_id != null && b.purchase_request_id !== '' ? Number(b.purchase_request_id) : null,
@@ -134,10 +157,17 @@ router.post('/', authenticate, requireRole(
     // Called "Project Code" on a PayReq and "Budget Code" on a PR/PO, but it is the
     // same budget_codes list. Optional upstream, mandatory here: this is the document
     // that moves cash, so the spend has to land against a code.
-    if (b.budget_code_id == null || b.budget_code_id === '') {
-      return res.status(422).json({ message: 'budget_code_id (Project Code) is required on a payment request' });
+    const inheritedCode = (b.budget_code_id == null || b.budget_code_id === '')
+      ? await budgetCodeFromSource(b)
+      : null;
+    if ((b.budget_code_id == null || b.budget_code_id === '') && inheritedCode == null) {
+      return res.status(422).json({
+        message: 'Project Code belum ada. Dokumen sumbernya (PO/PR) tidak membawa budget code, '
+          + 'jadi kode harus dipilih di sini.',
+      });
     }
     const c: any = bodyToCols(b);
+    if (c.budget_code_id == null) c.budget_code_id = inheritedCode;
     c.entity_id = scoped.entityId;
     const payreqNumber = b.payreq_number || await nextDocNumber('payment_requests', 'payreq_number', 'PAY');
     const cols = { payreq_number: payreqNumber, ...c, created_at: new Date(), updated_at: new Date() };
