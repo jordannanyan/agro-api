@@ -27,6 +27,27 @@ function checkVolumes(input: number, output: number): string | null {
   return null;
 }
 
+/**
+ * The batch's cost when it is priced per kilo.
+ *
+ * Priced against the volume that went IN: the sorting, drying and handling are
+ * done on the material received, so a batch that loses weight has still cost
+ * what it cost. Returns null when no per-kilo price is given, which leaves the
+ * total as a lump sum typed by hand — every imported batch predates this field.
+ */
+function costFromPerKg(perKg: number | null, volumeInput: number): number | null {
+  if (perKg == null) return null;
+  return Math.round(perKg * volumeInput * 100) / 100;
+}
+
+/** Reads the per-kilo price off a body: absent, cleared, or a number >= 0. */
+function readPerKg(raw: any): { value: number | null } | { error: string } {
+  if (raw === null || raw === '') return { value: null };
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return { error: 'processing_cost_per_kg tidak boleh negatif' };
+  return { value: n };
+}
+
 const SELECT = `
   SELECT pr.*, c.commodities_name AS commodity__commodities_name, w.warehouse_name AS warehouse__warehouse_name,
          (pr.volume_input - pr.volume_output) AS loss
@@ -100,6 +121,9 @@ router.post('/', authenticate, async (req: Request, res: Response) => {
     const vOut = b.volume_output != null ? Number(b.volume_output) : 0;
     const badVolume = checkVolumes(vIn, vOut);
     if (badVolume) return res.status(422).json({ message: badVolume });
+    const perKg = readPerKg(b.processing_cost_per_kg);
+    if ('error' in perKg) return res.status(422).json({ message: perKg.error });
+    const derived = costFromPerKg(perKg.value, vIn);
 
     await conn.beginTransaction();
     const cols: any = {
@@ -109,7 +133,12 @@ router.post('/', authenticate, async (req: Request, res: Response) => {
       warehouse_id: b.warehouse_id != null && b.warehouse_id !== '' ? Number(b.warehouse_id) : null,
       volume_input: b.volume_input != null ? Number(b.volume_input) : 0,
       volume_output: b.volume_output != null ? Number(b.volume_output) : 0,
-      total_processing_cost: b.total_processing_cost != null ? Number(b.total_processing_cost) : 0,
+      processing_cost_per_kg: perKg.value,
+      // The derived figure wins whenever a per-kilo price is given, so the two
+      // can never drift apart in the record.
+      total_processing_cost: derived != null
+        ? derived
+        : (b.total_processing_cost != null ? Number(b.total_processing_cost) : 0),
       status: b.status || 'open',
       created_at: new Date(),
       updated_at: new Date(),
@@ -150,7 +179,7 @@ const update = async (req: Request, res: Response) => {
   try {
     const id = req.params.id;
     const [ex] = await conn.query(
-      'SELECT id, volume_input, volume_output FROM processing WHERE id = ? LIMIT 1', [id]);
+      'SELECT id, volume_input, volume_output, processing_cost_per_kg FROM processing WHERE id = ? LIMIT 1', [id]);
     if (!(ex as any[]).length) { conn.release(); return res.status(404).json({ message: 'Processing not found' }); }
     const b = req.body || {};
     if (b.status && !STATUSES.includes(b.status)) { conn.release(); return res.status(422).json({ message: 'Invalid status' }); }
@@ -172,7 +201,21 @@ const update = async (req: Request, res: Response) => {
     set('warehouse_id', b.warehouse_id !== undefined ? (b.warehouse_id === '' || b.warehouse_id === null ? null : Number(b.warehouse_id)) : undefined);
     set('volume_input', b.volume_input != null ? Number(b.volume_input) : undefined);
     set('volume_output', b.volume_output != null ? Number(b.volume_output) : undefined);
-    set('total_processing_cost', b.total_processing_cost != null ? Number(b.total_processing_cost) : undefined);
+    // Cost follows the per-kilo price and the input volume as they will END UP:
+    // adding a purchase to the batch raises the volume, and the total has to move
+    // with it rather than keeping the figure computed from the old volume.
+    let perKgValue: number | null = cur.processing_cost_per_kg != null ? Number(cur.processing_cost_per_kg) : null;
+    if (b.processing_cost_per_kg !== undefined) {
+      const parsed = readPerKg(b.processing_cost_per_kg);
+      if ('error' in parsed) { conn.release(); return res.status(422).json({ message: parsed.error }); }
+      perKgValue = parsed.value;
+      set('processing_cost_per_kg', perKgValue);
+    }
+    const effInput = b.volume_input != null ? Number(b.volume_input) : Number(cur.volume_input);
+    const derivedTotal = costFromPerKg(perKgValue, effInput);
+    set('total_processing_cost', derivedTotal != null
+      ? derivedTotal
+      : (b.total_processing_cost != null ? Number(b.total_processing_cost) : undefined));
     set('status', b.status);
     const keys = Object.keys(updates);
     if (keys.length) {

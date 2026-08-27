@@ -326,6 +326,12 @@ CREATE TABLE `processing` (
   `warehouse_id`          INT NULL,
   `volume_input`          DECIMAL(15,3) NOT NULL DEFAULT 0,
   `volume_output`         DECIMAL(15,3) NOT NULL DEFAULT 0,
+  -- Processing is priced per kilo of what goes IN — the work is done on the
+  -- material received, and the loss is carried by whoever owns the batch. When
+  -- this is set, `total_processing_cost` is derived from it (per_kg x
+  -- volume_input) and never typed by hand. NULL means the older behaviour: a
+  -- lump sum entered directly, which is how every imported batch was recorded.
+  `processing_cost_per_kg` DECIMAL(15,2) NULL,
   `total_processing_cost` DECIMAL(18,2) NOT NULL DEFAULT 0,
   `status`                ENUM('open','processing','closed') NOT NULL DEFAULT 'open',
   `created_at`            DATETIME NULL,
