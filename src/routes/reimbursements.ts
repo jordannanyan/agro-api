@@ -217,7 +217,8 @@ async function writeItems(payreqId: number, items: (ItemInput & { farmer_name: s
 async function kthContext(kthId: number | null) {
   if (!kthId) return { error: 'kth_id wajib diisi — reimbursement dibayarkan ke rekening KTH.' };
   const [rows] = await pool.query(
-    'SELECT id, kth_name, entities_id, bank_name, bank_account, bank_account_name FROM kth WHERE id = ? LIMIT 1',
+    'SELECT id, kth_name, entities_id, bank_name, bank_account, bank_account_name, bank_id'
+    + ' FROM kth WHERE id = ? LIMIT 1',
     [kthId]);
   const kth = (rows as any[])[0];
   if (!kth) return { error: 'KTH tidak ditemukan.' };
@@ -270,6 +271,9 @@ router.post('/', authenticate, requireRole(...CREATORS), async (req: Request, re
       bank_name: ctx.kth.bank_name ?? null,
       bank_account: ctx.kth.bank_account,
       beneficiary_name: ctx.kth.bank_account_name || ctx.kth.kth_name,
+      // Which bank, as the code a Kopra transfer file carries. Snapshotted with the
+      // rest of the account for the same reason.
+      bank_id: ctx.kth.bank_id ?? null,
       amount: 0,   // replaced by writeItems below
       status,
       created_at: new Date(),
@@ -335,6 +339,7 @@ router.put('/:id', authenticate, async (req: Request, res: Response) => {
       updates.bank_name = ctx.kth.bank_name ?? null;
       updates.bank_account = ctx.kth.bank_account;
       updates.beneficiary_name = ctx.kth.bank_account_name || ctx.kth.kth_name;
+      updates.bank_id = ctx.kth.bank_id ?? null;
     }
     if (b.status !== undefined) updates.status = b.status;
 

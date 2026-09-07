@@ -10,3 +10,5 @@ storage/tree_monitorings/*
 
 # Database dumps -- never belong in the repo
 *.sql
+# ...except db/, which is the schema and seeds themselves and must be versioned.
+!db/*.sql

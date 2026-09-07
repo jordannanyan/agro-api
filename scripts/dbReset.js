@@ -1,4 +1,5 @@
-// Reset the database: run schema.sql, seed.sql, views.sql in order.
+// Reset the database: run schema.sql, seed.sql, seed_saprodi.sql, seed_banks.sql
+// and views.sql in order.
 // Fixes the seed password hash to a real bcrypt($2y$) of "password" at runtime.
 // Usage: node scripts/dbReset.js
 require('dotenv').config();
@@ -14,6 +15,10 @@ async function run() {
   // Saprodi master is a separate file so it can also be applied on its own to an
   // existing database; it must run after seed.sql because it references `units`.
   const seedSaprodi = fs.readFileSync(path.join(dir, 'seed_saprodi.sql'), 'utf8');
+  // Bank codes are their own file for the same reason, and because the list is
+  // Mandiri's: it is refreshed by re-running this one file, not by editing a seed
+  // that would also reset the demo users.
+  const seedBanks = fs.readFileSync(path.join(dir, 'seed_banks.sql'), 'utf8');
   const views = fs.readFileSync(path.join(dir, 'views.sql'), 'utf8');
 
   // Replace the seed @PW placeholder with a freshly computed valid hash of "password".
@@ -34,6 +39,8 @@ async function run() {
   await conn.query(seed);
   console.log('→ Running seed_saprodi.sql ...');
   await conn.query(seedSaprodi);
+  console.log('→ Running seed_banks.sql ...');
+  await conn.query(seedBanks);
   console.log('→ Running views.sql ...');
   await conn.query(views);
   await conn.end();

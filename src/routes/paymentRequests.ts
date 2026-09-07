@@ -11,12 +11,16 @@ import { settlePaymentRequest } from '../utils/payments';
 import { budgetCodeFromPR } from './purchaseOrders';
 import { inheritEntity, entityScope, canSeeEntity } from '../utils/entityScope';
 import { PENDING_STEP_COLUMNS, pendingStepJoin } from '../utils/pendingStep';
+import {
+  planExport, buildCsv, buildXlsx, kopraFilename, kopraDate, BI_FAST_LIMIT, KopraFormat,
+} from '../utils/kopraExport';
 
 export const router = Router();
 
 const SELECT = `
   SELECT pay.*, e.entities_name AS entity_name, bc.code AS budget_code,
          pr.pr_number, po.po_number,
+         bnk.bank_code, bnk.bank_name AS bank_list_name, bnk.is_self AS bank_is_self,
          CASE WHEN pay.purchase_order_id IS NOT NULL THEN 'via_po' ELSE 'direct' END AS route,
 ${PENDING_STEP_COLUMNS}
   FROM payment_requests pay
@@ -24,6 +28,7 @@ ${PENDING_STEP_COLUMNS}
   LEFT JOIN budget_codes bc       ON bc.id = pay.budget_code_id
   LEFT JOIN purchase_requests pr  ON pr.id = pay.purchase_request_id
   LEFT JOIN purchase_orders po    ON po.id = pay.purchase_order_id
+  LEFT JOIN banks bnk             ON bnk.id = pay.bank_id
 ${pendingStepJoin('PayReq', 'pay')}
 `;
 
@@ -44,6 +49,231 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
   const sql = SELECT + (where.length ? ` WHERE ${where.join(' AND ')}` : '') + ' ORDER BY pay.id DESC';
   const [rows] = await pool.query(sql, args);
   return res.json({ data: rows });
+});
+
+// -----------------------------------------------------------------------------
+// Kopra by Mandiri bulk transfer export
+//
+// The other half of reconciliation. Today a person reads approved requests off the
+// screen and types each one into Kopra; this hands them the file Kopra takes, with
+// the payment code already in the transfer remark — which is what lets the
+// statement coming back settle the requests without anybody matching them by eye.
+//
+// Same people as reconciliation itself (Finance Manager, Finance Staff, and the
+// break-glass account): whoever moves the money holds this.
+//
+// These are declared above `/:id` on purpose — Express would otherwise read
+// "export" as a payment request id.
+// -----------------------------------------------------------------------------
+const EXPORTERS = [...PAYMENT_EXECUTOR_ROLES, ...WRITE_OVERRIDE_ROLES];
+
+/** Everything the exporter needs, for one entity's approved-and-unpaid requests. */
+const KOPRA_SELECT = `
+  SELECT pay.id, pay.payreq_number, pay.payment_code, pay.payreq_kind, pay.amount,
+         pay.beneficiary_name, pay.bank_account, pay.bank_name, pay.entity_id,
+         pay.exported_at, pay.estimated_pay_date,
+         bnk.bank_code, bnk.is_self AS bank_is_self, bnk.bank_name AS bank_list_name,
+         e.entities_name AS entity_name, k.kth_name
+  FROM payment_requests pay
+  LEFT JOIN banks bnk    ON bnk.id = pay.bank_id
+  LEFT JOIN entities e   ON e.id = pay.entity_id
+  LEFT JOIN kth k        ON k.id = pay.kth_id
+  WHERE pay.status = 'Approved' AND pay.entity_id = ?
+`;
+
+/**
+ * Resolve one export request into a plan, or into the reason it cannot be made.
+ *
+ * Shared by the preview and the download so the two can never disagree about what
+ * would be in the file — a preview that shows one thing and a download that
+ * contains another is worse than having no preview.
+ */
+async function buildKopraPlan(req: Request): Promise<
+  | { error: string; status: number }
+  | { plan: ReturnType<typeof planExport>; skippedExported: any[]; accounts: any[] }
+> {
+  const entityId = Number(req.query.entity_id || 0);
+  if (!entityId) {
+    return { status: 422, error: 'entity_id wajib diisi — satu file Kopra hanya boleh mendebit satu rekening.' };
+  }
+  if (!canSeeEntity(req, entityId)) {
+    return { status: 403, error: 'Entity ini bukan milik Anda.' };
+  }
+
+  const format = String(req.query.format || 'csv').toLowerCase() as KopraFormat;
+  if (format !== 'csv' && format !== 'xlsx') {
+    return { status: 422, error: "format harus 'csv' atau 'xlsx'." };
+  }
+
+  const [entityRows] = await pool.query(
+    'SELECT id, entities_name FROM entities WHERE id = ? LIMIT 1', [entityId]);
+  const entity = (entityRows as any[])[0];
+  if (!entity) return { status: 404, error: 'Entity tidak ditemukan.' };
+
+  // Which of the PT's accounts the file debits. Named explicitly when the person
+  // exporting has chosen one; otherwise the entity's default, and failing that the
+  // only account it has. Never "the first one that came back" — the account is the
+  // difference between paying wages out of the operational account and out of the
+  // banana trading account.
+  const accountId = Number(req.query.debit_account_id || 0);
+  const [accountRows] = await pool.query(
+    `SELECT id, entity_id, label, account_no, account_name
+     FROM company_bank_accounts
+     WHERE entity_id = ? AND is_active = 1
+     ORDER BY is_default DESC, label ASC, id ASC`, [entityId]);
+  const accounts = accountRows as any[];
+  if (!accounts.length) {
+    return {
+      status: 422,
+      error: `${entity.entities_name} belum punya rekening perusahaan. Isi dulu di `
+        + 'Settings → Rekening Perusahaan, karena nomor itulah yang jadi header file Kopra.',
+    };
+  }
+  const account = accountId
+    ? accounts.find((a) => a.id === accountId)
+    : accounts[0];
+  if (!account) {
+    return { status: 422, error: 'Rekening debit yang dipilih bukan milik entity ini atau sudah non-aktif.' };
+  }
+
+  // An explicit selection wins; without one, everything approved for this entity.
+  const ids = String(req.query.ids || '')
+    .split(',').map((s) => Number(s.trim())).filter((n) => Number.isFinite(n) && n > 0);
+  const sql = KOPRA_SELECT + (ids.length ? ` AND pay.id IN (${ids.map(() => '?').join(',')})` : '')
+    + ' ORDER BY pay.payreq_number';
+  const [rows] = await pool.query(sql, [entityId, ...ids]);
+
+  // A request already carried out in an earlier file is held back unless somebody
+  // says otherwise: exporting it again is how the same invoice gets paid twice.
+  const reexport = String(req.query.reexport || '') === '1';
+  const all = rows as any[];
+  const skippedExported = reexport ? [] : all.filter((r) => r.exported_at);
+  const candidates = reexport ? all : all.filter((r) => !r.exported_at);
+
+  const transferDate = req.query.transfer_date
+    ? new Date(String(req.query.transfer_date))
+    : new Date();
+  if (Number.isNaN(transferDate.getTime())) {
+    return { status: 422, error: 'transfer_date tidak valid (pakai YYYY-MM-DD).' };
+  }
+
+  const plan = planExport(candidates, {
+    id: account.id,
+    entity_id: entity.id,
+    entity_name: entity.entities_name,
+    label: account.label,
+    account_no: account.account_no,
+    account_name: account.account_name,
+  }, format, transferDate);
+
+  return { plan, skippedExported, accounts };
+}
+
+// GET /api/payment-requests/export/kopra/preview?entity_id=&format=&ids=&reexport=
+//
+// What the file would contain, and what is holding rows out of it, without writing
+// anything. The same two-step as the statement upload: look first, commit second.
+router.get('/export/kopra/preview', authenticate, requireRole(...EXPORTERS), async (req: Request, res: Response) => {
+  const built = await buildKopraPlan(req);
+  if ('error' in built) return res.status(built.status).json({ message: built.error });
+  const { plan, skippedExported, accounts } = built;
+  return res.json({
+    message: 'Kopra export preview',
+    data: {
+      format: plan.format,
+      filename: kopraFilename(plan),
+      transfer_date: kopraDate(plan.transferDate),
+      debit_account: plan.debit,
+      // Every account this entity could debit instead, so the screen can offer the
+      // choice without a second round trip.
+      debit_accounts: accounts.map((a) => ({
+        id: a.id, label: a.label, account_no: a.account_no, account_name: a.account_name,
+      })),
+      bi_fast_limit: BI_FAST_LIMIT,
+      total: plan.total,
+      count: plan.lines.length,
+      lines: plan.lines.map((l) => ({
+        id: l.payreq.id,
+        payreq_number: l.payreq.payreq_number,
+        payment_code: l.payreq.payment_code,
+        payreq_kind: l.payreq.payreq_kind,
+        beneficiary_name: l.payreq.beneficiary_name,
+        bank_account: l.payreq.bank_account,
+        bank_name: (l.payreq as any).bank_list_name || l.payreq.bank_name,
+        bank_code: l.bankCode,
+        method: l.method,
+        service: l.service,
+        amount: l.amount,
+      })),
+      blockers: plan.blockers,
+      already_exported: skippedExported.map((r) => ({
+        id: r.id, payreq_number: r.payreq_number, exported_at: r.exported_at,
+      })),
+    },
+  });
+});
+
+// GET /api/payment-requests/export/kopra?entity_id=&format=csv|xlsx&ids=&reexport=
+//
+// The file itself. Refused rather than truncated when any selected request cannot
+// be written: a bulk transfer that quietly leaves somebody out is discovered when
+// they ring up asking where their money is.
+router.get('/export/kopra', authenticate, requireRole(...EXPORTERS), async (req: Request, res: Response) => {
+  try {
+    const built = await buildKopraPlan(req);
+    if ('error' in built) return res.status(built.status).json({ message: built.error });
+    const { plan, skippedExported } = built;
+
+    if (plan.blockers.length) {
+      return res.status(422).json({
+        message: `${plan.blockers.length} payment request belum bisa diexport. Perbaiki dulu, atau keluarkan dari pilihan.`,
+        data: { blockers: plan.blockers },
+      });
+    }
+    if (!plan.lines.length) {
+      return res.status(422).json({
+        message: skippedExported.length
+          ? 'Semua payment request yang dipilih sudah pernah diexport. Tambahkan reexport=1 kalau memang mau diulang.'
+          : 'Tidak ada payment request Approved yang siap ditransfer untuk entity ini.',
+      });
+    }
+
+    const body = plan.format === 'csv' ? buildCsv(plan) : await buildXlsx(plan);
+    const filename = kopraFilename(plan);
+
+    // Stamped only once the file has actually been built. Marking first would leave
+    // requests flagged as instructed by a download that failed and never happened.
+    const now = new Date();
+    const ids = plan.lines.map((l) => l.payreq.id);
+    await pool.query(
+      `UPDATE payment_requests SET exported_at = ?, exported_by_user_id = ?, updated_at = ?
+       WHERE id IN (${ids.map(() => '?').join(',')})`,
+      [now, (req as any).user?.id ?? null, now, ...ids]);
+    // A reimbursement is a payment_requests row too, but its timeline is filed under
+    // its own document_type — logging it as 'PayReq' would hide the entry from the
+    // very screen the person who raised it is looking at.
+    await pool.query(
+      `INSERT INTO document_activities (document_type, document_id, user_id, action, note, created_at)
+       VALUES ${plan.lines.map(() => '(?,?,?,?,?,?)').join(',')}`,
+      plan.lines.flatMap((l) => [
+        l.payreq.payreq_kind === 'Reimbursement' ? 'Reimbursement' : 'PayReq',
+        l.payreq.id, (req as any).user?.id ?? null, 'Export',
+        `Masuk file transfer Kopra (${plan.format.toUpperCase()}) ${filename}`
+        + ` — didebit dari ${plan.debit.label} ${plan.debit.account_no}`, now,
+      ]));
+
+    res.setHeader('Content-Type', plan.format === 'csv'
+      ? 'text/csv; charset=utf-8'
+      : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    // The browser client reads the count off the response to report what it got.
+    res.setHeader('X-Kopra-Count', String(plan.lines.length));
+    res.setHeader('X-Kopra-Total', String(plan.total));
+    res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition, X-Kopra-Count, X-Kopra-Total');
+    return res.send(body);
+  } catch (err: any) {
+    return res.status(500).json({ message: 'Gagal membuat file Kopra', error: err.message });
+  }
 });
 
 // GET /api/payment-requests/:id
@@ -136,6 +366,7 @@ function bodyToCols(b: any) {
     bank_name: b.bank_name ?? null,
     bank_account: b.bank_account ?? null,
     beneficiary_name: b.beneficiary_name ?? null,
+    bank_id: b.bank_id != null && b.bank_id !== '' ? Number(b.bank_id) : null,
     status: b.status || 'Draft',
   };
 }

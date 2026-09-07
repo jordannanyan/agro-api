@@ -47,6 +47,66 @@ export const rolesRouter = crudRouter({
   label: 'Role',
 });
 
+// The PTs' own Mandiri accounts — the debit side of a Kopra bulk transfer.
+//
+// Scoped by entity like any other per-PT table: staff bound to one PT have no
+// business reading another's account numbers out of a picker.
+//
+// `is_default` is not in `columns` on purpose. "At most one default per entity" is
+// not something MySQL can state (no partial unique index), and letting it be set
+// like any other field means two defaults and an export silently picking whichever
+// the sort returns first. It is set through POST /:id/default below, which is the
+// only place that can clear the previous one in the same breath.
+export const companyBankAccountsRouter = crudRouter({
+  table: 'company_bank_accounts',
+  columns: ['entity_id', 'label', 'account_no', 'account_name', 'is_active'],
+  required: ['entity_id', 'label', 'account_no'],
+  numeric: ['entity_id'],
+  boolean: ['is_active'],
+  filterColumns: ['entity_id', 'is_active'],
+  scopeEntityColumn: 'entity_id',
+  searchColumns: ['label', 'account_no', 'account_name'],
+  orderBy: 'entity_id ASC, is_default DESC, label ASC',
+  label: 'Rekening perusahaan',
+});
+
+// POST /api/company-bank-accounts/:id/default — make this the account an export
+// starts on, and stop the entity's previous default being one.
+companyBankAccountsRouter.post('/:id/default', authenticate, async (req: Request, res: Response) => {
+  const [rows] = await pool.query(
+    'SELECT id, entity_id FROM `company_bank_accounts` WHERE id = ? LIMIT 1', [req.params.id]);
+  const row = (rows as any[])[0];
+  if (!row) return res.status(404).json({ message: 'Rekening tidak ditemukan' });
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    await conn.query('UPDATE `company_bank_accounts` SET `is_default` = 0 WHERE `entity_id` = ?', [row.entity_id]);
+    await conn.query('UPDATE `company_bank_accounts` SET `is_default` = 1, `updated_at` = NOW() WHERE `id` = ?', [row.id]);
+    await conn.commit();
+  } catch (e) {
+    await conn.rollback();
+    throw e;
+  } finally {
+    conn.release();
+  }
+  return res.json({ message: 'Rekening default diperbarui' });
+});
+
+// The banks a transfer can be addressed to, with the code Kopra expects. Seeded
+// from Mandiri's published list (db/seed_banks.sql) and editable only because that
+// list is refreshed from time to time — not because anybody should be typing a BIC
+// from memory.
+export const banksRouter = crudRouter({
+  table: 'banks',
+  columns: ['bank_code', 'bank_name', 'is_self', 'is_active'],
+  required: ['bank_code', 'bank_name'],
+  boolean: ['is_self', 'is_active'],
+  filterColumns: ['is_active'],
+  searchColumns: ['bank_code', 'bank_name'],
+  orderBy: 'bank_name ASC',
+  label: 'Bank',
+});
+
 export const budgetCodesRouter = crudRouter({
   table: 'budget_codes',
   columns: ['code', 'name', 'is_active'],
@@ -129,9 +189,10 @@ export const kthRouter = crudRouter({
   // rather than on each document so the same account is not transcribed afresh
   // every time somebody pays the farmers under it.
   columns: ['kth_name', 'address', 'regency', 'partnership_period',
-    'bank_name', 'bank_account', 'bank_account_name', 'entities_id', 'username', 'password'],
+    'bank_name', 'bank_account', 'bank_account_name', 'bank_id',
+    'entities_id', 'username', 'password'],
   required: ['kth_name'],
-  numeric: ['entities_id'],
+  numeric: ['entities_id', 'bank_id'],
   filterColumns: ['entities_id'],
   scopeEntityColumn: 'entities_id',
   hashColumns: ['password'],
@@ -178,9 +239,10 @@ export const vendorsRouter = crudRouter({
   table: 'vendors',
   columns: [
     'vendor_name', 'contact_person', 'phone', 'email', 'address', 'npwp',
-    'bank_name', 'bank_account', 'beneficiary_name', 'category', 'status',
+    'bank_name', 'bank_account', 'beneficiary_name', 'bank_id', 'category', 'status',
   ],
   required: ['vendor_name'],
+  numeric: ['bank_id'],
   filterColumns: ['category', 'status'],
   searchColumns: ['vendor_name', 'contact_person', 'email', 'phone'],
   orderBy: 'vendor_name ASC',

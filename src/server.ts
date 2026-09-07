@@ -30,7 +30,8 @@ import { treesRouter, treeMonSubRouter, treeMonitoringRouter, polygonPointsRoute
 import { authenticate } from './middleware/auth';
 import { operationsReadOnly } from './middleware/readOnly';
 import {
-  entitiesRouter, rolesRouter, budgetCodesRouter, unitsRouter, paymentMethodsRouter,
+  entitiesRouter, rolesRouter, banksRouter, companyBankAccountsRouter,
+  budgetCodesRouter, unitsRouter, paymentMethodsRouter,
   preFinanceTypesRouter, sapropdiRouter, commoditiesRouter, gradesRouter, offtakersRouter,
   kthRouter, warehousesRouter, collectorsRouter, vendorsRouter, approvalRoutesRouter,
   reorderLevelsRouter, budgetsRouter,
@@ -68,6 +69,8 @@ app.use('/api', authRoutes);
 app.use('/api/entities', entitiesRouter);
 app.use('/api/roles', rolesRouter);
 app.use('/api/users', usersRoutes);
+app.use('/api/banks', banksRouter);
+app.use('/api/company-bank-accounts', companyBankAccountsRouter);
 app.use('/api/budget-codes', budgetCodesRouter);
 app.use('/api/units', unitsRouter);
 app.use('/api/payment-methods', paymentMethodsRouter);

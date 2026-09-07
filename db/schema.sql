@@ -124,6 +124,51 @@ CREATE TABLE `approval_routes` (
 -- -----------------------------------------------------------------------------
 -- CLUSTER: Master Lookup (normalisasi)
 -- -----------------------------------------------------------------------------
+-- The banks a transfer can be sent to, keyed by the code Kopra by Mandiri expects
+-- in a bulk-transfer file (an 8-character BIC, e.g. CENAIDJA for BCA).
+--
+-- A normalised list rather than the free text it replaces: `bank_name` held
+-- whatever somebody typed — "BCA", "Bank BCA", "bca" — and none of those can be
+-- turned into a code the bank will accept. Rows are seeded from Mandiri's own
+-- published list (db/seed_banks.sql), so the code is never keyed by hand.
+--
+-- `is_self` marks Bank Mandiri: a transfer there is In-House and carries no
+-- beneficiary bank code at all, which is what decides the FT service on export.
+CREATE TABLE `banks` (
+  `id`         INT AUTO_INCREMENT PRIMARY KEY,
+  `bank_code`  VARCHAR(11) NOT NULL UNIQUE,   -- BIC, e.g. CENAIDJA
+  `bank_name`  VARCHAR(150) NOT NULL,
+  `is_self`    TINYINT(1) NOT NULL DEFAULT 0,
+  `is_active`  TINYINT(1) NOT NULL DEFAULT 1,
+  `created_at` DATETIME NULL,
+  `updated_at` DATETIME NULL
+) ENGINE=InnoDB;
+
+-- The PTs' own Mandiri accounts — the ones a Kopra bulk transfer debits.
+--
+-- A table rather than a column on `entities` because a PT runs several: SNBS pays
+-- from an operational account and trades cacao and banana from two more. Which one
+-- a transfer leaves from is a real decision somebody makes per file, and a single
+-- column would have quietly made it for them.
+--
+-- `account_no` is unique across every entity: an account belongs to one PT, and the
+-- same number appearing twice is a typo, not a shared account.
+CREATE TABLE `company_bank_accounts` (
+  `id`           INT AUTO_INCREMENT PRIMARY KEY,
+  `entity_id`    INT NOT NULL,
+  `label`        VARCHAR(60) NOT NULL,          -- OPERATIONAL, TRADING CACAO, ...
+  `account_no`   VARCHAR(40) NOT NULL UNIQUE,
+  `account_name` VARCHAR(150) NULL,
+  -- The one an export starts on when nobody has chosen. At most one per entity is
+  -- meaningful; the API keeps it that way rather than a constraint MySQL cannot express.
+  `is_default`   TINYINT(1) NOT NULL DEFAULT 0,
+  `is_active`    TINYINT(1) NOT NULL DEFAULT 1,
+  `created_at`   DATETIME NULL,
+  `updated_at`   DATETIME NULL,
+  CONSTRAINT `fk_cba_entity` FOREIGN KEY (`entity_id`) REFERENCES `entities`(`id`) ON DELETE CASCADE,
+  KEY `idx_cba_entity` (`entity_id`)
+) ENGINE=InnoDB;
+
 CREATE TABLE `budget_codes` (
   `id`         INT AUTO_INCREMENT PRIMARY KEY,
   `code`       VARCHAR(60) NOT NULL UNIQUE,   -- 1_Investment .. 6_Rent
@@ -214,12 +259,16 @@ CREATE TABLE `kth` (
   `bank_name`          VARCHAR(80) NULL,
   `bank_account`       VARCHAR(60) NULL,
   `bank_account_name`  VARCHAR(150) NULL,
+  -- Which bank, as a code a transfer file can carry. `bank_name` above stays as the
+  -- label people already recognise; this is what the export reads.
+  `bank_id`            INT NULL,
   `entities_id`        INT NULL,
   `username`           VARCHAR(150) NULL UNIQUE,
   `password`           VARCHAR(255) NULL,
   `created_at`         DATETIME NULL,
   `updated_at`         DATETIME NULL,
-  CONSTRAINT `fk_kth_entity` FOREIGN KEY (`entities_id`) REFERENCES `entities`(`id`) ON DELETE CASCADE
+  CONSTRAINT `fk_kth_entity` FOREIGN KEY (`entities_id`) REFERENCES `entities`(`id`) ON DELETE CASCADE,
+  CONSTRAINT `fk_kth_bank`   FOREIGN KEY (`bank_id`)     REFERENCES `banks`(`id`) ON DELETE SET NULL
 ) ENGINE=InnoDB;
 
 CREATE TABLE `warehouse` (
@@ -456,10 +505,13 @@ CREATE TABLE `vendors` (
   `bank_name`        VARCHAR(80) NULL,
   `bank_account`     VARCHAR(60) NULL,
   `beneficiary_name` VARCHAR(150) NULL,
+  -- Which bank, as a code a transfer file can carry; see `banks`.
+  `bank_id`          INT NULL,
   `category`         VARCHAR(80) NULL,
   `status`           VARCHAR(40) NOT NULL DEFAULT 'Aktif',
   `created_at`       DATETIME NULL,
-  `updated_at`       DATETIME NULL
+  `updated_at`       DATETIME NULL,
+  CONSTRAINT `fk_vendors_bank` FOREIGN KEY (`bank_id`) REFERENCES `banks`(`id`) ON DELETE SET NULL
 ) ENGINE=InnoDB;
 
 CREATE TABLE `purchase_requests` (
@@ -566,6 +618,17 @@ CREATE TABLE `payment_requests` (
   `bank_name`           VARCHAR(80) NULL,
   `bank_account`        VARCHAR(60) NULL,
   `beneficiary_name`    VARCHAR(150) NULL,
+  -- Which bank the beneficiary account is at, as a code a Kopra transfer file can
+  -- carry. Copied onto the document rather than read through the vendor or KTH: the
+  -- account details are already snapshotted here, and a file exported next month
+  -- must reproduce the transfer that was approved, not the vendor's current bank.
+  `bank_id`             INT NULL,
+  -- Set the moment a Kopra bulk-transfer file carrying this request is downloaded.
+  -- It is not a payment — only the statement settles one — but it does say the
+  -- instruction has left the building, which is what stops the same approved
+  -- request being exported twice into two transfers.
+  `exported_at`         DATETIME NULL,
+  `exported_by_user_id` INT NULL,
   `status`              VARCHAR(40) NOT NULL DEFAULT 'Draft',
   -- Payment execution (step 5). Written by POST /api/payment-requests/:id/pay,
   -- which only Finance Manager / Finance Staff may call, and only once the
@@ -581,7 +644,9 @@ CREATE TABLE `payment_requests` (
   CONSTRAINT `fk_payreq_requester` FOREIGN KEY (`requested_by_user_id`) REFERENCES `users`(`id`) ON DELETE SET NULL,
   CONSTRAINT `fk_payreq_budget` FOREIGN KEY (`budget_code_id`)      REFERENCES `budget_codes`(`id`) ON DELETE SET NULL,
   CONSTRAINT `fk_payreq_method` FOREIGN KEY (`payment_method_id`)   REFERENCES `payment_methods`(`id`) ON DELETE SET NULL,
-  CONSTRAINT `fk_payreq_paidby` FOREIGN KEY (`paid_by_user_id`)     REFERENCES `users`(`id`) ON DELETE SET NULL
+  CONSTRAINT `fk_payreq_paidby` FOREIGN KEY (`paid_by_user_id`)     REFERENCES `users`(`id`) ON DELETE SET NULL,
+  CONSTRAINT `fk_payreq_bank`   FOREIGN KEY (`bank_id`)             REFERENCES `banks`(`id`) ON DELETE SET NULL,
+  CONSTRAINT `fk_payreq_exportedby` FOREIGN KEY (`exported_by_user_id`) REFERENCES `users`(`id`) ON DELETE SET NULL
   -- NOTE: "PR or PO required" is enforced in the API (routes/paymentRequests.ts).
   -- A CHECK constraint was intentionally omitted for MySQL/MariaDB portability.
 ) ENGINE=InnoDB;
