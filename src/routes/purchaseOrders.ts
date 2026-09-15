@@ -9,6 +9,7 @@ import {
 import { ROLE } from '../utils/roles';
 import { inheritEntity, entityScope, canSeeEntity } from '../utils/entityScope';
 import { PENDING_STEP_COLUMNS, pendingStepJoin } from '../utils/pendingStep';
+import { unusedFilter, DEAD_STATUS } from '../utils/unusedSource';
 
 export const router = Router();
 
@@ -76,7 +77,15 @@ async function computeTotals(poId: number) {
   };
 }
 
-// GET /api/purchase-orders?entity_id=&vendor_id=&status=&search=
+// Which orders are still free. A rejected payment request releases its order;
+// a receipt has no status worth excluding, so any stock-in consumes the order.
+const PO_UNUSED = {
+  payreq: `SELECT 1 FROM payment_requests pay_u
+           WHERE pay_u.purchase_order_id = po.id AND pay_u.status <> ${DEAD_STATUS}`,
+  stock_in: `SELECT 1 FROM stock_in si_u WHERE si_u.purchase_order_id = po.id`,
+};
+
+// GET /api/purchase-orders?entity_id=&vendor_id=&status=&search=&unused_for=payreq|stock_in&include_id=
 router.get('/', authenticate, async (req: Request, res: Response) => {
   const where: string[] = [];
   const args: any[] = [];
@@ -86,6 +95,8 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
   if (req.query.vendor_id) { where.push('po.vendor_id = ?'); args.push(req.query.vendor_id); }
   if (req.query.status)    { where.push('po.status = ?'); args.push(req.query.status); }
   if (req.query.search)    { where.push('po.po_number LIKE ?'); args.push(`%${req.query.search}%`); }
+  const unused = unusedFilter(req, 'po.id', PO_UNUSED);
+  if (unused) { where.push(unused.clause); args.push(...unused.args); }
   const sql = SELECT + (where.length ? ` WHERE ${where.join(' AND ')}` : '') + ' ORDER BY po.id DESC';
   const [rows] = await pool.query(sql, args);
   return res.json({ data: rows });

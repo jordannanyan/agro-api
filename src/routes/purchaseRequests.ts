@@ -9,6 +9,7 @@ import {
 import { ROLE } from '../utils/roles';
 import { resolveWriteEntity, entityScope, canSeeEntity } from '../utils/entityScope';
 import { PENDING_STEP_COLUMNS, pendingStepJoin } from '../utils/pendingStep';
+import { unusedFilter, DEAD_STATUS } from '../utils/unusedSource';
 
 export const router = Router();
 
@@ -34,7 +35,20 @@ ${PENDING_STEP_COLUMNS}
 ${pendingStepJoin('PR', 'pr')}
 `;
 
-// GET /api/purchase-requests?entity_id=&status=&search=
+// Which requests are still free to raise something from. An order that was
+// rejected releases its request; a request that already became an order is paid
+// through that order, so the direct payment route drops it as well.
+const PR_UNUSED = {
+  po: `SELECT 1 FROM purchase_orders po_u
+       WHERE po_u.purchase_request_id = pr.id AND po_u.status <> ${DEAD_STATUS}`,
+  payreq: `SELECT 1 FROM payment_requests pay_u
+           WHERE pay_u.purchase_request_id = pr.id AND pay_u.status <> ${DEAD_STATUS}
+           UNION ALL
+           SELECT 1 FROM purchase_orders po_u
+           WHERE po_u.purchase_request_id = pr.id AND po_u.status <> ${DEAD_STATUS}`,
+};
+
+// GET /api/purchase-requests?entity_id=&status=&search=&unused_for=po|payreq&include_id=
 router.get('/', authenticate, async (req: Request, res: Response) => {
   const where: string[] = [];
   const args: any[] = [];
@@ -45,6 +59,8 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
   if (scope != null) { where.push('pr.entity_id = ?'); args.push(scope); }
   if (req.query.status)    { where.push('pr.status = ?'); args.push(req.query.status); }
   if (req.query.search)    { where.push('pr.pr_number LIKE ?'); args.push(`%${req.query.search}%`); }
+  const unused = unusedFilter(req, 'pr.id', PR_UNUSED);
+  if (unused) { where.push(unused.clause); args.push(...unused.args); }
   const sql = SELECT + (where.length ? ` WHERE ${where.join(' AND ')}` : '') + ' ORDER BY pr.id DESC';
   const [rows] = await pool.query(sql, args);
   return res.json({ data: rows });

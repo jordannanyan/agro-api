@@ -4,6 +4,7 @@ import { authenticate } from '../middleware/auth';
 import { entityScope } from '../utils/entityScope';
 import { ENTITY_COL, processingScope } from '../utils/farmScope';
 import { respondList } from '../utils/pagination';
+import { unusedFilter } from '../utils/unusedSource';
 
 export const router = Router();
 
@@ -80,7 +81,13 @@ async function loadContributions(processingId: number) {
   return rows;
 }
 
-// GET /api/processing?status=&commodities_id=
+// A batch nothing has been sold out of yet. Selling carries no status, so one
+// sale is enough to take the batch off the picker.
+const PROCESSING_UNUSED = {
+  selling: `SELECT 1 FROM selling s_u WHERE s_u.processing_id = pr.id`,
+};
+
+// GET /api/processing?status=&commodities_id=&unused_for=selling&include_id=
 router.get('/', authenticate, async (req: Request, res: Response) => {
   const where: string[] = [];
   const args: any[] = [];
@@ -90,6 +97,8 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
   const scope = entityScope(req);
   if (scope != null) { where.push(`${ENTITY_COL} = ?`); args.push(scope); }
   if (req.query.search) { where.push('pr.processing_code LIKE ?'); args.push(`%${req.query.search}%`); }
+  const unused = unusedFilter(req, 'pr.id', PROCESSING_UNUSED);
+  if (unused) { where.push(unused.clause); args.push(...unused.args); }
   const sql = SELECT + processingScope('pr')
     + (where.length ? ` WHERE ${where.join(' AND ')}` : '') + ' ORDER BY pr.date DESC, pr.id DESC';
   return respondList(req, res, sql, args, shape);
