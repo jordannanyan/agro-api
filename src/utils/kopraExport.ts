@@ -221,6 +221,12 @@ function csvDetail(line: KopraLine): string {
  * CRLF because it is what Mandiri's own example ships, and the totals in the header
  * are computed from the same lines that follow rather than passed in — the two
  * disagreeing is exactly the kind of thing an upload is rejected for.
+ *
+ * No trailing newline, for the same reason: Mandiri's example file ends on the last
+ * detail record, with 8 line breaks for its 9 lines. The header states how many
+ * detail records follow, so a parser that splits on the line break and counts what
+ * it gets would see one more — an empty one — than the header admits to. Matching
+ * the vendor's own bytes costs nothing and removes the question.
  */
 export function buildCsv(plan: KopraPlan): Buffer {
   const header = [
@@ -231,7 +237,7 @@ export function buildCsv(plan: KopraPlan): Buffer {
     String(plan.total),
   ].join(',');
   const body = plan.lines.map(csvDetail);
-  return Buffer.from([header, ...body].join('\r\n') + '\r\n', 'utf8');
+  return Buffer.from([header, ...body].join('\r\n'), 'utf8');
 }
 
 // Where things live in templates/kopra-transfer-consolidated.xlsx. The template's
