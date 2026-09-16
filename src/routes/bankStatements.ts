@@ -55,7 +55,8 @@ type MatchStatus =
   | 'already_paid'     // seen before, settled already — a re-upload
   | 'not_approved'     // money moved before the chain finished
   | 'duplicate'        // this exact line was already imported
-  | 'incoming';        // money in, not our business here
+  | 'incoming'         // money in, not our business here
+  | 'manual_match';    // a person matched this line to a request by hand
 
 interface PayReqRow {
   id: number; payreq_number: string; payment_code: string; amount: number;
@@ -72,6 +73,17 @@ interface LineVerdict {
 }
 
 const SETTLES: MatchStatus[] = ['matched', 'matched_with_fee'];
+
+/**
+ * Everything that means "this line paid a request", automatic or by hand.
+ *
+ * Separate from {@link SETTLES}, which is what the importer is allowed to settle on
+ * its own: a hand match is never a verdict the parser may reach by itself.
+ */
+const SETTLED: MatchStatus[] = [...SETTLES, 'manual_match'];
+
+/** Outgoing lines still waiting for somebody to say what they were. */
+const OPEN: MatchStatus[] = ['no_code', 'code_unknown', 'amount_mismatch', 'not_approved'];
 
 /**
  * Decide what one statement line means.
@@ -242,6 +254,30 @@ async function analyse(file: Express.Multer.File, password?: string | null) {
     verdicts.push(v);
   }
   return { parsed, verdicts, policy, digest, checks: { ...checks, account_known: accountKnown } };
+}
+
+/**
+ * Recount an import's headline numbers from its own rows.
+ *
+ * A hand match moves one line from "unmatched" (or "mismatch") into "paid" after
+ * the import was written, so the counters recorded at upload time stop being true.
+ * Recomputing beats adjusting deltas: it cannot drift, and it repairs a row that
+ * some earlier bug already left wrong.
+ */
+async function refreshImportCounters(importId: number) {
+  await pool.query(
+    `UPDATE bank_statement_imports SET
+       paid_count      = (SELECT COUNT(*) FROM bank_statement_lines
+                          WHERE import_id = ? AND match_status IN ('matched','matched_with_fee','manual_match')),
+       mismatch_count  = (SELECT COUNT(*) FROM bank_statement_lines
+                          WHERE import_id = ? AND match_status IN ('amount_mismatch','not_approved')),
+       unmatched_count = (SELECT COUNT(*) FROM bank_statement_lines
+                          WHERE import_id = ? AND match_status IN ('no_code','code_unknown')),
+       duplicate_count = (SELECT COUNT(*) FROM bank_statement_lines
+                          WHERE import_id = ? AND match_status IN ('duplicate','already_paid')),
+       updated_at = NOW()
+     WHERE id = ?`,
+    [importId, importId, importId, importId, importId]);
 }
 
 function summarise(verdicts: LineVerdict[]) {
@@ -450,6 +486,120 @@ router.get('/outstanding', authenticate, requireRole(...RECONCILERS), async (req
      WHERE pay.status = 'Approved'
      ORDER BY age_days DESC, pay.id DESC`);
   return res.json({ data: rows });
+});
+
+// ── Manual matching ──────────────────────────────────────────────────────────
+//
+// Only tier 1 settles on its own: code valid, check character right, amount within
+// the fee tolerance. Everything else is written down and shown to a person — and
+// until now that is where it stopped. A transfer that really happened but whose
+// remark lost the payment code left its request Approved for ever, because nothing
+// could match a stored line to a request afterwards.
+//
+// This is that missing step. It is still reconciliation: the money is settled
+// against a real row on the bank's own statement, and the line it came from is
+// recorded on the payment. What a person supplies is the one thing the parser could
+// not work out — which request the transfer was for.
+//
+// Note the routes sit BEFORE `/:id`, or Express would read "lines" as an import id.
+
+// GET /api/bank-statements/lines/unmatched
+//
+// Every outgoing line, across every import, that nothing has accounted for. One
+// list rather than a hunt through each file: what finance needs to clear is the
+// leftovers, and they do not care which upload produced them.
+router.get('/lines/unmatched', authenticate, requireRole(...RECONCILERS), async (_req: Request, res: Response) => {
+  const [rows] = await pool.query(
+    `SELECT bsl.id, bsl.import_id, bsl.row_no, bsl.tx_date, bsl.remark,
+            bsl.amount_out, bsl.detected_code, bsl.match_status, bsl.match_note,
+            bsi.file_name, bsi.created_at AS imported_at,
+            pay.payreq_number AS candidate_payreq_number, pay.amount AS candidate_amount,
+            pay.status AS candidate_status
+     FROM bank_statement_lines bsl
+     JOIN bank_statement_imports bsi ON bsi.id = bsl.import_id
+     LEFT JOIN payment_requests pay  ON pay.id = bsl.payment_request_id
+     WHERE bsl.amount_out > 0 AND bsl.match_status IN (?)
+     ORDER BY bsl.tx_date DESC, bsl.id DESC`, [OPEN]);
+  return res.json({ data: rows });
+});
+
+// POST /api/bank-statements/lines/:lineId/match  { payment_request_id, note? }
+router.post('/lines/:lineId/match', authenticate, requireRole(...RECONCILERS), async (req: Request, res: Response) => {
+  try {
+    const lineId = Number(req.params.lineId);
+    const payreqId = Number(req.body?.payment_request_id);
+    const note = String(req.body?.note || '').trim();
+    if (!payreqId) return res.status(422).json({ message: 'payment_request_id wajib diisi' });
+
+    const [lrows] = await pool.query(
+      `SELECT bsl.*, bsi.file_name FROM bank_statement_lines bsl
+       JOIN bank_statement_imports bsi ON bsi.id = bsl.import_id
+       WHERE bsl.id = ? LIMIT 1`, [lineId]);
+    const line = (lrows as any[])[0];
+    if (!line) return res.status(404).json({ message: 'Baris rekening koran tidak ditemukan' });
+    if (Number(line.amount_out) <= 0) {
+      return res.status(422).json({ message: 'Baris ini bukan pembayaran keluar — tidak ada uang yang meninggalkan rekening.' });
+    }
+    if (SETTLED.includes(line.match_status)) {
+      return res.status(409).json({ message: 'Baris ini sudah melunasi sebuah payment request.' });
+    }
+
+    const [prows] = await pool.query(
+      'SELECT id, payreq_number, amount, status FROM payment_requests WHERE id = ? LIMIT 1', [payreqId]);
+    const payreq = (prows as any[])[0];
+    if (!payreq) return res.status(404).json({ message: 'Payment request tidak ditemukan' });
+    if (payreq.status === 'Paid') {
+      return res.status(409).json({ message: `${payreq.payreq_number} sudah berstatus Paid.` });
+    }
+    if (payreq.status !== 'Approved') {
+      // The same refusal the importer gives: money that moved before the chain
+      // finished is a finding, and matching it by hand must not bury that.
+      return res.status(409).json({
+        message: `${payreq.payreq_number} masih berstatus ${payreq.status} — approval belum selesai, jadi belum boleh dilunasi.`,
+      });
+    }
+
+    // A difference the tolerance covers is a bank charge and passes quietly, as it
+    // does on an automatic match. Anything larger is a person overruling the
+    // arithmetic, so it has to be written down.
+    const diff = Number(line.amount_out) - Number(payreq.amount);
+    const withinTolerance = Math.abs(diff) <= TOLERANCE;
+    if (!withinTolerance && !note) {
+      return res.status(422).json({
+        message: `Nominal beda ${fmt(Math.abs(diff))} (diminta ${fmt(Number(payreq.amount))}, keluar ${fmt(Number(line.amount_out))}) `
+          + '— tulis alasan kenapa baris ini tetap dianggap pembayarannya.',
+      });
+    }
+    const fee = withinTolerance ? diff : 0;
+
+    const reason = `Dicocokkan manual dengan baris rekening koran ${line.file_name}`
+      + (line.row_no ? ` baris ${line.row_no}` : '')
+      + (diff ? ` (selisih ${fmt(Math.abs(diff))}${withinTolerance ? ' dianggap biaya transfer' : ''})` : '')
+      + (note ? ` — ${note}` : '');
+
+    // One door to Paid, the same as the importer's: same status change, same Payment
+    // step on the timeline, same refusal if the chain moved underneath us.
+    const settled = await settlePaymentRequest(req.user!, payreq.id, {
+      released_pay_date: line.tx_date,
+      note: reason,
+      fee_amount: fee,
+    });
+    if (!settled.ok) return res.status(settled.status).json({ message: settled.message });
+
+    await pool.query(
+      `UPDATE bank_statement_lines
+       SET payment_request_id = ?, match_status = 'manual_match', fee_amount = ?, match_note = ?
+       WHERE id = ?`,
+      [payreq.id, fee, reason.slice(0, 255), lineId]);
+    await refreshImportCounters(Number(line.import_id));
+
+    return res.json({
+      message: `${payreq.payreq_number} ditandai Paid dari baris rekening koran`,
+      data: { line_id: lineId, payment_request_id: payreq.id, released_pay_date: line.tx_date, fee_amount: fee },
+    });
+  } catch (err: any) {
+    return res.status(500).json({ message: 'Server error', error: err.message });
+  }
 });
 
 // GET /api/bank-statements/:id — one import with every line and its verdict.
