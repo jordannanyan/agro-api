@@ -8,6 +8,8 @@
 import pool from '../db/connection';
 import { AuthUser } from '../middleware/auth';
 import { generatePaymentCode } from './paymentCode';
+import { notifyRoles, fmtRp } from './notify';
+import { ROLE } from './roles';
 
 export interface SettleOptions {
   /** Date the money actually left the account — from the statement line, not today. */
@@ -91,7 +93,70 @@ export async function settlePaymentRequest(
      VALUES (?, ?, 'Payment released', ?, ?, NOW())`,
     [docType, payreqId, user.id, opts.note ?? null]);
 
+  await announcePaid(user, payreqId);
+
   return { ok: true };
+}
+
+/**
+ * Say the money has gone.
+ *
+ * Everybody with a stake hears once: finance (who executed it), whoever filed the
+ * request, procurement (whose order it settles), the Director. Before this the
+ * answer to "has it been paid?" lived in one person's head.
+ *
+ * And when the payment settles a purchase order, the warehouse is told separately —
+ * that one is not an accounting fact but a heads-up that goods are now on their way,
+ * which is the difference between a delivery that gets received and one that sits on
+ * a loading bay because nobody expected it.
+ */
+async function announcePaid(user: AuthUser, payreqId: number) {
+  try {
+    const [rows] = await pool.query(
+      `SELECT pay.payreq_number, pay.amount, pay.entity_id, pay.purchase_order_id,
+              pay.requested_by_user_id, pay.payreq_kind,
+              e.entities_name AS entity_name, po.po_number, v.vendor_name
+       FROM payment_requests pay
+       LEFT JOIN entities e        ON e.id = pay.entity_id
+       LEFT JOIN purchase_orders po ON po.id = pay.purchase_order_id
+       LEFT JOIN vendors v          ON v.id = po.vendor_id
+       WHERE pay.id = ? LIMIT 1`, [payreqId]);
+    const pay = (rows as any[])[0];
+    if (!pay) return;
+    const entity = pay.entity_name ? ` · ${pay.entity_name}` : '';
+
+    await notifyRoles(
+      [ROLE.FINANCE_MANAGER, ROLE.FINANCE_STAFF, ROLE.PROCUREMENT, ROLE.DIRECTOR],
+      pay.entity_id ?? null,
+      {
+        kind: 'payreq_paid',
+        title: `${pay.payreq_number} sudah dibayar`,
+        body: `Pembayaran ${fmtRp(Number(pay.amount))}${entity} sudah dikeluarkan`
+          + `${pay.po_number ? ` untuk ${pay.po_number}` : ''}`
+          + `${pay.vendor_name ? ` (${pay.vendor_name})` : ''}.`,
+        documentType: pay.payreq_kind === 'Reimbursement' ? 'Reimbursement' : 'PayReq',
+        documentId: payreqId,
+        link: pay.payreq_kind === 'Reimbursement' ? `/reimbursement/${payreqId}` : `/procurement/payreq/${payreqId}`,
+      },
+      // The requester hears about their own request even when they hold none of the
+      // roles above — a Field Admin who filed it, say.
+      { alsoUserIds: [pay.requested_by_user_id], exceptUserId: user.id },
+    );
+
+    if (pay.purchase_order_id) {
+      await notifyRoles([ROLE.FIELD_ADMIN], pay.entity_id ?? null, {
+        kind: 'goods_in_transit',
+        title: `Barang ${pay.po_number} sudah dibayar — siapkan penerimaan`,
+        body: `${pay.po_number}${pay.vendor_name ? ` dari ${pay.vendor_name}` : ''}${entity} sudah dilunasi,`
+          + ' jadi barangnya dalam perjalanan. Catat lewat Stock In begitu tiba.',
+        documentType: 'PO',
+        documentId: Number(pay.purchase_order_id),
+        link: `/warehouse/stock-in/create`,
+      }, { exceptUserId: user.id });
+    }
+  } catch (err: any) {
+    console.error('[notify] announcePaid gagal:', err?.message || err);
+  }
 }
 
 /**

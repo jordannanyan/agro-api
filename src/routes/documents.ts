@@ -3,6 +3,7 @@ import pool from '../db/connection';
 import { authenticate, AuthUser } from '../middleware/auth';
 import { upload, fileToPath } from '../middleware/upload';
 import { SYSTEM_ADMIN_ROLES, WRITE_OVERRIDE_ROLES, PAYMENT_EXECUTOR_ROLES, ROLE } from '../utils/roles';
+import { notifyRoles, fmtRp } from '../utils/notify';
 import { entityScope } from '../utils/entityScope';
 import { issuePaymentCode } from '../utils/payments';
 
@@ -248,6 +249,18 @@ router.post('/:type/:id/approvals/:stepId/action', authenticate, async (req: Req
     return res.status(409).json({ message: 'The payment step is recorded by the payment endpoint, not by approving.' });
   }
 
+  // A purchase order is never refused outright (decision of 2026-09-18). It is a
+  // commitment already negotiated with a vendor, and the answer to one that is wrong
+  // is to send it back to be corrected — which "revision" does, and which now
+  // restarts the whole chain anyway. Rejecting it would strand the request behind it
+  // with no way forward.
+  if (docType === 'PO' && status === 'Rejected') {
+    return res.status(422).json({
+      message: 'Purchase Order tidak bisa ditolak. Pakai "Minta Revisi" bila ada yang harus diperbaiki — '
+        + 'dokumen kembali ke pembuatnya dan approval diulang dari awal.',
+    });
+  }
+
   // RBAC: only a staff user holding the step's role may act. System admins may override.
   // Note: Director no longer bypasses other roles' steps — with the 2026-08 flow the
   // Director owns explicit steps on PO and PayReq, so a blanket bypass would hollow out
@@ -317,8 +330,11 @@ router.post('/:type/:id/approvals/:stepId/action', authenticate, async (req: Req
 // document sat in Revision forever — every approver's step was already actioned,
 // so the timeline offered nobody anything to do.
 //
-// Steps that were already Approved stay approved: the document returns to the
-// approver who asked for the change, not to the very beginning.
+// Every step restarts, including the ones already approved. An approver who signed
+// a document signed *that* document; once it comes back changed, their signature no
+// longer covers what is in front of them, so the chain runs again from step 1. This
+// replaced the older behaviour of handing it back only to whoever asked for the
+// change (decision of 2026-09-18).
 router.post('/:type/:id/resubmit', authenticate, async (req: Request, res: Response) => {
   if (!checkType(req, res)) return;
   const docType = req.params.type as DocType;
@@ -336,10 +352,33 @@ router.post('/:type/:id/resubmit', authenticate, async (req: Request, res: Respo
   const denied = await guardRequester(user, docType, docId, doc);
   if (denied) return res.status(403).json({ message: denied });
 
+  const missing = await requireAttachment(docType, docId);
+  if (missing) return res.status(422).json({ message: missing });
+
   const reset = await resetRevisionSteps(docType, docId, user);
   const documentStatus = await syncDocumentStatus(docType, docId);
   return res.json({ message: 'Document resubmitted for approval', steps_reset: reset, document_status: documentStatus });
 });
+
+/**
+ * A document may not enter the approval chain with nothing attached.
+ *
+ * Asked for on 2026-09-18, and it is the right rule: an approver signing a request,
+ * an order or a payment is signing for something — the quotation, the signed order,
+ * the invoice — and a chain that runs on a typed number alone leaves nobody able to
+ * check it afterwards. Enforced here rather than in each form so the API cannot be
+ * used to go around it.
+ *
+ * Returns a message to refuse with, or null when there is something attached.
+ */
+export async function requireAttachment(docType: DocType, docId: number): Promise<string | null> {
+  const [rows] = await pool.query(
+    'SELECT COUNT(*) AS n FROM document_attachments WHERE document_type = ? AND document_id = ? LIMIT 1',
+    [docType, docId]);
+  if (Number((rows as any[])[0]?.n || 0) > 0) return null;
+  return 'Lampiran wajib diisi sebelum dokumen diajukan. Simpan dulu sebagai Draft, '
+    + 'unggah lampirannya, lalu ajukan.';
+}
 
 // ---- Attachments ----
 router.get('/:type/:id/attachments', authenticate, async (req, res) => {
@@ -585,10 +624,18 @@ export async function deleteDocumentChildren(docType: DocType, docId: number): P
  * they have not acted on this round yet.
  */
 export async function resetRevisionSteps(docType: DocType, docId: number, user: AuthUser): Promise<number> {
+  // Notes go too. A note explaining why a step sent the document back is history the
+  // activity log keeps; leaving it hanging on a step that is Pending again reads as
+  // though the objection still stands.
+  //
+  // The Payment step is excluded: it is an execution record, not an approval, and a
+  // paid request is not re-approved.
   const [result] = await pool.query(
     `UPDATE document_approvals
-     SET status = 'Pending', user_id = NULL, name = NULL, position = NULL, action_date = NULL, updated_at = NOW()
-     WHERE document_type = ? AND document_id = ? AND status = 'Revision'`,
+     SET status = 'Pending', user_id = NULL, name = NULL, position = NULL,
+         action_date = NULL, note = NULL, updated_at = NOW()
+     WHERE document_type = ? AND document_id = ?
+       AND COALESCE(step_label, '') <> 'Payment'`,
     [docType, docId]
   );
   const n = Number((result as any).affectedRows || 0);
@@ -619,6 +666,54 @@ export async function resetRevisionSteps(docType: DocType, docId: number, user: 
 // `NULL <> 'Payment'` is NULL, not true — a plain <> would silently drop them and
 // declare a half-approved document fully approved.
 // -----------------------------------------------------------------------------
+/**
+ * Tell the people whose work starts when a chain closes.
+ *
+ * A purchase request that is approved is not finished — it is Procurement's cue to
+ * raise the order. An approved order is Finance's cue that a payment is coming. Both
+ * used to be found out by asking, which is why a signed request could sit for days.
+ *
+ * Payment requests are deliberately absent: what matters there is not the approval
+ * but the money leaving, and that is announced from settlePaymentRequest().
+ */
+async function announceApproved(docType: DocType, docId: number) {
+  try {
+    const table = DOC_TABLE[docType];
+    const [rows] = await pool.query(
+      `SELECT d.*, e.entities_name AS entity_name FROM ${table} d
+       LEFT JOIN entities e ON e.id = d.entity_id WHERE d.id = ? LIMIT 1`, [docId]);
+    const doc = (rows as any[])[0];
+    if (!doc) return;
+    const entity = doc.entity_name ? ` · ${doc.entity_name}` : '';
+
+    if (docType === 'PR') {
+      await notifyRoles([ROLE.PROCUREMENT], doc.entity_id ?? null, {
+        kind: 'pr_approved',
+        title: `${doc.pr_number} disetujui — siap dibuatkan PO`,
+        body: `Purchase Request ${doc.pr_number}${entity} sudah lolos seluruh approval`
+          + `${doc.grand_total ? ` senilai ${fmtRp(Number(doc.grand_total))}` : ''}.`,
+        documentType: 'PR',
+        documentId: docId,
+        link: `/procurement/pr/${docId}`,
+      });
+      return;
+    }
+
+    if (docType === 'PO') {
+      await notifyRoles([ROLE.FINANCE_MANAGER, ROLE.FINANCE_STAFF], doc.entity_id ?? null, {
+        kind: 'po_approved',
+        title: `${doc.po_number} disetujui — menunggu pembayaran`,
+        body: `Purchase Order ${doc.po_number}${entity} sudah lolos seluruh approval dan siap dibuatkan Payment Request.`,
+        documentType: 'PO',
+        documentId: docId,
+        link: `/procurement/po/${docId}`,
+      });
+    }
+  } catch (err: any) {
+    console.error('[notify] announceApproved gagal:', err?.message || err);
+  }
+}
+
 export async function syncDocumentStatus(docType: DocType, docId: number): Promise<string | null> {
   const [rows] = await pool.query(
     `SELECT status FROM document_approvals
@@ -642,7 +737,18 @@ export async function syncDocumentStatus(docType: DocType, docId: number): Promi
     if ((cur as any[])[0]?.status === 'Paid') return 'Paid';
   }
 
+  // Read what it was before writing what it is: the notification below has to fire
+  // on the *transition* into Approved, not on every later call that finds it still
+  // approved. syncDocumentStatus runs after every step action, so without this a
+  // document with four steps would announce itself four times.
+  const [prevRow] = await pool.query(`SELECT status FROM ${table} WHERE id = ? LIMIT 1`, [docId]);
+  const previous = (prevRow as any[])[0]?.status ?? null;
+
   await pool.query(`UPDATE ${table} SET status = ?, updated_at = NOW() WHERE id = ?`, [status, docId]);
+
+  if (status === 'Approved' && previous !== 'Approved') {
+    await announceApproved(docType, docId);
+  }
 
   // The moment the chain closes on a payment request, it needs the reference that
   // will identify it on the bank statement — issued here rather than in the

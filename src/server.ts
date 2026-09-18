@@ -19,6 +19,7 @@ import reimbursementsRoutes from './routes/reimbursements';
 import stockInRoutes from './routes/stockIn';
 import stockOutRoutes from './routes/stockOut';
 import documentsRoutes from './routes/documents';
+import notificationsRoutes from './routes/notifications';
 import bankStatementsRoutes from './routes/bankStatements';
 import warehouseStockRoutes from './routes/warehouseStock';
 import financeRoutes from './routes/finance';
@@ -114,6 +115,9 @@ app.use('/api/reimbursements', ...opsGuard, reimbursementsRoutes);
 app.use('/api/stock-in', ...opsGuard, stockInRoutes);
 app.use('/api/stock-out', ...opsGuard, stockOutRoutes);
 app.use('/api/documents', ...opsGuard, documentsRoutes);
+// Not behind opsGuard: a read-only Admin still gets told what happened, and
+// marking your own notification read is not an operational change.
+app.use('/api/notifications', notificationsRoutes);
 // Bank statement reconciliation — what marks a payment request Paid.
 app.use('/api/bank-statements', ...opsGuard, bankStatementsRoutes);
 

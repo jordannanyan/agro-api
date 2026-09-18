@@ -4,7 +4,7 @@ import { authenticate, requireRole } from '../middleware/auth';
 import { nextDocNumber } from '../utils/docNumber';
 import {
   seedApprovalSteps, syncDocumentStatus, resetRevisionSteps,
-  guardEdit, guardRequester, guardDelete, deleteDocumentChildren,
+  guardEdit, guardRequester, guardDelete, deleteDocumentChildren, requireAttachment,
 } from './documents';
 import { ROLE, PAYMENT_EXECUTOR_ROLES, WRITE_OVERRIDE_ROLES } from '../utils/roles';
 import { settlePaymentRequest } from '../utils/payments';
@@ -344,6 +344,16 @@ async function budgetCodeFromSource(b: any): Promise<number | null> {
     const [r] = await pool.query('SELECT budget_code_id FROM purchase_orders WHERE id = ? LIMIT 1', [poId]);
     const code = (r as any[])[0]?.budget_code_id;
     if (code != null) return Number(code);
+    // Since 2026-09-18 an order carries a code per line, so the header may be blank
+    // where the lines are not. One code can only be inherited when the lines agree
+    // on it; a genuinely mixed order still has to be told which budget the payment
+    // lands against, which is what the refusal below asks for.
+    const [items] = await pool.query(
+      'SELECT DISTINCT budget_code_id FROM purchase_order_items WHERE po_id = ? AND budget_code_id IS NOT NULL',
+      [poId]);
+    const list = items as any[];
+    if (list.length === 1) return Number(list[0].budget_code_id);
+    if (list.length > 1) return null;
   }
   if (prId != null) return budgetCodeFromPR(prId);
   return null;
@@ -371,10 +381,19 @@ function bodyToCols(b: any) {
   };
 }
 
+/**
+ * Who may raise a payment request.
+ *
+ * Field Admin joined on 2026-09-18. They are the people in the field who incur the
+ * spend and already file the purchase requests behind it; routing their payments
+ * through somebody at head office added a step and lost a day without adding a
+ * check — the approval chain is what checks, and it is unchanged.
+ */
+const PAYREQ_CREATORS = [ROLE.FIELD_ADMIN, ROLE.PROCUREMENT, ROLE.FINANCE_MANAGER,
+                         ROLE.DIRECTOR, ROLE.SUPER_ADMIN];
+
 // POST /api/payment-requests  (CHECK: PR or PO source required)
-router.post('/', authenticate, requireRole(
-  ROLE.PROCUREMENT, ROLE.FINANCE_MANAGER, ROLE.DIRECTOR, ROLE.SUPER_ADMIN,
-), async (req: Request, res: Response) => {
+router.post('/', authenticate, requireRole(...PAYREQ_CREATORS), async (req: Request, res: Response) => {
   try {
     const b = req.body || {};
     if (!b.purchase_request_id && !b.purchase_order_id) {
@@ -400,6 +419,12 @@ router.post('/', authenticate, requireRole(
     const c: any = bodyToCols(b);
     if (c.budget_code_id == null) c.budget_code_id = inheritedCode;
     c.entity_id = scoped.entityId;
+    // Who filed it. The column has existed since the reimbursement work but nothing
+    // ever wrote it, so every payment request in the database says NULL — which made
+    // "tell whoever raised this that it has been paid" impossible to honour, and left
+    // guardDelete falling back to "whoever holds the requester role". Written here,
+    // from the token, so it cannot be claimed by a body field.
+    c.requested_by_user_id = req.user?.type === 'User' ? req.user.id : null;
     const payreqNumber = b.payreq_number || await nextDocNumber('payment_requests', 'payreq_number', 'PAY');
     const cols = { payreq_number: payreqNumber, ...c, created_at: new Date(), updated_at: new Date() };
     const keys = Object.keys(cols);
@@ -408,7 +433,19 @@ router.post('/', authenticate, requireRole(
       keys.map((k) => (cols as any)[k])
     );
     const id = (result as any).insertId;
-    if ((c.status) !== 'Draft') await seedApprovalSteps('PayReq', id, c.entity_id, c.amount);
+    // A document may not enter the chain with nothing attached (2026-09-18).
+    // Attachments hang off a saved document, so there is nowhere to put one before
+    // this row exists: the form saves a Draft, uploads, then submits. Left as a
+    // Draft here rather than discarded, so nothing keyed in is lost.
+    if ((c.status) !== 'Draft') {
+      const missing = await requireAttachment('PayReq', id);
+      if (missing) {
+        await pool.query("UPDATE payment_requests SET status = 'Draft' WHERE id = ?", [id]);
+        const [draft] = await pool.query(SELECT + ' WHERE pay.id = ? LIMIT 1', [id]);
+        return res.status(422).json({ message: missing, data: (draft as any[])[0] });
+      }
+      await seedApprovalSteps('PayReq', id, c.entity_id, c.amount);
+    }
     const [rows] = await pool.query(SELECT + ' WHERE pay.id = ? LIMIT 1', [id]);
     return res.status(201).json({ message: 'Payment request created', data: (rows as any[])[0] });
   } catch (err: any) {
@@ -472,6 +509,11 @@ const update = async (req: Request, res: Response) => {
     // Submitting a saved draft seeds the approval chain, as creating one already
     // Pending does — otherwise the request left Draft with nobody assigned to it.
     if (b.status && b.status !== 'Draft' && prev.status === 'Draft') {
+      const missing = await requireAttachment('PayReq', Number(id));
+      if (missing) {
+        await pool.query("UPDATE payment_requests SET status = 'Draft' WHERE id = ?", [id]);
+        return res.status(422).json({ message: missing });
+      }
       const [cnt] = await pool.query('SELECT COUNT(*) AS n FROM document_approvals WHERE document_type=? AND document_id=?', ['PayReq', id]);
       if (!Number((cnt as any[])[0].n)) {
         await seedApprovalSteps('PayReq', Number(id),
@@ -489,7 +531,7 @@ const update = async (req: Request, res: Response) => {
   }
 };
 // Editing a payment request is bounded by the same roles that may raise one.
-const PAYREQ_WRITERS = [ROLE.PROCUREMENT, ROLE.FINANCE_MANAGER, ROLE.DIRECTOR, ROLE.SUPER_ADMIN];
+const PAYREQ_WRITERS = PAYREQ_CREATORS;
 router.put('/:id', authenticate, requireRole(...PAYREQ_WRITERS), update);
 router.post('/:id', authenticate, requireRole(...PAYREQ_WRITERS), (req, res) => {
   if (String(req.body?._method || req.query?._method || '').toUpperCase() === 'PUT') return update(req, res);

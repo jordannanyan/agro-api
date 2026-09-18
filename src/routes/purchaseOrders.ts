@@ -4,7 +4,7 @@ import { authenticate, requireRole } from '../middleware/auth';
 import { nextDocNumber } from '../utils/docNumber';
 import {
   seedApprovalSteps, syncDocumentStatus, resetRevisionSteps,
-  guardEdit, guardRequester, guardDelete, deleteDocumentChildren,
+  guardEdit, guardRequester, guardDelete, deleteDocumentChildren, requireAttachment,
 } from './documents';
 import { ROLE } from '../utils/roles';
 import { inheritEntity, entityScope, canSeeEntity } from '../utils/entityScope';
@@ -33,14 +33,40 @@ async function loadItems(poId: number) {
     `SELECT poi.*, pri.description AS pr_item_description,
             pri.sapropdi_id, sp.sapropdi_name,
             pri.unit_id, un.unit_name,
-            pri.budget_code_id, bc.code AS budget_code
+            -- The line's own code, falling back to the request item's for orders
+            -- written before the column existed.
+            COALESCE(poi.budget_code_id, pri.budget_code_id) AS budget_code_id,
+            COALESCE(bcp.code, bc.code) AS budget_code
      FROM purchase_order_items poi
      LEFT JOIN purchase_request_items pri ON pri.id = poi.pr_item_id
      LEFT JOIN sapropdi sp     ON sp.id = pri.sapropdi_id
      LEFT JOIN units un        ON un.id = pri.unit_id
      LEFT JOIN budget_codes bc ON bc.id = pri.budget_code_id
+     LEFT JOIN budget_codes bcp ON bcp.id = poi.budget_code_id
      WHERE poi.po_id = ? ORDER BY poi.id ASC`, [poId]);
   return rows;
+}
+
+/**
+ * The budget code each order line inherits from the request line behind it.
+ *
+ * A request carries a code per item; an order raised from it has to keep them, or a
+ * request spanning two budgets collapses into one code the moment it becomes an
+ * order (asked for 2026-09-18). Copied onto the order line rather than read through
+ * `pr_item_id` at display time, so re-coding a request later cannot rewrite what an
+ * order was approved with.
+ *
+ * An explicit `budget_code_id` on the posted line wins — that is the operator
+ * overriding, which the form allows for a line with no request item behind it.
+ */
+async function itemBudgetCode(it: any): Promise<number | null> {
+  if (it?.budget_code_id != null && it.budget_code_id !== '') return Number(it.budget_code_id);
+  const prItemId = it?.pr_item_id != null && it.pr_item_id !== '' ? Number(it.pr_item_id) : null;
+  if (!prItemId) return null;
+  const [rows] = await pool.query(
+    'SELECT budget_code_id FROM purchase_request_items WHERE id = ? LIMIT 1', [prItemId]);
+  const v = (rows as any[])[0]?.budget_code_id;
+  return v != null ? Number(v) : null;
 }
 
 // The budget code a request already carries, so the order does not ask for it a
@@ -163,9 +189,9 @@ router.post('/', authenticate, requireRole(
     const id = (result as any).insertId;
     for (const it of (Array.isArray(b.items) ? b.items : [])) {
       await conn.query(
-        `INSERT INTO purchase_order_items (po_id, pr_item_id, order_qty, unit_price) VALUES (?,?,?,?)`,
+        `INSERT INTO purchase_order_items (po_id, pr_item_id, budget_code_id, order_qty, unit_price) VALUES (?,?,?,?,?)`,
         [id, it.pr_item_id != null && it.pr_item_id !== '' ? Number(it.pr_item_id) : null,
-         Number(it.order_qty || 0), Number(it.unit_price || 0)]
+         await itemBudgetCode(it), Number(it.order_qty || 0), Number(it.unit_price || 0)]
       );
     }
     for (const x of (Array.isArray(b.extra_costs) ? b.extra_costs : [])) {
@@ -175,7 +201,16 @@ router.post('/', authenticate, requireRole(
     }
     await conn.commit();
 
+    // A document may not enter the chain with nothing attached (2026-09-18).
+    // Attachments hang off a saved document, so there is nowhere to put one before
+    // this row exists: submitting straight from the form is refused, and the form
+    // saves a Draft, uploads, then submits. Left as a Draft so nothing is lost.
     if ((b.status || 'Draft') !== 'Draft') {
+      const missing = await requireAttachment('PO', id);
+      if (missing) {
+        await pool.query("UPDATE purchase_orders SET status = 'Draft' WHERE id = ?", [id]);
+        return res.status(422).json({ message: missing, data: { id, status: 'Draft' } });
+      }
       const totals = await computeTotals(id);
       await seedApprovalSteps('PO', id, entityId, totals.grand_total);
     }
@@ -256,8 +291,9 @@ const update = async (req: Request, res: Response) => {
     if (Array.isArray(b.items)) {
       await conn.query('DELETE FROM purchase_order_items WHERE po_id = ?', [id]);
       for (const it of b.items) {
-        await conn.query('INSERT INTO purchase_order_items (po_id, pr_item_id, order_qty, unit_price) VALUES (?,?,?,?)',
-          [id, it.pr_item_id != null && it.pr_item_id !== '' ? Number(it.pr_item_id) : null, Number(it.order_qty || 0), Number(it.unit_price || 0)]);
+        await conn.query('INSERT INTO purchase_order_items (po_id, pr_item_id, budget_code_id, order_qty, unit_price) VALUES (?,?,?,?,?)',
+          [id, it.pr_item_id != null && it.pr_item_id !== '' ? Number(it.pr_item_id) : null,
+           await itemBudgetCode(it), Number(it.order_qty || 0), Number(it.unit_price || 0)]);
       }
     }
     if (Array.isArray(b.extra_costs)) {

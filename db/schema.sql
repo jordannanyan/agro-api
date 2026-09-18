@@ -571,11 +571,18 @@ CREATE TABLE `purchase_order_items` (
   `id`          INT AUTO_INCREMENT PRIMARY KEY,
   `po_id`       INT NOT NULL,
   `pr_item_id`  INT NULL,
+  -- Copied from the request item this line came from. A request carries a code per
+  -- item and an order must keep them: a request spanning two budgets used to
+  -- collapse into the order's single code the moment it became an order. Stored
+  -- rather than read through `pr_item_id` so that re-coding a request later cannot
+  -- rewrite what an order was approved with.
+  `budget_code_id` INT NULL,
   `order_qty`   DECIMAL(15,3) NOT NULL DEFAULT 0,
   `unit_price`  DECIMAL(15,2) NOT NULL DEFAULT 0,
   `total`       DECIMAL(18,2) GENERATED ALWAYS AS (`order_qty` * `unit_price`) STORED,
   CONSTRAINT `fk_poi_po`     FOREIGN KEY (`po_id`)      REFERENCES `purchase_orders`(`id`) ON DELETE CASCADE,
-  CONSTRAINT `fk_poi_priitem` FOREIGN KEY (`pr_item_id`) REFERENCES `purchase_request_items`(`id`) ON DELETE SET NULL
+  CONSTRAINT `fk_poi_priitem` FOREIGN KEY (`pr_item_id`) REFERENCES `purchase_request_items`(`id`) ON DELETE SET NULL,
+  CONSTRAINT `fk_poi_budget`  FOREIGN KEY (`budget_code_id`) REFERENCES `budget_codes`(`id`) ON DELETE SET NULL
 ) ENGINE=InnoDB;
 
 CREATE TABLE `purchase_order_extra_costs` (
@@ -1026,6 +1033,39 @@ CREATE TABLE `bank_statement_lines` (
 -- -----------------------------------------------------------------------------
 -- Auth token store (JWT is stateless; this table optionally supports revocation)
 -- -----------------------------------------------------------------------------
+-- -----------------------------------------------------------------------------
+-- CLUSTER: Notifikasi
+-- -----------------------------------------------------------------------------
+
+-- What somebody needs to be told, once it has already happened.
+--
+-- Distinct from the approval inbox, which counts what is waiting for *you to act*.
+-- These are the other half: a request you filed is approved, an order you have to
+-- pay for is cleared, goods you will receive have been paid for. Nobody has to do
+-- anything about them in this system — they have to know.
+--
+-- One row per recipient rather than one row plus a join table: read state is
+-- per-person, the fan-out is a handful of rows, and a query for "my unread" stays
+-- a single index lookup.
+CREATE TABLE `notifications` (
+  `id`            INT AUTO_INCREMENT PRIMARY KEY,
+  `user_id`       INT NOT NULL,
+  -- pr_approved | po_approved | payreq_paid | goods_in_transit
+  `kind`          VARCHAR(40) NOT NULL,
+  `title`         VARCHAR(160) NOT NULL,
+  `body`          VARCHAR(500) NULL,
+  -- What it is about, so the UI can link straight to it. Kept as loose columns
+  -- rather than an FK per document type: a notification outlives the row it
+  -- refers to, and a deleted draft must not delete the record that it happened.
+  `document_type` VARCHAR(20) NULL,
+  `document_id`   INT NULL,
+  `link`          VARCHAR(200) NULL,
+  `read_at`       DATETIME NULL,
+  `created_at`    DATETIME NULL,
+  KEY `idx_notif_user` (`user_id`, `read_at`, `id`),
+  CONSTRAINT `fk_notif_user` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
 CREATE TABLE `personal_access_tokens` (
   `id`             BIGINT AUTO_INCREMENT PRIMARY KEY,
   `tokenable_type` VARCHAR(80) NOT NULL,

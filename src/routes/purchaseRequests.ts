@@ -4,7 +4,7 @@ import { authenticate, requireRole } from '../middleware/auth';
 import { nextDocNumber } from '../utils/docNumber';
 import {
   seedApprovalSteps, syncDocumentStatus, resetRevisionSteps,
-  guardEdit, guardRequester, guardDelete, deleteDocumentChildren,
+  guardEdit, guardRequester, guardDelete, deleteDocumentChildren, requireAttachment,
 } from './documents';
 import { ROLE } from '../utils/roles';
 import { resolveWriteEntity, entityScope, canSeeEntity } from '../utils/entityScope';
@@ -132,8 +132,16 @@ router.post('/', authenticate, requireRole(...PR_WRITERS), async (req: Request, 
     }
     await conn.commit();
 
-    // Seed approval workflow when submitted (not Draft).
+    // A document may not enter the chain with nothing attached (2026-09-18).
+    // Attachments hang off a saved document, so there is nowhere to put one before
+    // this row exists: submitting straight from the form is refused, and the form
+    // saves a Draft, uploads, then submits. Left as a Draft so nothing is lost.
     if ((b.status || 'Draft') !== 'Draft') {
+      const missing = await requireAttachment('PR', id);
+      if (missing) {
+        await pool.query("UPDATE purchase_requests SET status = 'Draft' WHERE id = ?", [id]);
+        return res.status(422).json({ message: missing, data: { id, status: 'Draft' } });
+      }
       await seedApprovalSteps('PR', id, entityId, grandTotal);
     }
 
@@ -212,6 +220,11 @@ const update = async (req: Request, res: Response) => {
 
     // If transitioning out of Draft and no approvals exist yet, seed them.
     if (b.status && b.status !== 'Draft' && prev.status === 'Draft') {
+      const missing = await requireAttachment('PR', Number(id));
+      if (missing) {
+        await pool.query("UPDATE purchase_requests SET status = 'Draft' WHERE id = ?", [id]);
+        return res.status(422).json({ message: missing });
+      }
       const [cnt] = await pool.query('SELECT COUNT(*) AS n FROM document_approvals WHERE document_type=? AND document_id=?', ['PR', id]);
       if (!Number((cnt as any[])[0].n)) {
         await seedApprovalSteps('PR', Number(id), Number(updates.entity_id ?? prev.entity_id), Number(grandTotal ?? prev.grand_total));
