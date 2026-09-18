@@ -34,20 +34,23 @@ ${pendingStepJoin(PAYREQ_DOC_TYPES, 'pay')}
 
 // GET /api/payment-requests?entity_id=&status=&route=
 router.get('/', authenticate, async (req: Request, res: Response) => {
-  // Reimbursements live in the same table but are a different document with their
-  // own screen; mixing them in would put farmer payments in front of people looking
-  // for supplier invoices. Expense claims DO belong here — they are payment
-  // requests filed on the same screen, only with no purchase behind them.
-  const where: string[] = ["pay.payreq_kind IN ('Procurement','Expense')"];
-  const args: any[] = [];
+  // One screen per kind, so each list answers one question.
+  //
+  //   (default)       procurement payment requests — the ones settling a PR or PO
+  //   ?kind=Expense   reimbursement claims — money somebody laid out themselves
+  //
+  // KTH reimbursements are in this table too and belong to neither: they have their
+  // own endpoint and their own screen.
+  const kind = req.query.kind === 'Expense' ? 'Expense' : 'Procurement';
+  const where: string[] = ['pay.payreq_kind = ?'];
+  const args: any[] = [kind];
   // Same rule as PR and PO: entity-bound staff see their own PT only.
+  // A reimbursement claim is personal to a PT in the plainest sense — somebody who
+  // works for that PT laid out the money — so this scoping is what keeps one PT's
+  // claims out of another's list.
   const scope = entityScope(req);
   if (scope != null) { where.push('pay.entity_id = ?'); args.push(scope); }
   if (req.query.status)    { where.push('pay.status = ?'); args.push(req.query.status); }
-  // ?kind=Procurement|Expense narrows the list to one of the two the screen holds.
-  if (req.query.kind === 'Procurement' || req.query.kind === 'Expense') {
-    where.push('pay.payreq_kind = ?'); args.push(req.query.kind);
-  }
   if (req.query.route === 'via_po')  where.push('pay.purchase_order_id IS NOT NULL');
   if (req.query.route === 'direct')  where.push('pay.purchase_order_id IS NULL');
   if (req.query.search)    { where.push('pay.payreq_number LIKE ?'); args.push(`%${req.query.search}%`); }

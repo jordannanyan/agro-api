@@ -139,10 +139,12 @@ async function announcePaid(user: AuthUser, payreqId: number) {
         documentType: pay.payreq_kind === 'Reimbursement' ? 'Reimbursement'
           : pay.payreq_kind === 'Expense' ? 'Expense' : 'PayReq',
         documentId: payreqId,
-        // An expense claim lives on the ordinary Payment Request page — it is one,
-        // only without a purchase behind it.
-        link: pay.payreq_kind === 'Reimbursement'
-          ? `/reimbursement/${payreqId}` : `/procurement/payreq/${payreqId}`,
+        // Each kind has its own screen, so each notification has to land on the
+        // right one — a claim opened on the procurement page would show a document
+        // that page does not list.
+        link: pay.payreq_kind === 'Reimbursement' ? `/reimbursement/${payreqId}`
+          : pay.payreq_kind === 'Expense' ? `/procurement/payreq-reimbursement/${payreqId}`
+          : `/procurement/payreq/${payreqId}`,
       },
       // The requester hears about their own request even when they hold none of the
       // roles above — a Field Admin who filed it, say.
