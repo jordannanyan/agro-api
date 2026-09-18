@@ -382,14 +382,15 @@ function bodyToCols(b: any) {
 }
 
 /**
- * Who may raise a payment request.
+ * Who may raise a procurement payment request.
  *
- * Field Admin joined on 2026-09-18. They are the people in the field who incur the
- * spend and already file the purchase requests behind it; routing their payments
- * through somebody at head office added a step and lost a day without adding a
- * check — the approval chain is what checks, and it is unchanged.
+ * Field Admin is deliberately absent. They were added on 2026-09-18 and taken out
+ * again the same week: the payment requests they actually file are reimbursements —
+ * farm labour paid through a KTH, descending from no purchase at all — and those go
+ * through `/api/reimbursements`, which is where they are a creator. A procurement
+ * payment request always settles a PR or a PO, and a Field Admin raises neither.
  */
-const PAYREQ_CREATORS = [ROLE.FIELD_ADMIN, ROLE.PROCUREMENT, ROLE.FINANCE_MANAGER,
+const PAYREQ_CREATORS = [ROLE.PROCUREMENT, ROLE.FINANCE_MANAGER,
                          ROLE.DIRECTOR, ROLE.SUPER_ADMIN];
 
 // POST /api/payment-requests  (CHECK: PR or PO source required)
