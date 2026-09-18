@@ -9,8 +9,8 @@ import {
 import { ROLE, PAYMENT_EXECUTOR_ROLES, WRITE_OVERRIDE_ROLES } from '../utils/roles';
 import { settlePaymentRequest } from '../utils/payments';
 import { budgetCodeFromPR } from './purchaseOrders';
-import { inheritEntity, entityScope, canSeeEntity } from '../utils/entityScope';
-import { PENDING_STEP_COLUMNS, pendingStepJoin } from '../utils/pendingStep';
+import { inheritEntity, entityScope, canSeeEntity, resolveWriteEntity } from '../utils/entityScope';
+import { PENDING_STEP_COLUMNS, pendingStepJoin, PAYREQ_DOC_TYPES } from '../utils/pendingStep';
 import {
   planExport, buildCsv, buildXlsx, kopraFilename, kopraDate, BI_FAST_LIMIT, KopraFormat,
 } from '../utils/kopraExport';
@@ -29,20 +29,25 @@ ${PENDING_STEP_COLUMNS}
   LEFT JOIN purchase_requests pr  ON pr.id = pay.purchase_request_id
   LEFT JOIN purchase_orders po    ON po.id = pay.purchase_order_id
   LEFT JOIN banks bnk             ON bnk.id = pay.bank_id
-${pendingStepJoin('PayReq', 'pay')}
+${pendingStepJoin(PAYREQ_DOC_TYPES, 'pay')}
 `;
 
 // GET /api/payment-requests?entity_id=&status=&route=
 router.get('/', authenticate, async (req: Request, res: Response) => {
-  // Reimbursements live in the same table but are a different document with a
-  // different chain and their own screen; mixing them into the procurement queue
-  // would put farmer payments in front of people looking for supplier invoices.
-  const where: string[] = ["pay.payreq_kind = 'Procurement'"];
+  // Reimbursements live in the same table but are a different document with their
+  // own screen; mixing them in would put farmer payments in front of people looking
+  // for supplier invoices. Expense claims DO belong here — they are payment
+  // requests filed on the same screen, only with no purchase behind them.
+  const where: string[] = ["pay.payreq_kind IN ('Procurement','Expense')"];
   const args: any[] = [];
   // Same rule as PR and PO: entity-bound staff see their own PT only.
   const scope = entityScope(req);
   if (scope != null) { where.push('pay.entity_id = ?'); args.push(scope); }
   if (req.query.status)    { where.push('pay.status = ?'); args.push(req.query.status); }
+  // ?kind=Procurement|Expense narrows the list to one of the two the screen holds.
+  if (req.query.kind === 'Procurement' || req.query.kind === 'Expense') {
+    where.push('pay.payreq_kind = ?'); args.push(req.query.kind);
+  }
   if (req.query.route === 'via_po')  where.push('pay.purchase_order_id IS NOT NULL');
   if (req.query.route === 'direct')  where.push('pay.purchase_order_id IS NULL');
   if (req.query.search)    { where.push('pay.payreq_number LIKE ?'); args.push(`%${req.query.search}%`); }
@@ -285,10 +290,13 @@ router.get('/:id', authenticate, async (req: Request, res: Response) => {
   if (!canSeeEntity(req, data.entity_id)) {
     return res.status(403).json({ message: 'This payment request belongs to another entity.' });
   }
+  // Three kinds live in this table and each keeps its chain under its own type.
+  const docType = data.payreq_kind === 'Expense' ? 'Expense' : 'PayReq';
   const [appr] = await pool.query(
     `SELECT da.*, r.role_code, r.role_name FROM document_approvals da LEFT JOIN roles r ON r.id = da.role_id
-     WHERE da.document_type='PayReq' AND da.document_id=? ORDER BY da.step_order`, [req.params.id]);
+     WHERE da.document_type=? AND da.document_id=? ORDER BY da.step_order`, [docType, req.params.id]);
   data.approvals = appr;
+  if (data.payreq_kind === 'Expense') data.items = await loadExpenseItems(Number(req.params.id));
   return res.json({ data });
 });
 
@@ -359,8 +367,65 @@ async function budgetCodeFromSource(b: any): Promise<number | null> {
   return null;
 }
 
+/**
+ * An expense claim: a payment request with nothing bought behind it.
+ *
+ * A Field Admin covers fuel, a courier, a meal out of their own pocket and has to
+ * be paid back. There is no purchase request and no order, and there is no KTH
+ * either — that is the other source-less kind, and it reaches a farmer rather than
+ * a member of staff. Keeping them apart is the whole reason this is its own kind.
+ */
+const isExpense = (b: any) => String(b?.payreq_kind || '') === 'Expense';
+
+interface ExpenseItem { description: string; amount: number }
+
+/**
+ * Read the claim lines, refusing what would make the total unaccountable.
+ *
+ * The header amount is DERIVED from these, never typed — the same rule the KTH
+ * reimbursement follows, and for the same reason: a payment whose total disagrees
+ * with its own breakdown is one nobody can check.
+ */
+function readExpenseItems(raw: any): { items: ExpenseItem[]; total: number } | { error: string } {
+  if (!Array.isArray(raw) || !raw.length) {
+    return { error: 'Isi minimal satu baris pengeluaran — yang diganti harus jelas apa saja.' };
+  }
+  const items: ExpenseItem[] = [];
+  let total = 0;
+  for (const [i, r] of raw.entries()) {
+    const description = String(r?.description ?? '').trim();
+    const amount = Number(r?.amount || 0);
+    if (!description) return { error: `Baris ${i + 1}: keterangan pengeluaran belum diisi.` };
+    if (!(amount > 0)) return { error: `Baris ${i + 1}: nominal harus lebih dari 0.` };
+    items.push({ description, amount });
+    total += amount;
+  }
+  return { items, total };
+}
+
+/** Replace the claim lines wholesale and return what they add up to. */
+async function writeExpenseItems(payreqId: number, items: ExpenseItem[]): Promise<number> {
+  await pool.query('DELETE FROM payment_request_items WHERE payment_request_id = ?', [payreqId]);
+  let total = 0;
+  for (const it of items) {
+    total += Number(it.amount);
+    await pool.query(
+      `INSERT INTO payment_request_items (payment_request_id, description, amount, created_at, updated_at)
+       VALUES (?,?,?,NOW(),NOW())`, [payreqId, it.description, it.amount]);
+  }
+  await pool.query('UPDATE payment_requests SET amount = ?, updated_at = NOW() WHERE id = ?', [total, payreqId]);
+  return total;
+}
+
+async function loadExpenseItems(payreqId: number) {
+  const [rows] = await pool.query(
+    'SELECT * FROM payment_request_items WHERE payment_request_id = ? ORDER BY id ASC', [payreqId]);
+  return rows;
+}
+
 function bodyToCols(b: any) {
   return {
+    payreq_kind: isExpense(b) ? 'Expense' : 'Procurement',
     purchase_request_id: b.purchase_request_id != null && b.purchase_request_id !== '' ? Number(b.purchase_request_id) : null,
     purchase_order_id: b.purchase_order_id != null && b.purchase_order_id !== '' ? Number(b.purchase_order_id) : null,
     entity_id: b.entity_id != null ? Number(b.entity_id) : null,
@@ -390,36 +455,80 @@ function bodyToCols(b: any) {
  * through `/api/reimbursements`, which is where they are a creator. A procurement
  * payment request always settles a PR or a PO, and a Field Admin raises neither.
  */
-const PAYREQ_CREATORS = [ROLE.PROCUREMENT, ROLE.FINANCE_MANAGER,
+const PAYREQ_CREATORS = [ROLE.FIELD_ADMIN, ROLE.PROCUREMENT, ROLE.FINANCE_MANAGER,
                          ROLE.DIRECTOR, ROLE.SUPER_ADMIN];
+
+/**
+ * A Field Admin may raise an expense claim and nothing else here.
+ *
+ * They are the one out of pocket, so they have to be able to ask for it back. But
+ * a procurement payment request settles a PR or a PO, and a Field Admin raises
+ * neither — letting them file one would only produce a document nobody can match
+ * to a purchase.
+ */
+function creatorMayFile(req: Request, kind: string): string | null {
+  if (req.user?.roleCode !== ROLE.FIELD_ADMIN) return null;
+  if (kind === 'Expense') return null;
+  return 'Field Admin hanya dapat mengajukan Payment Request penggantian biaya '
+    + '(tanpa PR/PO). Payment Request atas PR atau PO diajukan oleh Procurement.';
+}
 
 // POST /api/payment-requests  (CHECK: PR or PO source required)
 router.post('/', authenticate, requireRole(...PAYREQ_CREATORS), async (req: Request, res: Response) => {
   try {
     const b = req.body || {};
-    if (!b.purchase_request_id && !b.purchase_order_id) {
+    const expense = isExpense(b);
+
+    const roleDenied = creatorMayFile(req, expense ? 'Expense' : 'Procurement');
+    if (roleDenied) return res.status(403).json({ message: roleDenied });
+
+    if (!expense && !b.purchase_request_id && !b.purchase_order_id) {
       return res.status(422).json({ message: 'Either purchase_request_id or purchase_order_id is required' });
     }
-    // The source document decides the entity; entity_id in the body is ignored.
-    const source = await entityFromSource(b);
-    if ('error' in source) return res.status(422).json({ message: source.error });
-    const scoped = inheritEntity(req, source.entityId);
-    if ('error' in scoped) return res.status(422).json({ message: scoped.error });
+
+    // An expense claim has no source document, so nothing upstream can settle which
+    // PT is paying: it comes from whoever is filing, the same way a purchase request
+    // takes it from its author.
+    let entityId: number;
+    if (expense) {
+      const own = resolveWriteEntity(req, b.entity_id);
+      if ('error' in own) return res.status(422).json({ message: own.error });
+      entityId = own.entityId;
+    } else {
+      // The source document decides the entity; entity_id in the body is ignored.
+      const source = await entityFromSource(b);
+      if ('error' in source) return res.status(422).json({ message: source.error });
+      const scoped = inheritEntity(req, source.entityId);
+      if ('error' in scoped) return res.status(422).json({ message: scoped.error });
+      entityId = scoped.entityId;
+    }
     // Called "Project Code" on a PayReq and "Budget Code" on a PR/PO, but it is the
     // same budget_codes list. Optional upstream, mandatory here: this is the document
     // that moves cash, so the spend has to land against a code.
     const inheritedCode = (b.budget_code_id == null || b.budget_code_id === '')
-      ? await budgetCodeFromSource(b)
+      ? (expense ? null : await budgetCodeFromSource(b))
       : null;
     if ((b.budget_code_id == null || b.budget_code_id === '') && inheritedCode == null) {
       return res.status(422).json({
-        message: 'Project Code belum ada. Dokumen sumbernya (PO/PR) tidak membawa budget code, '
+        message: expense
+          ? 'Project Code wajib diisi.'
+          : 'Project Code belum ada. Dokumen sumbernya (PO/PR) tidak membawa budget code, '
           + 'jadi kode harus dipilih di sini.',
       });
     }
+    // Lines are read before anything is written, so a bad line refuses the whole
+    // document rather than leaving half of one behind.
+    let claim: { items: ExpenseItem[]; total: number } | null = null;
+    if (expense) {
+      const read = readExpenseItems(b.items);
+      if ('error' in read) return res.status(422).json({ message: read.error });
+      claim = read;
+    }
+
     const c: any = bodyToCols(b);
     if (c.budget_code_id == null) c.budget_code_id = inheritedCode;
-    c.entity_id = scoped.entityId;
+    c.entity_id = entityId;
+    if (claim) c.amount = claim.total;
     // Who filed it. The column has existed since the reimbursement work but nothing
     // ever wrote it, so every payment request in the database says NULL — which made
     // "tell whoever raised this that it has been paid" impossible to honour, and left
@@ -434,18 +543,19 @@ router.post('/', authenticate, requireRole(...PAYREQ_CREATORS), async (req: Requ
       keys.map((k) => (cols as any)[k])
     );
     const id = (result as any).insertId;
+    if (claim) await writeExpenseItems(id, claim.items);
     // A document may not enter the chain with nothing attached (2026-09-18).
     // Attachments hang off a saved document, so there is nowhere to put one before
     // this row exists: the form saves a Draft, uploads, then submits. Left as a
     // Draft here rather than discarded, so nothing keyed in is lost.
     if ((c.status) !== 'Draft') {
-      const missing = await requireAttachment('PayReq', id);
+      const missing = await requireAttachment(expense ? 'Expense' : 'PayReq', id);
       if (missing) {
         await pool.query("UPDATE payment_requests SET status = 'Draft' WHERE id = ?", [id]);
         const [draft] = await pool.query(SELECT + ' WHERE pay.id = ? LIMIT 1', [id]);
         return res.status(422).json({ message: missing, data: (draft as any[])[0] });
       }
-      await seedApprovalSteps('PayReq', id, c.entity_id, c.amount);
+      await seedApprovalSteps(expense ? 'Expense' : 'PayReq', id, c.entity_id, c.amount);
     }
     const [rows] = await pool.query(SELECT + ' WHERE pay.id = ? LIMIT 1', [id]);
     return res.status(201).json({ message: 'Payment request created', data: (rows as any[])[0] });
@@ -471,10 +581,27 @@ const update = async (req: Request, res: Response) => {
     const denied = guardEdit(req.user, prev, b.status);
     if (denied) return res.status(403).json({ message: denied });
 
+    // The kind is fixed at creation: an expense claim never turns into a
+    // procurement request, and letting it would orphan the chain already seeded
+    // under the other document type.
+    const docType: 'PayReq' | 'Expense' = prev.payreq_kind === 'Expense' ? 'Expense' : 'PayReq';
+
+    const roleDenied = creatorMayFile(req, docType === 'Expense' ? 'Expense' : 'Procurement');
+    if (roleDenied) return res.status(403).json({ message: roleDenied });
+
     const resubmitting = b.status === 'Pending' && prev.status === 'Revision';
     if (resubmitting) {
-      const noRight = await guardRequester(req.user!, 'PayReq', Number(id), prev);
+      const noRight = await guardRequester(req.user!, docType, Number(id), prev);
       if (noRight) return res.status(403).json({ message: noRight });
+    }
+
+    // Claim lines are replaced wholesale when sent, and the header amount follows
+    // them — it is never typed on this kind.
+    let claimTotal: number | null = null;
+    if (docType === 'Expense' && b.items !== undefined) {
+      const read = readExpenseItems(b.items);
+      if ('error' in read) return res.status(422).json({ message: read.error });
+      claimTotal = await writeExpenseItems(Number(id), read.items);
     }
     // Editing may leave the code alone, but it may not clear it.
     if (b.budget_code_id !== undefined && (b.budget_code_id === null || b.budget_code_id === '')) {
@@ -488,6 +615,12 @@ const update = async (req: Request, res: Response) => {
     // Entity follows the source document, never the body. Moving a payment onto a
     // different PR or PO moves it to that document's entity as well.
     delete updates.entity_id;
+    // Nor may the kind be edited, nor the amount on a kind whose amount is derived.
+    delete updates.payreq_kind;
+    if (docType === 'Expense') {
+      delete updates.amount;
+      if (claimTotal != null) updates.amount = claimTotal;
+    }
     if (b.purchase_request_id !== undefined || b.purchase_order_id !== undefined) {
       const [cur] = await pool.query(
         'SELECT purchase_request_id, purchase_order_id FROM payment_requests WHERE id = ? LIMIT 1', [id]);
@@ -510,20 +643,20 @@ const update = async (req: Request, res: Response) => {
     // Submitting a saved draft seeds the approval chain, as creating one already
     // Pending does — otherwise the request left Draft with nobody assigned to it.
     if (b.status && b.status !== 'Draft' && prev.status === 'Draft') {
-      const missing = await requireAttachment('PayReq', Number(id));
+      const missing = await requireAttachment(docType, Number(id));
       if (missing) {
         await pool.query("UPDATE payment_requests SET status = 'Draft' WHERE id = ?", [id]);
         return res.status(422).json({ message: missing });
       }
-      const [cnt] = await pool.query('SELECT COUNT(*) AS n FROM document_approvals WHERE document_type=? AND document_id=?', ['PayReq', id]);
+      const [cnt] = await pool.query('SELECT COUNT(*) AS n FROM document_approvals WHERE document_type=? AND document_id=?', [docType, id]);
       if (!Number((cnt as any[])[0].n)) {
-        await seedApprovalSteps('PayReq', Number(id),
+        await seedApprovalSteps(docType, Number(id),
           Number(updates.entity_id ?? prev.entity_id),
           Number(updates.amount ?? prev.amount));
       }
     }
-    if (resubmitting) await resetRevisionSteps('PayReq', Number(id), req.user!);
-    if (b.status && b.status !== 'Draft') await syncDocumentStatus('PayReq', Number(id));
+    if (resubmitting) await resetRevisionSteps(docType, Number(id), req.user!);
+    if (b.status && b.status !== 'Draft') await syncDocumentStatus(docType, Number(id));
 
     const [rows] = await pool.query(SELECT + ' WHERE pay.id = ? LIMIT 1', [id]);
     return res.json({ message: 'Payment request updated', data: (rows as any[])[0] });

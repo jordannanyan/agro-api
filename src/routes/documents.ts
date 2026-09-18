@@ -11,7 +11,7 @@ import { issuePaymentCode } from '../utils/payments';
 // Mounted at /api/documents/:type/:id/(approvals|attachments|activities)
 export const router = Router({ mergeParams: true });
 
-const DOC_TYPES = ['PR', 'PO', 'PayReq', 'Reimbursement'] as const;
+const DOC_TYPES = ['PR', 'PO', 'PayReq', 'Reimbursement', 'Expense'] as const;
 export type DocType = (typeof DOC_TYPES)[number];
 
 /**
@@ -28,10 +28,13 @@ const DOC_TABLE: Record<DocType, string> = {
   PO: 'purchase_orders',
   PayReq: 'payment_requests',
   Reimbursement: 'payment_requests',
+  // Paying back somebody who spent their own money. Same table again, and for the
+  // same reason: it is a payment request with no purchase behind it.
+  Expense: 'payment_requests',
 };
 
 /** The document types that end in money leaving the account. */
-export const PAYMENT_DOC_TYPES: DocType[] = ['PayReq', 'Reimbursement'];
+export const PAYMENT_DOC_TYPES: DocType[] = ['PayReq', 'Reimbursement', 'Expense'];
 const isPaymentDoc = (t: DocType) => PAYMENT_DOC_TYPES.includes(t);
 
 function checkType(req: Request, res: Response): boolean {
@@ -157,8 +160,11 @@ router.get('/inbox', authenticate, async (req: Request, res: Response) => {
   const scope = entityScope(req);
   const roleCode = user.roleCode;
 
+  // Expense claims are counted into the PayReq bucket rather than a bucket of their
+  // own: they are filed and read on the Payment Request screen, so a badge pointing
+  // anywhere else would point at a page that does not list them.
   const [prApproval, prRevision, poApproval, poRevision, payApproval, payRevision,
-         rbApproval, rbRevision] =
+         exApproval, exRevision, rbApproval, rbRevision] =
     await Promise.all([
       pendingOnRole('PR', roleCode, scope),
       revisionForUser('PR', user, scope),
@@ -166,6 +172,8 @@ router.get('/inbox', authenticate, async (req: Request, res: Response) => {
       revisionForUser('PO', user, scope),
       pendingOnRole('PayReq', roleCode, scope),
       revisionForUser('PayReq', user, scope),
+      pendingOnRole('Expense', roleCode, scope),
+      revisionForUser('Expense', user, scope),
       pendingOnRole('Reimbursement', roleCode, scope),
       revisionForUser('Reimbursement', user, scope),
     ]);
@@ -184,17 +192,19 @@ router.get('/inbox', authenticate, async (req: Request, res: Response) => {
     const awaitingPayment = (kind: string) => countOne(
       `SELECT COUNT(*) AS n FROM payment_requests d
        WHERE d.status = 'Approved' AND d.payreq_kind = ?${scoped}`, [kind, ...args]);
-    [payment, rbPayment] = await Promise.all([
-      awaitingPayment('Procurement'), awaitingPayment('Reimbursement'),
+    const [proc, exp, rb] = await Promise.all([
+      awaitingPayment('Procurement'), awaitingPayment('Expense'), awaitingPayment('Reimbursement'),
     ]);
+    payment = proc + exp;
+    rbPayment = rb;
   }
 
   const data = {
     PR: { approval: prApproval, revision: prRevision, total: prApproval + prRevision },
     PO: { approval: poApproval, revision: poRevision, total: poApproval + poRevision },
     PayReq: {
-      approval: payApproval, revision: payRevision, payment,
-      total: payApproval + payRevision + payment,
+      approval: payApproval + exApproval, revision: payRevision + exRevision, payment,
+      total: payApproval + exApproval + payRevision + exRevision + payment,
     },
     Reimbursement: {
       approval: rbApproval, revision: rbRevision, payment: rbPayment,
@@ -520,6 +530,8 @@ const DEFAULT_REQUESTER_ROLE: Record<DocType, string> = {
   // Nothing is procured on a reimbursement, and Field Admin is who deals with the
   // KTH and its farmers.
   Reimbursement: ROLE.FIELD_ADMIN,
+  // And the same person again when it is their own money being paid back.
+  Expense: ROLE.FIELD_ADMIN,
 };
 
 async function requesterRoleCode(docType: DocType, docId: number): Promise<string | null> {

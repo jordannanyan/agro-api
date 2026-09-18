@@ -49,7 +49,9 @@ export async function settlePaymentRequest(
   // has to check — and the Payment step it appends — belong to that type, not to
   // 'PayReq'. Reading it from the row rather than taking it as an argument means
   // the statement importer, which knows only a payment code, cannot get it wrong.
-  const docType = payreq.payreq_kind === 'Reimbursement' ? 'Reimbursement' : 'PayReq';
+  const docType = payreq.payreq_kind === 'Reimbursement' ? 'Reimbursement'
+    : payreq.payreq_kind === 'Expense' ? 'Expense'
+    : 'PayReq';
 
   const [steps] = await pool.query(
     `SELECT da.step_order, da.status, r.role_name
@@ -134,9 +136,13 @@ async function announcePaid(user: AuthUser, payreqId: number) {
         body: `Pembayaran ${fmtRp(Number(pay.amount))}${entity} sudah dikeluarkan`
           + `${pay.po_number ? ` untuk ${pay.po_number}` : ''}`
           + `${pay.vendor_name ? ` (${pay.vendor_name})` : ''}.`,
-        documentType: pay.payreq_kind === 'Reimbursement' ? 'Reimbursement' : 'PayReq',
+        documentType: pay.payreq_kind === 'Reimbursement' ? 'Reimbursement'
+          : pay.payreq_kind === 'Expense' ? 'Expense' : 'PayReq',
         documentId: payreqId,
-        link: pay.payreq_kind === 'Reimbursement' ? `/reimbursement/${payreqId}` : `/procurement/payreq/${payreqId}`,
+        // An expense claim lives on the ordinary Payment Request page — it is one,
+        // only without a purchase behind it.
+        link: pay.payreq_kind === 'Reimbursement'
+          ? `/reimbursement/${payreqId}` : `/procurement/payreq/${payreqId}`,
       },
       // The requester hears about their own request even when they hold none of the
       // roles above — a Field Admin who filed it, say.

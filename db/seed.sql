@@ -181,7 +181,21 @@ INSERT INTO `approval_routes` (document_type, entity_id, step_order, step_label,
 ('Reimbursement', 2, 1, 'Requested',    1, NULL, NULL),
 ('Reimbursement', 2, 2, 'Approved',     2, NULL, NULL),
 ('Reimbursement', 2, 3, 'Approved',     4, NULL, NULL),
-('Reimbursement', 2, 4, 'Acknowledged', 6, NULL, NULL);
+('Reimbursement', 2, 4, 'Acknowledged', 6, NULL, NULL),
+-- ---- Expense: paying back somebody who spent their own money ----------------
+-- Same chain again, and filed by the Field Admin for the same reason: they are
+-- the one out of pocket. It is a separate document type from Reimbursement only
+-- because that one reaches a farmer and this one reaches a member of staff, and a
+-- chain shared between them would make the two impossible to tell apart on the
+-- timeline.
+('Expense', 1, 1, 'Requested',    1, NULL, NULL),
+('Expense', 1, 2, 'Approved',     2, NULL, NULL),
+('Expense', 1, 3, 'Approved',     4, NULL, NULL),
+('Expense', 1, 4, 'Acknowledged', 6, NULL, NULL),
+('Expense', 2, 1, 'Requested',    1, NULL, NULL),
+('Expense', 2, 2, 'Approved',     2, NULL, NULL),
+('Expense', 2, 3, 'Approved',     4, NULL, NULL),
+('Expense', 2, 4, 'Acknowledged', 6, NULL, NULL);
 -- PayReq step 5 (Payment Process) is intentionally NOT a route row: it is cash
 -- execution, not approval. POST /api/payment-requests/:id/pay writes it, and both
 -- Finance Manager and Finance Staff may call that endpoint.

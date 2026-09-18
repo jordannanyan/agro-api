@@ -105,7 +105,7 @@ CREATE TABLE `users` (
 -- Approval routing config (per document type, per entity, per step).
 CREATE TABLE `approval_routes` (
   `id`             INT AUTO_INCREMENT PRIMARY KEY,
-  `document_type`  ENUM('PR','PO','PayReq','Reimbursement') NOT NULL,
+  `document_type`  ENUM('PR','PO','PayReq','Reimbursement','Expense') NOT NULL,
   `entity_id`      INT NULL,                          -- NULL = berlaku semua entitas
   `step_order`     INT NOT NULL,
   -- 'Payment' is the cash-execution step (PayReq step 5). It is not an approval:
@@ -601,11 +601,21 @@ CREATE TABLE `payment_requests` (
   -- line on the statement, so it is short and carries a check character.
   `payment_code`        VARCHAR(16) NULL UNIQUE,
   `payment_code_issued_at` DATETIME NULL,
-  -- Two kinds of payment request share this table, because everything around one
-  -- is what the other needs: the chain, the code, the statement matching, the
-  -- attachments. 'Reimbursement' pays farmers through their KTH and descends from
-  -- no purchase at all; see `reimbursement_items` and approval_routes.
-  `payreq_kind`         ENUM('Procurement','Reimbursement') NOT NULL DEFAULT 'Procurement',
+  -- Three kinds of payment request share this table, because everything around one
+  -- is what the others need: the chain, the code, the statement matching, the
+  -- attachments.
+  --
+  --   Procurement   settles a PR or a PO — something was bought from a vendor.
+  --   Reimbursement pays FARMERS through their KTH. See `reimbursement_items`.
+  --   Expense       pays back somebody who spent their own money — a Field Admin
+  --                 out in the field, usually. No purchase document behind it and
+  --                 no KTH either; the lines are what was spent on, in
+  --                 `payment_request_items`.
+  --
+  -- The last two are both "reimbursements" in plain speech, which is exactly why
+  -- they are named apart here: one reaches a farmer, the other reaches a member of
+  -- staff, and confusing them puts money in the wrong account.
+  `payreq_kind`         ENUM('Procurement','Reimbursement','Expense') NOT NULL DEFAULT 'Procurement',
   `purchase_request_id` INT NULL,
   `purchase_order_id`   INT NULL,
   `entity_id`           INT NOT NULL,
@@ -656,6 +666,24 @@ CREATE TABLE `payment_requests` (
   CONSTRAINT `fk_payreq_exportedby` FOREIGN KEY (`exported_by_user_id`) REFERENCES `users`(`id`) ON DELETE SET NULL
   -- NOTE: "PR or PO required" is enforced in the API (routes/paymentRequests.ts).
   -- A CHECK constraint was intentionally omitted for MySQL/MariaDB portability.
+) ENGINE=InnoDB;
+
+-- What an Expense payment request is claiming back, line by line.
+--
+-- Deliberately plain: a description and an amount. Somebody paid for fuel, a
+-- courier and a meal out of their own pocket, and the receipts go on as
+-- attachments — the lines exist so the total is derived from its parts rather
+-- than typed, the same rule the KTH reimbursement follows.
+CREATE TABLE `payment_request_items` (
+  `id`                 INT AUTO_INCREMENT PRIMARY KEY,
+  `payment_request_id` INT NOT NULL,
+  `description`        VARCHAR(255) NOT NULL,
+  `amount`             DECIMAL(18,2) NOT NULL DEFAULT 0,
+  `created_at`         DATETIME NULL,
+  `updated_at`         DATETIME NULL,
+  KEY `idx_pri_payreq` (`payment_request_id`),
+  CONSTRAINT `fk_pri_payreq` FOREIGN KEY (`payment_request_id`)
+    REFERENCES `payment_requests`(`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB;
 
 -- The farmers one reimbursement settles, and how much each is owed.
@@ -727,7 +755,7 @@ CREATE TABLE `reimbursement_items` (
 -- -----------------------------------------------------------------------------
 CREATE TABLE `document_approvals` (
   `id`            INT AUTO_INCREMENT PRIMARY KEY,
-  `document_type` ENUM('PR','PO','PayReq','Reimbursement') NOT NULL,
+  `document_type` ENUM('PR','PO','PayReq','Reimbursement','Expense') NOT NULL,
   `document_id`   INT NOT NULL,
   `step_order`    INT NOT NULL,
   `step_label`    ENUM('Requested','Approved','Acknowledged','Payment') NULL,
@@ -747,7 +775,7 @@ CREATE TABLE `document_approvals` (
 
 CREATE TABLE `document_attachments` (
   `id`            INT AUTO_INCREMENT PRIMARY KEY,
-  `document_type` ENUM('PR','PO','PayReq','Reimbursement') NOT NULL,
+  `document_type` ENUM('PR','PO','PayReq','Reimbursement','Expense') NOT NULL,
   `document_id`   INT NOT NULL,
   `category`      VARCHAR(80) NULL,
   `subcategory`   VARCHAR(80) NULL,
@@ -759,7 +787,7 @@ CREATE TABLE `document_attachments` (
 
 CREATE TABLE `document_activities` (
   `id`            INT AUTO_INCREMENT PRIMARY KEY,
-  `document_type` ENUM('PR','PO','PayReq','Reimbursement') NOT NULL,
+  `document_type` ENUM('PR','PO','PayReq','Reimbursement','Expense') NOT NULL,
   `document_id`   INT NOT NULL,
   `action`        VARCHAR(120) NOT NULL,
   `user_id`       INT NULL,
