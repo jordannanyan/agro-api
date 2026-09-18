@@ -679,9 +679,15 @@ export async function resetRevisionSteps(docType: DocType, docId: number, user: 
 async function announceApproved(docType: DocType, docId: number) {
   try {
     const table = DOC_TABLE[docType];
+    // The vendor is joined only for an order — it is the one thing a reader wants
+    // beside the number, and the other document types have no vendor to join.
+    const vendorJoin = docType === 'PO'
+      ? ', v.vendor_name' : '';
+    const vendorFrom = docType === 'PO'
+      ? ' LEFT JOIN vendors v ON v.id = d.vendor_id' : '';
     const [rows] = await pool.query(
-      `SELECT d.*, e.entities_name AS entity_name FROM ${table} d
-       LEFT JOIN entities e ON e.id = d.entity_id WHERE d.id = ? LIMIT 1`, [docId]);
+      `SELECT d.*, e.entities_name AS entity_name${vendorJoin} FROM ${table} d
+       LEFT JOIN entities e ON e.id = d.entity_id${vendorFrom} WHERE d.id = ? LIMIT 1`, [docId]);
     const doc = (rows as any[])[0];
     if (!doc) return;
     const entity = doc.entity_name ? ` · ${doc.entity_name}` : '';
@@ -700,14 +706,22 @@ async function announceApproved(docType: DocType, docId: number) {
     }
 
     if (docType === 'PO') {
-      await notifyRoles([ROLE.FINANCE_MANAGER, ROLE.FINANCE_STAFF], doc.entity_id ?? null, {
-        kind: 'po_approved',
-        title: `${doc.po_number} disetujui — menunggu pembayaran`,
-        body: `Purchase Order ${doc.po_number}${entity} sudah lolos seluruh approval dan siap dibuatkan Payment Request.`,
-        documentType: 'PO',
-        documentId: docId,
-        link: `/procurement/po/${docId}`,
-      });
+      // Procurement hears it too, not only Finance. They are the ones who raised the
+      // order and who have to tell the vendor it is cleared and then raise the
+      // payment request against it — being told by Finance afterwards, or finding
+      // out by opening the list, is how an approved order sits for days.
+      await notifyRoles(
+        [ROLE.PROCUREMENT, ROLE.FINANCE_MANAGER, ROLE.FINANCE_STAFF],
+        doc.entity_id ?? null,
+        {
+          kind: 'po_approved',
+          title: `${doc.po_number} disetujui — siap dibuatkan Payment Request`,
+          body: `Purchase Order ${doc.po_number}${entity} sudah lolos seluruh approval`
+            + `${doc.vendor_name ? ` untuk ${doc.vendor_name}` : ''}.`,
+          documentType: 'PO',
+          documentId: docId,
+          link: `/procurement/po/${docId}`,
+        });
     }
   } catch (err: any) {
     console.error('[notify] announceApproved gagal:', err?.message || err);
