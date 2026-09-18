@@ -22,6 +22,24 @@
 //
 // Design note on `farmer_name`: it is stored on the line, not joined at read time.
 // Farmers get renamed and deleted; a record of who was paid has to keep saying so.
+//
+// The lines carry the shape of the form that is actually filed (2026-09-18, see
+// docs/reimbursement.md). Two facts that used to be one:
+//
+//   * `farmer_id` / `farmer_name` is **who is paid** — usually a daily worker, and
+//     often not a registered farmer at all, so the id is optional and the name is
+//     free text when it has to be.
+//   * `on_behalf_*` is **whose land or loan the work was on** — the farmer the cost
+//     belongs to. It is what makes the by-scheme recap possible.
+//
+// One person may appear on several lines. A worker who maintained three farmers'
+// land in a week owes three different loans their share, and collapsing that into
+// one line destroys the only record of which is which.
+//
+// Nothing here posts to a farmer's outstanding or to profit sharing. Recording
+// only, by decision of 2026-09-18 — the same amounts may already be booked through
+// another route, and a silent second posting is how the SNBS farmer debt came to be
+// overstated by Rp 384.3 million.
 
 import { Router, Request, Response } from 'express';
 import pool from '../db/connection';
@@ -134,6 +152,10 @@ router.get('/:id', authenticate, async (req: Request, res: Response) => {
      LEFT JOIN farmers f ON f.id = ri.farmer_id
      WHERE ri.payment_request_id = ? ORDER BY ri.id ASC`, [req.params.id]);
   data.items = items;
+  // The two recaps the paper form lives by. Both add to the same total, and that
+  // they do is the check a reader performs first — so they are computed from the
+  // lines here rather than left to each client to get right separately.
+  data.recap = buildRecap(items as any[]);
   const [appr] = await pool.query(
     `SELECT da.*, r.role_code, r.role_name FROM document_approvals da
      LEFT JOIN roles r ON r.id = da.role_id
@@ -143,64 +165,212 @@ router.get('/:id', authenticate, async (req: Request, res: Response) => {
   return res.json({ data });
 });
 
+/**
+ * The two ways the same total is read.
+ *
+ * By scheme — whose loan or whose wage bill this is — and by recipient, who
+ * actually gets the money. Every reimbursement document in use prints both, and a
+ * reader checks them against each other before looking at anything else.
+ */
+function buildRecap(items: any[]) {
+  const LABEL: Record<string, string> = {
+    DailyWorker: 'Daily worker',
+    LabourLoanPreFinance: 'Labour loan — pre finance',
+    LabourLoanProfitSharing: 'Labour loan — profit sharing',
+  };
+
+  const scheme = new Map<string, any>();
+  const recipient = new Map<string, any>();
+  let total = 0;
+
+  for (const it of items) {
+    const amount = Number(it.amount || 0);
+    total += amount;
+
+    // A labour loan is grouped by whose loan it is; a daily worker line has no
+    // owner and stands as its own group.
+    const owner = it.category === 'DailyWorker' ? null : (it.on_behalf_name || null);
+    const key = `${it.category}|${owner ?? ''}`;
+    if (!scheme.has(key)) {
+      scheme.set(key, {
+        category: it.category,
+        category_label: LABEL[it.category] ?? it.category,
+        on_behalf_farmer_id: it.on_behalf_farmer_id ?? null,
+        on_behalf_name: owner,
+        label: owner ? `${owner} — ${LABEL[it.category] ?? it.category}` : (LABEL[it.category] ?? it.category),
+        amount: 0,
+        lines: 0,
+      });
+    }
+    const sg = scheme.get(key);
+    sg.amount += amount;
+    sg.lines += 1;
+
+    const rkey = it.farmer_id ? `id:${it.farmer_id}` : `name:${String(it.farmer_name || '').toLowerCase()}`;
+    if (!recipient.has(rkey)) {
+      recipient.set(rkey, {
+        farmer_id: it.farmer_id ?? null,
+        farmer_name: it.farmer_name,
+        bank_name: it.recipient_bank_name ?? null,
+        bank_account: it.recipient_bank_account ?? it.no_rek ?? null,
+        amount: 0,
+        lines: 0,
+      });
+    }
+    const rg = recipient.get(rkey);
+    rg.amount += amount;
+    rg.lines += 1;
+    // The account is often filled on only one of a person's lines.
+    if (!rg.bank_name && it.recipient_bank_name) rg.bank_name = it.recipient_bank_name;
+    if (!rg.bank_account && it.recipient_bank_account) rg.bank_account = it.recipient_bank_account;
+  }
+
+  const byAmount = (a: any, b: any) => b.amount - a.amount;
+  return {
+    total,
+    by_scheme: [...scheme.values()].sort(byAmount),
+    by_recipient: [...recipient.values()].sort(byAmount),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // The farmer lines
 // ---------------------------------------------------------------------------
 
-interface ItemInput { farmer_id: number; description?: string | null; amount: number }
+const CATEGORIES = ['DailyWorker', 'LabourLoanPreFinance', 'LabourLoanProfitSharing'] as const;
+type Category = (typeof CATEGORIES)[number];
+
+interface ItemInput {
+  farmer_id: number | null;
+  farmer_name: string;
+  category: Category;
+  on_behalf_farmer_id: number | null;
+  on_behalf_name: string | null;
+  description: string | null;
+  rate: number | null;
+  work_days: number | null;
+  work_dates: string | null;
+  amount: number;
+  recipient_bank_name: string | null;
+  recipient_bank_account: string | null;
+}
+
+/** A number, or null when the field was left alone. Zero is a value; '' is not. */
+function optNum(v: any): number | null {
+  if (v == null || v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+const optText = (v: any): string | null => {
+  const t = String(v ?? '').trim();
+  return t ? t : null;
+};
 
 /**
- * Read the farmer lines out of a request body, refusing anything that would make
- * the document unpayable.
+ * Read the lines out of a request body, refusing anything that would make the
+ * document unpayable.
  *
- * Every line names a farmer from the master list. A free-typed name would be
- * easier to file and useless afterwards: the whole reason to keep this breakdown
- * is to be able to answer "what has this person been paid", and a name typed three
- * different ways cannot answer it.
+ * A recipient is identified by `farmer_id` where they are in the master list, and
+ * by name where they are not — most of the people on these documents are daily
+ * workers, not farmers, and refusing to record them was the reason the form went on
+ * being typed outside the system. A picked farmer's name is still taken from the
+ * master rather than the body, so it cannot be spelled three ways.
+ *
+ * Duplicates are allowed now. The same worker maintaining three farmers' land is
+ * three lines because it is three different loans; merging them would leave nothing
+ * able to say which.
+ *
+ * `rate` x `work_days` is NOT checked against `amount`, and must not be: the real
+ * documents carry weeks where one of four days was paid at half rate.
  */
-async function readItems(raw: any): Promise<{ items: (ItemInput & { farmer_name: string })[] } | { error: string }> {
+async function readItems(raw: any): Promise<{ items: ItemInput[] } | { error: string }> {
   if (!Array.isArray(raw) || !raw.length) {
-    return { error: 'Isi minimal satu baris petani — reimbursement tanpa daftar petani tidak bisa dipertanggungjawabkan.' };
+    return { error: 'Isi minimal satu baris — reimbursement tanpa rincian penerima tidak bisa dipertanggungjawabkan.' };
   }
-  const cleaned: ItemInput[] = [];
+
+  const draft: (ItemInput & { _pickedFarmer: number | null; _pickedBehalf: number | null })[] = [];
   for (const [i, r] of raw.entries()) {
-    const farmerId = r?.farmer_id != null && r.farmer_id !== '' ? Number(r.farmer_id) : null;
     const amount = Number(r?.amount || 0);
-    if (!farmerId) return { error: `Baris ${i + 1}: petani belum dipilih.` };
     if (!(amount > 0)) return { error: `Baris ${i + 1}: nominal harus lebih dari 0.` };
-    cleaned.push({ farmer_id: farmerId, description: r?.description ?? null, amount });
+
+    const farmerId = optNum(r?.farmer_id);
+    const typedName = optText(r?.farmer_name);
+    if (!farmerId && !typedName) {
+      return { error: `Baris ${i + 1}: isi nama penerima, atau pilih petani dari daftar.` };
+    }
+
+    const category = CATEGORIES.includes(r?.category) ? (r.category as Category) : 'DailyWorker';
+    const behalfId = optNum(r?.on_behalf_farmer_id);
+    const behalfName = optText(r?.on_behalf_name);
+    // A labour loan is charged to somebody. Without that the by-scheme recap has a
+    // row it cannot name, which is exactly the number finance asks about.
+    if (category !== 'DailyWorker' && !behalfId && !behalfName) {
+      return { error: `Baris ${i + 1}: labour loan harus menyebut lahan/pinjaman siapa.` };
+    }
+
+    draft.push({
+      farmer_id: farmerId,
+      farmer_name: typedName ?? '',
+      category,
+      on_behalf_farmer_id: behalfId,
+      on_behalf_name: behalfName,
+      description: optText(r?.description),
+      rate: optNum(r?.rate),
+      work_days: optNum(r?.work_days),
+      work_dates: optText(r?.work_dates),
+      amount,
+      recipient_bank_name: optText(r?.recipient_bank_name),
+      recipient_bank_account: optText(r?.recipient_bank_account),
+      _pickedFarmer: farmerId,
+      _pickedBehalf: behalfId,
+    });
   }
 
-  // One farmer twice in one document is almost always two rows that should have
-  // been one, and it makes the per-farmer total ambiguous to read back.
-  const seen = new Set<number>();
-  for (const c of cleaned) {
-    if (seen.has(c.farmer_id)) return { error: 'Ada petani yang muncul dua kali. Gabungkan jadi satu baris.' };
-    seen.add(c.farmer_id);
+  // Resolve every farmer named by id in one query — recipients and on-behalf alike.
+  const ids = [...new Set(draft.flatMap((d) => [d._pickedFarmer, d._pickedBehalf]).filter((v): v is number => !!v))];
+  const byId = new Map<number, any>();
+  if (ids.length) {
+    const [rows] = await pool.query('SELECT id, farmer_name FROM farmers WHERE id IN (?)', [ids]);
+    for (const f of rows as any[]) byId.set(Number(f.id), f);
+    const missing = ids.filter((id) => !byId.has(id));
+    if (missing.length) return { error: `Petani tidak ditemukan: ${missing.join(', ')}` };
   }
 
-  const [rows] = await pool.query(
-    'SELECT id, farmer_name, kth_id FROM farmers WHERE id IN (?)', [cleaned.map((c) => c.farmer_id)]);
-  const byId = new Map<number, any>((rows as any[]).map((f) => [Number(f.id), f]));
-  const missing = cleaned.filter((c) => !byId.has(c.farmer_id));
-  if (missing.length) return { error: `Petani tidak ditemukan: ${missing.map((m) => m.farmer_id).join(', ')}` };
-
-  return {
-    items: cleaned.map((c) => ({ ...c, farmer_name: byId.get(c.farmer_id).farmer_name ?? `#${c.farmer_id}` })),
-  };
+  const items: ItemInput[] = draft.map((d) => ({
+    farmer_id: d.farmer_id,
+    farmer_name: d.farmer_id ? (byId.get(d.farmer_id)?.farmer_name ?? d.farmer_name) : d.farmer_name,
+    category: d.category,
+    on_behalf_farmer_id: d.on_behalf_farmer_id,
+    on_behalf_name: d.on_behalf_farmer_id
+      ? (byId.get(d.on_behalf_farmer_id)?.farmer_name ?? d.on_behalf_name)
+      : d.on_behalf_name,
+    description: d.description,
+    rate: d.rate,
+    work_days: d.work_days,
+    work_dates: d.work_dates,
+    amount: d.amount,
+    recipient_bank_name: d.recipient_bank_name,
+    recipient_bank_account: d.recipient_bank_account,
+  }));
+  return { items };
 }
 
 /** Replace the lines wholesale and return the total they add up to. */
-async function writeItems(payreqId: number, items: (ItemInput & { farmer_name: string })[]): Promise<number> {
+async function writeItems(payreqId: number, items: ItemInput[]): Promise<number> {
   await pool.query('DELETE FROM reimbursement_items WHERE payment_request_id = ?', [payreqId]);
   let total = 0;
   for (const it of items) {
     total += Number(it.amount);
     await pool.query(
       `INSERT INTO reimbursement_items
-         (payment_request_id, farmer_id, farmer_name, description, amount, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, NOW(), NOW())`,
-      [payreqId, it.farmer_id, it.farmer_name, it.description ?? null, it.amount]);
+         (payment_request_id, farmer_id, farmer_name, category, on_behalf_farmer_id, on_behalf_name,
+          description, rate, work_days, work_dates, amount,
+          recipient_bank_name, recipient_bank_account, created_at, updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,NOW(),NOW())`,
+      [payreqId, it.farmer_id, it.farmer_name, it.category, it.on_behalf_farmer_id, it.on_behalf_name,
+       it.description, it.rate, it.work_days, it.work_dates, it.amount,
+       it.recipient_bank_name, it.recipient_bank_account]);
   }
   await pool.query(
     'UPDATE payment_requests SET amount = ?, updated_at = NOW() WHERE id = ?', [total, payreqId]);

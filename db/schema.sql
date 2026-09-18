@@ -667,17 +667,59 @@ CREATE TABLE `payment_requests` (
 --
 -- `farmer_name` is a snapshot rather than a join: farmers get renamed and deleted,
 -- and a payment record has to keep saying who was paid.
+-- One line of a reimbursement: one person, paid for one kind of work, on one
+-- account.
+--
+-- Shaped from the form the field admins actually file (see
+-- docs/reimbursement.md). Two facts share a line and must not be confused:
+--
+--   * `farmer_id` / `farmer_name` — **who is paid**. A daily worker, usually, and
+--     often not a registered farmer at all, which is why `farmer_id` is nullable
+--     and the name is stored rather than joined: a record of who was paid has to
+--     keep saying so after a rename or a deletion.
+--   * `on_behalf_*` — **whose land or loan the work was on**. This is the farmer
+--     the cost belongs to (Mr. Mustari, Mr. Suparno), not the person holding the
+--     hoe. It is what makes the by-scheme recap possible.
+--
+-- The same person may appear on several lines — one worker maintains three
+-- farmers' land in a week, and collapsing that into one line would destroy the
+-- only record of which loan each part belongs to.
+--
+-- `rate` x `days` is **not** forced to equal `amount`, and must never be: the real
+-- documents carry weeks where one of four days was paid at half rate, so the
+-- amount is the authority and rate/days/dates describe how it was arrived at.
 CREATE TABLE `reimbursement_items` (
   `id`                 INT AUTO_INCREMENT PRIMARY KEY,
   `payment_request_id` INT NOT NULL,
   `farmer_id`          INT NULL,
   `farmer_name`        VARCHAR(255) NOT NULL,
+  -- What kind of cost this is. The by-scheme recap groups on it, and it is the
+  -- column that says whether a line is somebody's debt or the company's own wage
+  -- bill. Recording only — nothing here posts to a farmer's outstanding or to
+  -- profit sharing automatically (decision of 2026-09-18).
+  `category`           ENUM('DailyWorker','LabourLoanPreFinance','LabourLoanProfitSharing')
+                       NOT NULL DEFAULT 'DailyWorker',
+  `on_behalf_farmer_id` INT NULL,
+  `on_behalf_name`     VARCHAR(255) NULL,
   `description`        VARCHAR(255) NULL,
+  `rate`               DECIMAL(15,2) NULL,
+  `work_days`          DECIMAL(6,2) NULL,
+  -- Free text on purpose: "06, 07, 08, 10, 11, 12 August" is how the attendance
+  -- sheet reads, and turning it into rows would be a timesheet module nobody asked
+  -- for.
+  `work_dates`         VARCHAR(255) NULL,
   `amount`             DECIMAL(18,2) NOT NULL DEFAULT 0,
+  -- The worker's own account, copied off the KTH's invoice. The transfer still
+  -- goes to the KTH in one sum; this is here because the invoice lists it and a
+  -- query about who was actually paid what should not need the paper.
+  `recipient_bank_name`    VARCHAR(80) NULL,
+  `recipient_bank_account` VARCHAR(60) NULL,
   `created_at`         DATETIME NULL,
   `updated_at`         DATETIME NULL,
+  KEY `idx_ri_category` (`payment_request_id`, `category`),
   CONSTRAINT `fk_ri_payreq` FOREIGN KEY (`payment_request_id`) REFERENCES `payment_requests`(`id`) ON DELETE CASCADE,
-  CONSTRAINT `fk_ri_farmer` FOREIGN KEY (`farmer_id`)          REFERENCES `farmers`(`id`) ON DELETE SET NULL
+  CONSTRAINT `fk_ri_farmer` FOREIGN KEY (`farmer_id`)          REFERENCES `farmers`(`id`) ON DELETE SET NULL,
+  CONSTRAINT `fk_ri_behalf` FOREIGN KEY (`on_behalf_farmer_id`) REFERENCES `farmers`(`id`) ON DELETE SET NULL
 ) ENGINE=InnoDB;
 
 -- -----------------------------------------------------------------------------
