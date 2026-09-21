@@ -20,6 +20,7 @@ import { RoleCode } from './roles';
 export type NotificationKind =
   | 'pr_approved'       // a purchase request cleared its chain
   | 'po_approved'       // a purchase order cleared its chain
+  | 'payreq_approved'   // a payment request cleared its chain — the transfer may go
   | 'payreq_paid'       // finance settled a payment request
   | 'goods_in_transit'; // that payment was for an order, so the goods are coming
 

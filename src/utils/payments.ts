@@ -128,7 +128,10 @@ async function announcePaid(user: AuthUser, payreqId: number) {
     const entity = pay.entity_name ? ` · ${pay.entity_name}` : '';
 
     await notifyRoles(
-      [ROLE.FINANCE_MANAGER, ROLE.FINANCE_STAFF, ROLE.PROCUREMENT, ROLE.DIRECTOR],
+      // The Project Manager signs step 2 of every one of these chains; leaving them
+      // out meant the one person who approved the spend never learned it had gone.
+      [ROLE.FINANCE_MANAGER, ROLE.FINANCE_STAFF, ROLE.PROCUREMENT,
+       ROLE.PROJECT_MANAGER, ROLE.DIRECTOR],
       pay.entity_id ?? null,
       {
         kind: 'payreq_paid',

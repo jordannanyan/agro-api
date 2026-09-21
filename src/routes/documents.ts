@@ -679,15 +679,25 @@ export async function resetRevisionSteps(docType: DocType, docId: number, user: 
 // declare a half-approved document fully approved.
 // -----------------------------------------------------------------------------
 /**
- * Tell the people whose work starts when a chain closes.
+ * Tell the people whose work starts when a chain closes — and the people who signed.
  *
- * A purchase request that is approved is not finished — it is Procurement's cue to
- * raise the order. An approved order is Finance's cue that a payment is coming. Both
- * used to be found out by asking, which is why a signed request could sit for days.
+ * Two audiences, and they want different things from the same event:
  *
- * Payment requests are deliberately absent: what matters there is not the approval
- * but the money leaving, and that is announced from settlePaymentRequest().
+ *   * Whoever acts next. An approved request is Procurement's cue to raise the
+ *     order; an approved order is Finance's cue that a payment is coming; an
+ *     approved payment request is Finance's cue that the transfer may go. Each used
+ *     to be found out by asking, which is why a signed document could sit for days.
+ *   * **The Project Manager and the Director.** They sign step 2 and the last step
+ *     of every one of these chains and were told nothing about the outcome, so the
+ *     only way to learn whether what they approved actually happened was to open
+ *     the list and look. Added 2026-09-21 at the request of the PM.
+ *
+ * Every kind of document that has a chain is announced here, payment requests
+ * included. What settlePaymentRequest() announces is a different event — the money
+ * actually leaving — and both are worth saying.
  */
+/** Everyone who signed but is not the next to act. They want the outcome, not a task. */
+const APPROVAL_WATCHERS = [ROLE.PROJECT_MANAGER, ROLE.DIRECTOR];
 async function announceApproved(docType: DocType, docId: number) {
   try {
     const table = DOC_TABLE[docType];
@@ -705,7 +715,7 @@ async function announceApproved(docType: DocType, docId: number) {
     const entity = doc.entity_name ? ` · ${doc.entity_name}` : '';
 
     if (docType === 'PR') {
-      await notifyRoles([ROLE.PROCUREMENT], doc.entity_id ?? null, {
+      await notifyRoles([ROLE.PROCUREMENT, ...APPROVAL_WATCHERS], doc.entity_id ?? null, {
         kind: 'pr_approved',
         title: `${doc.pr_number} disetujui — siap dibuatkan PO`,
         body: `Purchase Request ${doc.pr_number}${entity} sudah lolos seluruh approval`
@@ -723,7 +733,7 @@ async function announceApproved(docType: DocType, docId: number) {
       // payment request against it — being told by Finance afterwards, or finding
       // out by opening the list, is how an approved order sits for days.
       await notifyRoles(
-        [ROLE.PROCUREMENT, ROLE.FINANCE_MANAGER, ROLE.FINANCE_STAFF],
+        [ROLE.PROCUREMENT, ROLE.FINANCE_MANAGER, ROLE.FINANCE_STAFF, ...APPROVAL_WATCHERS],
         doc.entity_id ?? null,
         {
           kind: 'po_approved',
@@ -734,6 +744,37 @@ async function announceApproved(docType: DocType, docId: number) {
           documentId: docId,
           link: `/procurement/po/${docId}`,
         });
+      return;
+    }
+
+    // The three kinds of payment request. Their chains close the same way and the
+    // same people want to know, but each has its own screen, so each notification
+    // has to land on the right one.
+    if (docType === 'PayReq' || docType === 'Reimbursement' || docType === 'Expense') {
+      const label = docType === 'Reimbursement' ? 'Reimbursement petani'
+        : docType === 'Expense' ? 'Penggantian biaya' : 'Payment Request';
+      const link = docType === 'Reimbursement' ? `/reimbursement/${docId}`
+        : docType === 'Expense' ? `/procurement/payreq-reimbursement/${docId}`
+        : `/procurement/payreq/${docId}`;
+      // Procurement is told about the kind they raise and pay for; they have no part
+      // in a farmer reimbursement or somebody's expense claim.
+      const next = docType === 'PayReq'
+        ? [ROLE.FINANCE_MANAGER, ROLE.FINANCE_STAFF, ROLE.PROCUREMENT]
+        : [ROLE.FINANCE_MANAGER, ROLE.FINANCE_STAFF];
+      await notifyRoles([...next, ...APPROVAL_WATCHERS], doc.entity_id ?? null, {
+        kind: 'payreq_approved',
+        title: `${doc.payreq_number} disetujui — siap ditransfer`,
+        body: `${label} ${doc.payreq_number}${entity} sudah lolos seluruh approval`
+          + `${doc.amount ? ` senilai ${fmtRp(Number(doc.amount))}` : ''}.`
+          + `${doc.payment_code ? ` Kode pembayaran ${doc.payment_code} — tempel di keterangan transfer.` : ''}`,
+        documentType: docType,
+        documentId: docId,
+        link,
+      }, {
+        // Whoever filed it hears too, even when they hold none of the roles above —
+        // a Field Admin waiting to be paid back, say.
+        alsoUserIds: [doc.requested_by_user_id],
+      });
     }
   } catch (err: any) {
     console.error('[notify] announceApproved gagal:', err?.message || err);
@@ -772,16 +813,19 @@ export async function syncDocumentStatus(docType: DocType, docId: number): Promi
 
   await pool.query(`UPDATE ${table} SET status = ?, updated_at = NOW() WHERE id = ?`, [status, docId]);
 
-  if (status === 'Approved' && previous !== 'Approved') {
-    await announceApproved(docType, docId);
-  }
-
   // The moment the chain closes on a payment request, it needs the reference that
   // will identify it on the bank statement — issued here rather than in the
   // approval handler so that every route into 'Approved' produces one, including
   // a resubmitted document whose last step is signed off elsewhere.
   if (isPaymentDoc(docType) && status === 'Approved') {
     await issuePaymentCode(docId);
+  }
+
+  // Announced last, and deliberately after the code exists: the notification tells
+  // finance the transfer may go, and it can only carry the reference they have to
+  // type into the remark if that reference has already been issued.
+  if (status === 'Approved' && previous !== 'Approved') {
+    await announceApproved(docType, docId);
   }
 
   return status;
