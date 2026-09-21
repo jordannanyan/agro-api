@@ -210,6 +210,12 @@ router.delete('/:id', authenticate, async (req: Request, res: Response) => {
         message: `Stock out ini masih punya ${n} baris yang menjadi utang petani. Hapus barisnya lebih dulu.`,
       });
     }
+    // Attachments are addressed by (type, id) with no foreign key, so a real delete
+    // has to take them along or they end up pointing at an id a later stock-out
+    // reuses. See the same clean-up in stockIn.ts.
+    await pool.query(
+      "DELETE FROM document_attachments WHERE document_type = 'StockOut' AND document_id = ?",
+      [req.params.id]);
     const [result] = await pool.query('DELETE FROM stock_out WHERE id = ?', [req.params.id]);
     if (!(result as any).affectedRows) return res.status(404).json({ message: 'Stock out not found' });
     return res.json({ message: 'Stock out deleted' });

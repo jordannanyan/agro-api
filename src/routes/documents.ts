@@ -11,7 +11,8 @@ import { issuePaymentCode } from '../utils/payments';
 // Mounted at /api/documents/:type/:id/(approvals|attachments|activities)
 export const router = Router({ mergeParams: true });
 
-const DOC_TYPES = ['PR', 'PO', 'PayReq', 'Reimbursement', 'Expense'] as const;
+const DOC_TYPES = ['PR', 'PO', 'PayReq', 'Reimbursement', 'Expense',
+                   'StockIn', 'StockInItem', 'StockOut'] as const;
 export type DocType = (typeof DOC_TYPES)[number];
 
 /**
@@ -31,6 +32,16 @@ const DOC_TABLE: Record<DocType, string> = {
   // Paying back somebody who spent their own money. Same table again, and for the
   // same reason: it is a payment request with no purchase behind it.
   Expense: 'payment_requests',
+  // Warehouse movements. No approval chain — they carry attachments and nothing
+  // else from this layer — but the attachment endpoints are polymorphic, so making
+  // them addressable here is all it takes.
+  //
+  // 'StockInItem' addresses a LINE, not a document: the photo of what came off the
+  // truck belongs to the item it is a photo of. The delivery note is the other way
+  // round — one sheet for the whole shipment — so it hangs off 'StockIn'.
+  StockIn: 'stock_in',
+  StockInItem: 'stock_in_items',
+  StockOut: 'stock_out',
 };
 
 /** The document types that end in money leaving the account. */
@@ -523,7 +534,10 @@ export function guardEdit(
  * Who raises each kind of document, for the one case the chain cannot answer:
  * a Draft, which has no chain yet. Kept in step with db/seed.sql's approval_routes.
  */
-const DEFAULT_REQUESTER_ROLE: Record<DocType, string> = {
+// Partial on purpose: the warehouse types have no approval chain and therefore no
+// requester role to fall back to. A missing entry is the correct answer for them,
+// not an oversight.
+const DEFAULT_REQUESTER_ROLE: Partial<Record<DocType, string>> = {
   PR: ROLE.FIELD_ADMIN,
   PO: ROLE.PROCUREMENT,
   PayReq: ROLE.PROCUREMENT,

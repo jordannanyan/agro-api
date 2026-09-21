@@ -773,9 +773,17 @@ CREATE TABLE `document_approvals` (
   KEY `idx_docappr_doc` (`document_type`, `document_id`)
 ) ENGINE=InnoDB;
 
+-- Files hanging off a document. The type/id pair is deliberately loose: anything
+-- addressable can carry attachments, including a single LINE of a document.
+--
+-- 'StockInItem' points at `stock_in_items.id`, not at the stock-in itself. A
+-- receiving clerk photographs each item as it comes off the truck, and a photo that
+-- cannot say which item it is of answers nothing. The delivery note is the opposite
+-- — one sheet covers the whole shipment — so that goes on 'StockIn'.
 CREATE TABLE `document_attachments` (
   `id`            INT AUTO_INCREMENT PRIMARY KEY,
-  `document_type` ENUM('PR','PO','PayReq','Reimbursement','Expense') NOT NULL,
+  `document_type` ENUM('PR','PO','PayReq','Reimbursement','Expense',
+                       'StockIn','StockInItem','StockOut') NOT NULL,
   `document_id`   INT NOT NULL,
   `category`      VARCHAR(80) NULL,
   `subcategory`   VARCHAR(80) NULL,
@@ -787,7 +795,8 @@ CREATE TABLE `document_attachments` (
 
 CREATE TABLE `document_activities` (
   `id`            INT AUTO_INCREMENT PRIMARY KEY,
-  `document_type` ENUM('PR','PO','PayReq','Reimbursement','Expense') NOT NULL,
+  `document_type` ENUM('PR','PO','PayReq','Reimbursement','Expense',
+                       'StockIn','StockInItem','StockOut') NOT NULL,
   `document_id`   INT NOT NULL,
   `action`        VARCHAR(120) NOT NULL,
   `user_id`       INT NULL,

@@ -154,7 +154,22 @@ router.post('/:id', authenticate, (req, res) => {
 
 // DELETE /api/stock-in/:id
 router.delete('/:id', authenticate, async (req: Request, res: Response) => {
-  const [result] = await pool.query('DELETE FROM stock_in WHERE id = ?', [req.params.id]);
+  const id = Number(req.params.id);
+  // The lines cascade with the header, but attachments do not: they are addressed
+  // by (type, id) with no foreign key, by design — a record of what was attached
+  // has to outlive a document that is merely edited. On a real delete they would
+  // otherwise linger, pointing at an id that a later stock-in will reuse.
+  const [items] = await pool.query('SELECT id FROM stock_in_items WHERE stock_in_id = ?', [id]);
+  const itemIds = (items as any[]).map((r) => Number(r.id));
+  if (itemIds.length) {
+    await pool.query(
+      "DELETE FROM document_attachments WHERE document_type = 'StockInItem' AND document_id IN (?)",
+      [itemIds]);
+  }
+  await pool.query(
+    "DELETE FROM document_attachments WHERE document_type = 'StockIn' AND document_id = ?", [id]);
+
+  const [result] = await pool.query('DELETE FROM stock_in WHERE id = ?', [id]);
   if (!(result as any).affectedRows) return res.status(404).json({ message: 'Stock In not found' });
   return res.json({ message: 'Stock In deleted' });
 });
