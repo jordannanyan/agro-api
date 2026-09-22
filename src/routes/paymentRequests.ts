@@ -663,7 +663,17 @@ const update = async (req: Request, res: Response) => {
         if (docType === 'Expense') await assignRequestedStepToFiler('Expense', Number(id), req.user);
       }
     }
-    if (resubmitting) await resetRevisionSteps(docType, Number(id), req.user!);
+    if (resubmitting) {
+      // Resubmitting is another way into the chain, so it meets the same gate as
+      // submitting a draft. The dedicated /resubmit endpoint already checked this;
+      // a PUT that sets status = Pending did not.
+      const missing = await requireAttachment(docType, Number(id));
+      if (missing) {
+        await pool.query("UPDATE payment_requests SET status = 'Revision' WHERE id = ?", [id]);
+        return res.status(422).json({ message: missing });
+      }
+      await resetRevisionSteps(docType, Number(id), req.user!);
+    }
     if (b.status && b.status !== 'Draft') await syncDocumentStatus(docType, Number(id));
 
     const [rows] = await pool.query(SELECT + ' WHERE pay.id = ? LIMIT 1', [id]);

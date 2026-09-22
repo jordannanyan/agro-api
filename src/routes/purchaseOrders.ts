@@ -310,13 +310,28 @@ const update = async (req: Request, res: Response) => {
     // its status read "Pending" while the timeline stayed empty and no approver was
     // ever asked — the "PO cannot be submitted for approval" report.
     if (b.status && b.status !== 'Draft' && prev.status === 'Draft') {
+      // The same gate the create handler applies. Without it here, saving a PO as a
+      // Draft and then submitting it — which is exactly what the form does when
+      // there are files to upload — walked straight past the rule.
+      const missing = await requireAttachment('PO', Number(id));
+      if (missing) {
+        await pool.query("UPDATE purchase_orders SET status = 'Draft' WHERE id = ?", [id]);
+        return res.status(422).json({ message: missing });
+      }
       const [cnt] = await pool.query('SELECT COUNT(*) AS n FROM document_approvals WHERE document_type=? AND document_id=?', ['PO', id]);
       if (!Number((cnt as any[])[0].n)) {
         const totals = await computeTotals(Number(id));
         await seedApprovalSteps('PO', Number(id), Number(updates.entity_id ?? prev.entity_id), totals.grand_total);
       }
     }
-    if (resubmitting) await resetRevisionSteps('PO', Number(id), req.user!);
+    if (resubmitting) {
+      const missing = await requireAttachment('PO', Number(id));
+      if (missing) {
+        await pool.query("UPDATE purchase_orders SET status = 'Revision' WHERE id = ?", [id]);
+        return res.status(422).json({ message: missing });
+      }
+      await resetRevisionSteps('PO', Number(id), req.user!);
+    }
     if (b.status && b.status !== 'Draft') await syncDocumentStatus('PO', Number(id));
 
     const [rows] = await pool.query(SELECT + ' WHERE po.id = ? LIMIT 1', [id]);

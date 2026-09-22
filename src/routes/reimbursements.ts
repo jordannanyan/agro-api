@@ -47,7 +47,7 @@ import { authenticate, requireRole } from '../middleware/auth';
 import { nextDocNumber } from '../utils/docNumber';
 import {
   seedApprovalSteps, assignRequestedStepToFiler, syncDocumentStatus,
-  guardEdit, guardRequester, guardDelete, deleteDocumentChildren,
+  guardEdit, guardRequester, guardDelete, deleteDocumentChildren, requireAttachment,
 } from './documents';
 import { ROLE } from '../utils/roles';
 import { inheritEntity, entityScope, canSeeEntity } from '../utils/entityScope';
@@ -534,7 +534,20 @@ router.post('/', authenticate, requireRole(...CREATORS), async (req: Request, re
     const id = (result as any).insertId;
 
     const total = await writeItems(id, parsed.items);
+    // A document may not enter the chain with nothing attached (2026-09-18). This
+    // kind was the one left out: the farmer list is evidence of who is owed what,
+    // but not that the work happened or that the KTH agreed — which is what an
+    // approver is signing for. Attachments hang off a saved document, so there is
+    // nowhere to put one before this row exists: the form saves a Draft, uploads,
+    // then submits. Left as a Draft rather than discarded, so nothing keyed in is
+    // lost.
     if (status !== 'Draft') {
+      const missing = await requireAttachment('Reimbursement', id);
+      if (missing) {
+        await pool.query("UPDATE payment_requests SET status = 'Draft' WHERE id = ?", [id]);
+        const [draft] = await pool.query(SELECT + ' AND pay.id = ? LIMIT 1', [id]);
+        return res.status(422).json({ message: missing, data: (draft as any[])[0] });
+      }
       await seedApprovalSteps('Reimbursement', id, scoped.entityId, total);
       await assignRequestedStepToFiler('Reimbursement', id, req.user);
     }
@@ -614,8 +627,22 @@ router.put('/:id', authenticate, async (req: Request, res: Response) => {
     // Leaving Draft is what puts a document into the chain; if it was already in
     // one (a resubmission) the steps stay and only the status is recomputed.
     if (prev.status === 'Draft' && now.status !== 'Draft') {
+      const missing = await requireAttachment('Reimbursement', id);
+      if (missing) {
+        await pool.query("UPDATE payment_requests SET status = 'Draft' WHERE id = ?", [id]);
+        return res.status(422).json({ message: missing });
+      }
       await seedApprovalSteps('Reimbursement', id, now.entity_id, Number(now.amount));
       await assignRequestedStepToFiler('Reimbursement', id, req.user);
+    }
+    // A resubmission goes through the same gate: the document was sent back to be
+    // corrected, and it may not re-enter the chain any barer than it entered it.
+    if (prev.status === 'Revision' && now.status === 'Pending') {
+      const missing = await requireAttachment('Reimbursement', id);
+      if (missing) {
+        await pool.query("UPDATE payment_requests SET status = 'Revision' WHERE id = ?", [id]);
+        return res.status(422).json({ message: missing });
+      }
     }
     await syncDocumentStatus('Reimbursement', id);
 

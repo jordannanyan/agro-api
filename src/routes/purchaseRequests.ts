@@ -232,7 +232,17 @@ const update = async (req: Request, res: Response) => {
     }
     // Resubmitting after a revision: the steps already exist, so hand the document
     // back to the approver who asked for the change rather than seeding a new chain.
-    if (resubmitting) await resetRevisionSteps('PR', Number(id), req.user!);
+    if (resubmitting) {
+      // Resubmitting is another way into the chain, so it meets the same gate as
+      // submitting a draft. The dedicated /resubmit endpoint already checked this;
+      // a PUT that sets status = Pending did not.
+      const missing = await requireAttachment('PR', Number(id));
+      if (missing) {
+        await pool.query("UPDATE purchase_requests SET status = 'Revision' WHERE id = ?", [id]);
+        return res.status(422).json({ message: missing });
+      }
+      await resetRevisionSteps('PR', Number(id), req.user!);
+    }
     // The chain, not the request body, decides the status once a chain exists.
     if (b.status && b.status !== 'Draft') await syncDocumentStatus('PR', Number(id));
 
