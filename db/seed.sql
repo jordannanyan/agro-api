@@ -33,7 +33,10 @@ INSERT INTO `roles` (id, role_code, role_name, is_cross_entity, created_at, upda
 (5, 'FINANCE_STAFF',   'Finance Staff',   1, NOW(), NOW()),
 (6, 'DIRECTOR',        'Director',        1, NOW(), NOW()),
 (7, 'SUPER_ADMIN',     'Super Admin',     1, NOW(), NOW()),
-(8, 'ADMIN',           'Admin',           1, NOW(), NOW());
+(8, 'ADMIN',           'Admin',           1, NOW(), NOW()),
+-- Runs a warehouse and nothing else: no purchase requests, no purchasing,
+-- no KTH. Entity-bound, like the Field Admin they sit beside.
+('WAREHOUSE_STAFF', 'Pegawai Gudang', 0);
 
 -- Users (staff login) — the real people from Dokumentasi_Role_Approval_Procurement.pdf.
 -- Login accepts either `username` or `email`.

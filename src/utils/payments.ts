@@ -155,7 +155,11 @@ async function announcePaid(user: AuthUser, payreqId: number) {
     );
 
     if (pay.purchase_order_id) {
-      await notifyRoles([ROLE.FIELD_ADMIN], pay.entity_id ?? null, {
+      // Both people who might receive the delivery: the Field Admin who handles
+      // stock at a PT without a dedicated storekeeper, and the warehouse staff who
+      // do nothing else. This is the notification a storekeeper actually needs from
+      // a payment — the money moving is only interesting because the goods follow.
+      await notifyRoles([ROLE.FIELD_ADMIN, ROLE.WAREHOUSE_STAFF], pay.entity_id ?? null, {
         kind: 'goods_in_transit',
         title: `Barang ${pay.po_number} sudah dibayar — siapkan penerimaan`,
         body: `${pay.po_number}${pay.vendor_name ? ` dari ${pay.vendor_name}` : ''}${entity} sudah dilunasi,`

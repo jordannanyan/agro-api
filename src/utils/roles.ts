@@ -11,6 +11,10 @@ export const ROLE = {
   DIRECTOR: 'DIRECTOR',
   SUPER_ADMIN: 'SUPER_ADMIN',
   ADMIN: 'ADMIN',
+  // Somebody who runs a warehouse and nothing else. Distinct from FIELD_ADMIN,
+  // who also files purchase requests, records purchasing and deals with the KTH:
+  // a storekeeper needs none of that and should not be shown it.
+  WAREHOUSE_STAFF: 'WAREHOUSE_STAFF',
 } as const;
 
 export type RoleCode = (typeof ROLE)[keyof typeof ROLE];
