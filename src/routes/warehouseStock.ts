@@ -101,6 +101,9 @@ router.get('/reorder', authenticate, async (req: Request, res: Response) => {
   if (scope != null) { where.push(warehouseEntityPredicate('r.warehouse_id')); args.push(scope); }
   const [rows] = await pool.query(
     `SELECT r.id, r.warehouse_id, w.warehouse_name, r.sapropdi_id, s.sapropdi_name,
+            -- The item's own category and unit, rather than the placeholders the
+            -- screen used to invent: every row read "3_Material" with no unit.
+            s.category, COALESCE(un.unit_name, s.unit) AS unit_name,
             ent.id AS entity_id, ent.entities_name AS entity_name,
             r.min_stock, r.reorder_qty, r.is_active,
             COALESCE(st.remaining, 0) AS current_stock,
@@ -113,6 +116,7 @@ router.get('/reorder', authenticate, async (req: Request, res: Response) => {
      LEFT JOIN kth wk      ON wk.id = w.kth_id
      LEFT JOIN entities ent ON ent.id = wk.entities_id
      JOIN sapropdi s   ON s.id = r.sapropdi_id
+     LEFT JOIN units un ON un.id = s.unit_id
      LEFT JOIN v_saprodi_stock st ON st.warehouse_id = r.warehouse_id AND st.sapropdi_id = r.sapropdi_id
      ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
      ORDER BY status DESC, w.warehouse_name`, args);

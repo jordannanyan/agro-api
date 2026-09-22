@@ -23,11 +23,17 @@ SELECT
   w.warehouse_name         AS warehouse_name,
   s.id                     AS sapropdi_id,
   s.sapropdi_name          AS sapropdi_name,
+  -- A quantity with no unit beside it is a number nobody can act on: 40 of what?
+  -- Taken from the `units` master where the item points at one, falling back to the
+  -- free-text column the older rows carry.
+  s.unit_id                AS unit_id,
+  COALESCE(un.unit_name, s.unit) AS unit_name,
   COALESCE(si.total_in, 0) AS total_in,
   COALESCE(d.total_out, 0) AS total_out,
   COALESCE(si.total_in, 0) - COALESCE(d.total_out, 0) AS remaining
 FROM warehouse w
 CROSS JOIN sapropdi s
+LEFT JOIN units un ON un.id = s.unit_id
 LEFT JOIN (
   SELECT si.warehouse_id, sii.sapropdi_id, SUM(sii.received_qty) AS total_in
   FROM stock_in si

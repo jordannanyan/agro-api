@@ -2,6 +2,8 @@ import { Router, Request, Response } from 'express';
 import pool from '../db/connection';
 import { authenticate } from '../middleware/auth';
 import { nextDocNumber } from '../utils/docNumber';
+import { notifyRoles } from '../utils/notify';
+import { ROLE } from '../utils/roles';
 import { entityScope } from '../utils/entityScope';
 import { warehouseEntityPredicate } from '../utils/farmScope';
 import { respondList } from '../utils/pagination';
@@ -56,6 +58,78 @@ router.get('/:id', authenticate, async (req: Request, res: Response) => {
 const CONDITIONS = ['Good', 'Damaged', 'Shortage'] as const;
 
 // POST /api/stock-in  body: {..., items:[{po_item_id,sapropdi_id,received_qty,item_condition,remarks}]}
+/**
+ * Tell Procurement and the Project Manager when a delivery did not match the order.
+ *
+ * A short or damaged delivery is somebody's to answer for — the vendor's, usually —
+ * and the person who has to raise it is Procurement, who placed the order. Before
+ * this the shortage was written on the receiving note and discovered weeks later,
+ * when the stock did not add up.
+ *
+ * Two things count as a shortage, and both are worth saying:
+ *   * less arrived than the order asked for, per line
+ *   * a line was marked Damaged or Shortage on arrival
+ *
+ * A stock-in with no purchase order behind it is skipped: there is no ordered
+ * quantity to fall short of, and nobody to hold to account.
+ */
+async function announceShortage(stockInId: number) {
+  try {
+    const [rows] = await pool.query(
+      `SELECT si.stock_in_number, si.purchase_order_id, si.warehouse_id,
+              w.warehouse_name, po.po_number, v.vendor_name, ent.id AS entity_id
+       FROM stock_in si
+       LEFT JOIN warehouse w      ON w.id = si.warehouse_id
+       LEFT JOIN kth wk           ON wk.id = w.kth_id
+       LEFT JOIN entities ent     ON ent.id = wk.entities_id
+       LEFT JOIN purchase_orders po ON po.id = si.purchase_order_id
+       LEFT JOIN vendors v        ON v.id = po.vendor_id
+       WHERE si.id = ? LIMIT 1`, [stockInId]);
+    const head = (rows as any[])[0];
+    if (!head || !head.purchase_order_id) return;
+
+    const [lines] = await pool.query(
+      `SELECT sii.received_qty, sii.item_condition, sii.remarks,
+              poi.order_qty, s.sapropdi_name, pri.description AS pr_item_description
+       FROM stock_in_items sii
+       LEFT JOIN purchase_order_items poi ON poi.id = sii.po_item_id
+       LEFT JOIN purchase_request_items pri ON pri.id = poi.pr_item_id
+       LEFT JOIN sapropdi s ON s.id = sii.sapropdi_id
+       WHERE sii.stock_in_id = ?`, [stockInId]);
+
+    const problems = (lines as any[])
+      .map((l) => {
+        const name = l.sapropdi_name || l.pr_item_description || 'Item';
+        const ordered = l.order_qty != null ? Number(l.order_qty) : null;
+        const got = Number(l.received_qty || 0);
+        const short = ordered != null && got < ordered ? ordered - got : 0;
+        const bad = l.item_condition === 'Damaged' || l.item_condition === 'Shortage';
+        if (!short && !bad) return null;
+        const parts: string[] = [];
+        if (short) parts.push(`kurang ${short} dari ${ordered}`);
+        if (bad) parts.push(l.item_condition === 'Damaged' ? 'rusak' : 'shortage');
+        return `${name} (${parts.join(', ')})`;
+      })
+      .filter((x): x is string => !!x);
+
+    if (!problems.length) return;
+
+    const shown = problems.slice(0, 4).join('; ');
+    const more = problems.length > 4 ? ` dan ${problems.length - 4} item lain` : '';
+    await notifyRoles([ROLE.PROCUREMENT, ROLE.PROJECT_MANAGER], head.entity_id ?? null, {
+      kind: 'stock_shortage',
+      title: `Selisih penerimaan ${head.po_number} — perlu ditindaklanjuti`,
+      body: `${head.stock_in_number} di ${head.warehouse_name || 'gudang'} tidak sesuai pesanan`
+        + `${head.vendor_name ? ` dari ${head.vendor_name}` : ''}: ${shown}${more}.`,
+      documentType: 'StockIn',
+      documentId: stockInId,
+      link: `/warehouse/stockin/${stockInId}`,
+    });
+  } catch (err: any) {
+    console.error('[notify] announceShortage gagal:', err?.message || err);
+  }
+}
+
 router.post('/', authenticate, async (req: Request, res: Response) => {
   const conn = await pool.getConnection();
   try {
@@ -86,6 +160,9 @@ router.post('/', authenticate, async (req: Request, res: Response) => {
       );
     }
     await conn.commit();
+    // After the commit: the notification reads the rows back, and it must not be
+    // able to hold up a receipt that is already recorded.
+    await announceShortage(id);
     const [rows] = await pool.query(SELECT + ' WHERE si.id = ? LIMIT 1', [id]);
     const data = (rows as any[])[0];
     data.items = await loadItems(id);

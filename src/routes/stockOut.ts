@@ -68,6 +68,13 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
     const args: any[] = [];
     if (req.query.warehouse_id) { where.push('so.warehouse_id = ?'); args.push(req.query.warehouse_id); }
     if (req.query.search)       { where.push('so.stock_out_number LIKE ?'); args.push(`%${req.query.search}%`); }
+    // Narrow to one plot. The plot lives on the LINES, not the header — a stock-out
+    // can be split across several — so this asks whether any line went to it rather
+    // than joining, which would duplicate the header row once per matching line.
+    if (req.query.plot_id) {
+      where.push('EXISTS (SELECT 1 FROM pre_finance_distributions d WHERE d.stock_out_id = so.id AND d.plot_id = ?)');
+      args.push(req.query.plot_id);
+    }
     // A warehouse belongs to a KTH, which belongs to a PT — so does everything
     // issued from it. Staff bound to one PT see only their own warehouses' issues.
     const scope = entityScope(req);
