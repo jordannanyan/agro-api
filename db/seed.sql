@@ -36,7 +36,11 @@ INSERT INTO `roles` (id, role_code, role_name, is_cross_entity, created_at, upda
 (8, 'ADMIN',           'Admin',           1, NOW(), NOW()),
 -- Runs a warehouse and nothing else: no purchase requests, no purchasing,
 -- no KTH. Entity-bound, like the Field Admin they sit beside.
-('WAREHOUSE_STAFF', 'Pegawai Gudang', 0);
+(9, 'WAREHOUSE_STAFF', 'Pegawai Gudang', 0, NOW(), NOW()),
+-- HR at WLI. Files the two payment requests that never come from procurement —
+-- the farmer reimbursement paid through a KTH, and the expense somebody laid out —
+-- and approves nothing. Cross-entity: one of them serves every PT.
+(10, 'HR', 'HR', 1, NOW(), NOW());
 
 -- Users (staff login) — the real people from Dokumentasi_Role_Approval_Procurement.pdf.
 -- Login accepts either `username` or `email`.

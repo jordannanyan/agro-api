@@ -3,10 +3,10 @@ import pool from '../db/connection';
 import { authenticate, requireRole } from '../middleware/auth';
 import { nextDocNumber } from '../utils/docNumber';
 import {
-  seedApprovalSteps, syncDocumentStatus, resetRevisionSteps,
+  seedApprovalSteps, assignRequestedStepToFiler, syncDocumentStatus, resetRevisionSteps,
   guardEdit, guardRequester, guardDelete, deleteDocumentChildren, requireAttachment,
 } from './documents';
-import { ROLE, PAYMENT_EXECUTOR_ROLES, WRITE_OVERRIDE_ROLES } from '../utils/roles';
+import { ROLE, PAYMENT_EXECUTOR_ROLES, WRITE_OVERRIDE_ROLES, CLAIM_CREATOR_ROLES } from '../utils/roles';
 import { settlePaymentRequest } from '../utils/payments';
 import { budgetCodeFromPR } from './purchaseOrders';
 import { inheritEntity, entityScope, canSeeEntity, resolveWriteEntity } from '../utils/entityScope';
@@ -458,21 +458,22 @@ function bodyToCols(b: any) {
  * through `/api/reimbursements`, which is where they are a creator. A procurement
  * payment request always settles a PR or a PO, and a Field Admin raises neither.
  */
-const PAYREQ_CREATORS = [ROLE.FIELD_ADMIN, ROLE.PROCUREMENT, ROLE.FINANCE_MANAGER,
+const PAYREQ_CREATORS = [ROLE.FIELD_ADMIN, ROLE.HR, ROLE.PROCUREMENT, ROLE.FINANCE_MANAGER,
                          ROLE.DIRECTOR, ROLE.SUPER_ADMIN];
 
 /**
- * A Field Admin may raise an expense claim and nothing else here.
+ * A Field Admin, and an HR, may raise an expense claim and nothing else here.
  *
- * They are the one out of pocket, so they have to be able to ask for it back. But
- * a procurement payment request settles a PR or a PO, and a Field Admin raises
- * neither — letting them file one would only produce a document nobody can match
- * to a purchase.
+ * They are the ones out of pocket, or filing for somebody who is, so they have to
+ * be able to ask for it back. But a procurement payment request settles a PR or a
+ * PO, and neither of them raises one — letting them file it would only produce a
+ * document nobody can match to a purchase.
  */
 function creatorMayFile(req: Request, kind: string): string | null {
-  if (req.user?.roleCode !== ROLE.FIELD_ADMIN) return null;
+  const role = req.user?.roleCode;
+  if (!(CLAIM_CREATOR_ROLES as string[]).includes(role || '')) return null;
   if (kind === 'Expense') return null;
-  return 'Field Admin hanya dapat mengajukan Payment Request penggantian biaya '
+  return 'Peran Anda hanya dapat mengajukan Payment Request penggantian biaya '
     + '(tanpa PR/PO). Payment Request atas PR atau PO diajukan oleh Procurement.';
 }
 
@@ -559,6 +560,9 @@ router.post('/', authenticate, requireRole(...PAYREQ_CREATORS), async (req: Requ
         return res.status(422).json({ message: missing, data: (draft as any[])[0] });
       }
       await seedApprovalSteps(expense ? 'Expense' : 'PayReq', id, c.entity_id, c.amount);
+      // A claim filed by an HR is signed for by that HR, not by a Field Admin who
+      // never saw it. Only moves the first step; the approvers are unchanged.
+      if (expense) await assignRequestedStepToFiler('Expense', id, req.user);
     }
     const [rows] = await pool.query(SELECT + ' WHERE pay.id = ? LIMIT 1', [id]);
     return res.status(201).json({ message: 'Payment request created', data: (rows as any[])[0] });
@@ -656,6 +660,7 @@ const update = async (req: Request, res: Response) => {
         await seedApprovalSteps(docType, Number(id),
           Number(updates.entity_id ?? prev.entity_id),
           Number(updates.amount ?? prev.amount));
+        if (docType === 'Expense') await assignRequestedStepToFiler('Expense', Number(id), req.user);
       }
     }
     if (resubmitting) await resetRevisionSteps(docType, Number(id), req.user!);

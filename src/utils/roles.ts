@@ -15,6 +15,11 @@ export const ROLE = {
   // who also files purchase requests, records purchasing and deals with the KTH:
   // a storekeeper needs none of that and should not be shown it.
   WAREHOUSE_STAFF: 'WAREHOUSE_STAFF',
+  // Human resources, sitting at WLI and serving every PT. They file the payment
+  // requests that have nothing to do with procurement — a labour fee owed to a
+  // KTH's workers, an expense somebody laid out — and nothing else. Cross-entity,
+  // because there is one of them for the whole group.
+  HR: 'HR',
 } as const;
 
 export type RoleCode = (typeof ROLE)[keyof typeof ROLE];
@@ -41,6 +46,17 @@ export const WRITE_OVERRIDE_ROLES: RoleCode[] = [ROLE.SUPER_ADMIN];
  * middleware/readOnly.ts, not by each handler.
  */
 export const OPERATIONS_READ_ONLY_ROLES: RoleCode[] = [ROLE.ADMIN];
+
+/**
+ * Who may raise a payment request that has no procurement behind it — the farmer
+ * reimbursement paid through a KTH, and the expense claim somebody files for money
+ * they laid out. Both are the same errand from the approvers' side (identical
+ * chains), so the same people file both.
+ *
+ * Deliberately NOT the same list as the procurement payment request: a Field Admin
+ * and an HR may file these and only these, which is what keeps the two apart.
+ */
+export const CLAIM_CREATOR_ROLES: RoleCode[] = [ROLE.FIELD_ADMIN, ROLE.HR];
 
 /** May execute a payment once a PayReq is fully approved (Finance Manager + Finance Staff). */
 export const PAYMENT_EXECUTOR_ROLES: RoleCode[] = [ROLE.FINANCE_MANAGER, ROLE.FINANCE_STAFF];

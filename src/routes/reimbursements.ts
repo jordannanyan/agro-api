@@ -46,18 +46,24 @@ import pool from '../db/connection';
 import { authenticate, requireRole } from '../middleware/auth';
 import { nextDocNumber } from '../utils/docNumber';
 import {
-  seedApprovalSteps, syncDocumentStatus,
+  seedApprovalSteps, assignRequestedStepToFiler, syncDocumentStatus,
   guardEdit, guardRequester, guardDelete, deleteDocumentChildren,
 } from './documents';
 import { ROLE } from '../utils/roles';
 import { inheritEntity, entityScope, canSeeEntity } from '../utils/entityScope';
-import { PENDING_STEP_COLUMNS, pendingStepJoin } from '../utils/pendingStep';
+import { PENDING_STEP_COLUMNS, pendingStepJoin, type DocType } from '../utils/pendingStep';
+
+/** The two payment requests that never come from procurement. */
+const CLAIM_DOC_TYPES: DocType[] = ['Reimbursement', 'Expense'];
 
 export const router = Router();
 
-/** Who may raise one: the Field Admin who files it, plus the seniors above them. */
+/**
+ * Who may raise one: the Field Admin who files it and the HR who files it for the
+ * other PTs, plus the seniors above them.
+ */
 const CREATORS = [
-  ROLE.FIELD_ADMIN, ROLE.PROJECT_MANAGER, ROLE.FINANCE_MANAGER, ROLE.SUPER_ADMIN,
+  ROLE.FIELD_ADMIN, ROLE.HR, ROLE.PROJECT_MANAGER, ROLE.FINANCE_MANAGER, ROLE.SUPER_ADMIN,
 ] as const;
 
 const SELECT = `
@@ -95,6 +101,77 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
     args.push(like, like, like);
   }
   const sql = SELECT + (where.length ? ` AND ${where.join(' AND ')}` : '') + ' ORDER BY pay.id DESC';
+  const [rows] = await pool.query(sql, args);
+  return res.json({ data: rows });
+});
+
+// ---------------------------------------------------------------------------
+// The two claims, on one list
+// ---------------------------------------------------------------------------
+//
+// A payment request that did not come from procurement is one errand as far as the
+// people signing it are concerned. There are two of them:
+//
+//   Reimbursement — paying farmers, one transfer to their KTH's account
+//   Expense       — paying back a member of staff who laid the money out
+//
+// They differ in who receives the money and therefore in what the lines look like,
+// which is why each keeps its own form and its own detail page. They do not differ
+// in anything else: same header, same four signatures (Field Admin/HR → Project
+// Manager → Finance Manager → Director), same payment code, same reconciliation. So
+// they are one list, and splitting them across two menus only meant the people who
+// file them had to remember which menu a claim had been filed under.
+//
+// Read-only on purpose. Creating and editing stay on the endpoint that understands
+// the lines — nothing here can write a claim whose total disagrees with them.
+//
+// Declared before `/:id`, or Express reads "claims" as a reimbursement id.
+
+const CLAIMS_SELECT = `
+  SELECT pay.id, pay.payreq_number, pay.payreq_kind, pay.payment_code, pay.status,
+         pay.amount, pay.reason, pay.entity_id, pay.kth_id, pay.beneficiary_name,
+         pay.estimated_pay_date, pay.released_pay_date, pay.created_at,
+         e.entities_name AS entity_name, bc.code AS budget_code,
+         k.kth_name, u.name AS requested_by_name, ro.role_name AS requested_by_role,
+         CASE pay.payreq_kind
+           WHEN 'Reimbursement'
+             THEN (SELECT COUNT(*) FROM reimbursement_items ri WHERE ri.payment_request_id = pay.id)
+           ELSE (SELECT COUNT(*) FROM payment_request_items pi WHERE pi.payment_request_id = pay.id)
+         END AS line_count,
+${PENDING_STEP_COLUMNS}
+  FROM payment_requests pay
+  LEFT JOIN entities e      ON e.id = pay.entity_id
+  LEFT JOIN budget_codes bc ON bc.id = pay.budget_code_id
+  LEFT JOIN kth k           ON k.id = pay.kth_id
+  LEFT JOIN users u         ON u.id = pay.requested_by_user_id
+  LEFT JOIN roles ro        ON ro.id = u.role_id
+${pendingStepJoin(CLAIM_DOC_TYPES, 'pay')}
+  WHERE pay.payreq_kind IN ('Reimbursement', 'Expense')
+`;
+
+// GET /api/reimbursements/claims?kind=&entity_id=&status=&search=
+router.get('/claims', authenticate, async (req: Request, res: Response) => {
+  const where: string[] = [];
+  const args: any[] = [];
+  // `kind` narrows to one of the two; anything else is ignored rather than refused,
+  // so a stale bookmark shows the whole list instead of an error.
+  const kind = String(req.query.kind || '');
+  if (kind === 'Reimbursement' || kind === 'Expense') {
+    where.push('pay.payreq_kind = ?'); args.push(kind);
+  }
+  // HR serves every PT and is flagged cross-entity, so this leaves their list alone;
+  // a Field Admin still sees only the PT they work for.
+  const scope = entityScope(req);
+  if (scope != null) { where.push('pay.entity_id = ?'); args.push(scope); }
+  if (req.query.status) { where.push('pay.status = ?'); args.push(req.query.status); }
+  if (req.query.search) {
+    where.push('(pay.payreq_number LIKE ? OR pay.reason LIKE ? OR k.kth_name LIKE ?'
+      + ' OR pay.beneficiary_name LIKE ? OR u.name LIKE ?)');
+    const like = `%${req.query.search}%`;
+    args.push(like, like, like, like, like);
+  }
+  const sql = CLAIMS_SELECT + (where.length ? ` AND ${where.join(' AND ')}` : '')
+    + ' ORDER BY pay.id DESC';
   const [rows] = await pool.query(sql, args);
   return res.json({ data: rows });
 });
@@ -457,7 +534,10 @@ router.post('/', authenticate, requireRole(...CREATORS), async (req: Request, re
     const id = (result as any).insertId;
 
     const total = await writeItems(id, parsed.items);
-    if (status !== 'Draft') await seedApprovalSteps('Reimbursement', id, scoped.entityId, total);
+    if (status !== 'Draft') {
+      await seedApprovalSteps('Reimbursement', id, scoped.entityId, total);
+      await assignRequestedStepToFiler('Reimbursement', id, req.user);
+    }
     await pool.query(
       `INSERT INTO document_activities (document_type, document_id, action, user_id, note, created_at)
        VALUES ('Reimbursement', ?, 'Reimbursement created', ?, ?, NOW())`,
@@ -535,6 +615,7 @@ router.put('/:id', authenticate, async (req: Request, res: Response) => {
     // one (a resubmission) the steps stay and only the status is recomputed.
     if (prev.status === 'Draft' && now.status !== 'Draft') {
       await seedApprovalSteps('Reimbursement', id, now.entity_id, Number(now.amount));
+      await assignRequestedStepToFiler('Reimbursement', id, req.user);
     }
     await syncDocumentStatus('Reimbursement', id);
 

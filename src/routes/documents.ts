@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express';
 import pool from '../db/connection';
 import { authenticate, AuthUser } from '../middleware/auth';
 import { upload, fileToPath } from '../middleware/upload';
-import { SYSTEM_ADMIN_ROLES, WRITE_OVERRIDE_ROLES, PAYMENT_EXECUTOR_ROLES, ROLE } from '../utils/roles';
+import { SYSTEM_ADMIN_ROLES, WRITE_OVERRIDE_ROLES, PAYMENT_EXECUTOR_ROLES, CLAIM_CREATOR_ROLES, ROLE } from '../utils/roles';
 import { notifyRoles, fmtRp } from '../utils/notify';
 import { entityScope } from '../utils/entityScope';
 import { issuePaymentCode } from '../utils/payments';
@@ -171,9 +171,10 @@ router.get('/inbox', authenticate, async (req: Request, res: Response) => {
   const scope = entityScope(req);
   const roleCode = user.roleCode;
 
-  // Expense claims are counted into the PayReq bucket rather than a bucket of their
-  // own: they are filed and read on the Payment Request screen, so a badge pointing
-  // anywhere else would point at a page that does not list them.
+  // Expense claims are counted into the Reimbursement bucket rather than a bucket of
+  // their own. A badge has to point at the page that lists what it counts, and both
+  // claim kinds are now listed on one screen — the Payment Request menu, where these
+  // used to be counted, no longer shows them at all.
   const [prApproval, prRevision, poApproval, poRevision, payApproval, payRevision,
          exApproval, exRevision, rbApproval, rbRevision] =
     await Promise.all([
@@ -206,20 +207,21 @@ router.get('/inbox', authenticate, async (req: Request, res: Response) => {
     const [proc, exp, rb] = await Promise.all([
       awaitingPayment('Procurement'), awaitingPayment('Expense'), awaitingPayment('Reimbursement'),
     ]);
-    payment = proc + exp;
-    rbPayment = rb;
+    payment = proc;
+    rbPayment = rb + exp;
   }
 
   const data = {
     PR: { approval: prApproval, revision: prRevision, total: prApproval + prRevision },
     PO: { approval: poApproval, revision: poRevision, total: poApproval + poRevision },
     PayReq: {
-      approval: payApproval + exApproval, revision: payRevision + exRevision, payment,
-      total: payApproval + exApproval + payRevision + exRevision + payment,
+      approval: payApproval, revision: payRevision, payment,
+      total: payApproval + payRevision + payment,
     },
+    // Both claim kinds, under the menu that shows both.
     Reimbursement: {
-      approval: rbApproval, revision: rbRevision, payment: rbPayment,
-      total: rbApproval + rbRevision + rbPayment,
+      approval: rbApproval + exApproval, revision: rbRevision + exRevision, payment: rbPayment,
+      total: rbApproval + exApproval + rbRevision + exRevision + rbPayment,
     },
     total: 0,
   };
@@ -767,8 +769,12 @@ async function announceApproved(docType: DocType, docId: number) {
     if (docType === 'PayReq' || docType === 'Reimbursement' || docType === 'Expense') {
       const label = docType === 'Reimbursement' ? 'Reimbursement petani'
         : docType === 'Expense' ? 'Penggantian biaya' : 'Payment Request';
+      // Both claim kinds live under one menu now — the farmer reimbursement at the
+      // root of it, the personal one a level down. The old
+      // /procurement/payreq-reimbursement path still resolves, so notifications sent
+      // before the merge keep working.
       const link = docType === 'Reimbursement' ? `/reimbursement/${docId}`
-        : docType === 'Expense' ? `/procurement/payreq-reimbursement/${docId}`
+        : docType === 'Expense' ? `/reimbursement/pribadi/${docId}`
         : `/procurement/payreq/${docId}`;
       // Procurement is told about the kind they raise and pay for; they have no part
       // in a farmer reimbursement or somebody's expense claim.
@@ -879,4 +885,40 @@ export async function seedApprovalSteps(docType: DocType, docId: number, entityI
       [docType, docId, r.step_order, r.step_label, r.role_id]
     );
   }
+}
+
+/**
+ * Point the "Requested" step at the person who actually filed the document.
+ *
+ * approval_routes name a *role* for every step, and for the two claim kinds that
+ * role is the Field Admin — which was true while a Field Admin was the only one who
+ * could file them. HR files them too now, and the seeded chain would otherwise open
+ * with a signature only a Field Admin could give: the document would sit in the
+ * Field Admin's inbox waiting for somebody to confirm a request they never made,
+ * and the filer could neither sign it nor take it back (guardRequester and the
+ * revision inbox both read the owner off this very step).
+ *
+ * So the step follows the filer. The rest of the chain does not move — the people
+ * who approve are the same whoever asked, which is the whole reason these two kinds
+ * could be merged into one screen.
+ *
+ * Only called for the claim kinds, and only when the filer is a legitimate one for
+ * them: a document must never be able to rewrite its own chain into a role that
+ * could not have raised it.
+ */
+export async function assignRequestedStepToFiler(
+  docType: DocType,
+  docId: number,
+  user: AuthUser | undefined,
+): Promise<void> {
+  if (!user?.roleCode) return;
+  if (!(CLAIM_CREATOR_ROLES as string[]).includes(user.roleCode)) return;
+  const [roleRows] = await pool.query(
+    'SELECT id FROM roles WHERE role_code = ? LIMIT 1', [user.roleCode]);
+  const roleId = (roleRows as any[])[0]?.id;
+  if (!roleId) return;
+  await pool.query(
+    `UPDATE document_approvals SET role_id = ?, updated_at = NOW()
+      WHERE document_type = ? AND document_id = ? AND step_label = 'Requested'`,
+    [roleId, docType, docId]);
 }
