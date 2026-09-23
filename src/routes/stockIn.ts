@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import pool from '../db/connection';
 import { authenticate } from '../middleware/auth';
 import { nextDocNumber } from '../utils/docNumber';
+import { requireAttachment } from './documents';
 import { notifyRoles } from '../utils/notify';
 import { ROLE } from '../utils/roles';
 import { entityScope } from '../utils/entityScope';
@@ -159,6 +160,19 @@ router.post('/', authenticate, async (req: Request, res: Response) => {
          Number(it.received_qty || 0), cond, it.remarks || null]
       );
     }
+    // A receipt may not be posted with nothing attached — the surat jalan is what
+    // says the delivery arrived, and a posted receipt without one is a stock figure
+    // nobody can check against a supplier. Unlike a stock out, this document does
+    // have a Draft to fall back to, so it is left there rather than refused
+    // outright: the form saves a Draft, uploads, then posts.
+    if ((b.status || 'Draft') !== 'Draft') {
+      const missing = await requireAttachment('StockIn', id);
+      if (missing) {
+        await conn.query("UPDATE stock_in SET status = 'Draft' WHERE id = ?", [id]);
+        await conn.commit();
+        return res.status(422).json({ message: missing, data: { id, status: 'Draft' } });
+      }
+    }
     await conn.commit();
     // After the commit: the notification reads the rows back, and it must not be
     // able to hold up a receipt that is already recorded.
@@ -194,6 +208,19 @@ const update = async (req: Request, res: Response) => {
     set('vehicle_number', b.vehicle_number);
     set('status', b.status);
     set('notes', b.notes);
+    // The same gate on the other way in. Read before the UPDATE so the document's
+    // status here is still the one it had when the request arrived.
+    if (b.status !== undefined && b.status !== 'Draft') {
+      const [cur] = await conn.query('SELECT status FROM stock_in WHERE id = ? LIMIT 1', [id]);
+      const was = (cur as any[])[0]?.status;
+      if (was === 'Draft') {
+        const missing = await requireAttachment('StockIn', Number(id));
+        if (missing) {
+          await conn.rollback();
+          return res.status(422).json({ message: missing });
+        }
+      }
+    }
     const keys = Object.keys(updates);
     if (keys.length) {
       updates.updated_at = new Date(); keys.push('updated_at');

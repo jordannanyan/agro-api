@@ -44,7 +44,10 @@ router.get('/stock-card', authenticate, async (req: Request, res: Response) => {
 
   const scope = entityScope(req);
   const inArgs: any[] = [sapropdiId];
-  let inWhere = 'sii.sapropdi_id = ?';
+  // Sejalan dengan v_saprodi_stock: penerimaan yang masih Draft belum jadi barang,
+  // jadi ia tidak boleh muncul sebagai pergerakan pada kartu stok — kalau tidak,
+  // saldo berjalan di kartu ini tidak akan cocok dengan angka di inventory.
+  let inWhere = "sii.sapropdi_id = ? AND COALESCE(si.status, '') <> 'Draft'";
   if (warehouseId) { inWhere += ' AND si.warehouse_id = ?'; inArgs.push(warehouseId); }
   if (scope != null) { inWhere += ` AND ${warehouseEntityPredicate('si.warehouse_id')}`; inArgs.push(scope); }
 

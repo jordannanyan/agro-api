@@ -38,7 +38,11 @@ LEFT JOIN (
   SELECT si.warehouse_id, sii.sapropdi_id, SUM(sii.received_qty) AS total_in
   FROM stock_in si
   JOIN stock_in_items sii ON sii.stock_in_id = si.id
-  WHERE sii.sapropdi_id IS NOT NULL
+  -- A Draft receipt is somebody still typing, not goods on a shelf. Counting it
+  -- made the Draft state cosmetic: the stock figure moved the moment the form was
+  -- saved, so the rule that a receipt may not be posted without its surat jalan
+  -- guarded a status that no longer decided anything.
+  WHERE sii.sapropdi_id IS NOT NULL AND COALESCE(si.status, '') <> 'Draft'
   GROUP BY si.warehouse_id, sii.sapropdi_id
 ) si ON si.warehouse_id = w.id AND si.sapropdi_id = s.id
 LEFT JOIN (

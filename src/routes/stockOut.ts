@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import pool from '../db/connection';
 import { authenticate } from '../middleware/auth';
+import { upload, fileToPath } from '../middleware/upload';
 import { nextDocNumber } from '../utils/docNumber';
 import { entityScope } from '../utils/entityScope';
 import { warehouseEntityPredicate } from '../utils/farmScope';
@@ -100,13 +101,64 @@ router.get('/:id', authenticate, async (req: Request, res: Response) => {
   } catch (err: any) { return res.status(500).json({ message: 'Server error', error: err.message }); }
 });
 
+// -----------------------------------------------------------------------------
+// Creating a stock out, with its evidence, in one request
+//
+// Every other document in this system is saved as a Draft first and only then
+// submitted, which is what gives the "attachment required" rule somewhere to stand:
+// the guard refuses to let the document *leave* Draft with nothing attached.
+//
+// A stock out has no Draft. There is one write, and when it lands the goods have
+// already left the warehouse — the balance is calculated from these very rows. So
+// there is no later door to guard, and asking for the file afterwards would mean a
+// record that is already true and already unevidenced.
+//
+// Hence: the files travel with the document. Without one the request is refused
+// before a single row is written, and the attachments are inserted inside the same
+// transaction as the stock movement, so a stock out that exists always has its
+// evidence and one that fails leaves nothing behind.
+//
+// The form sends multipart: `payload` is the document as a JSON string, beside the
+// files. A plain JSON body is still read — it simply cannot carry a file, so it is
+// refused by the same rule rather than by a separate one.
+// -----------------------------------------------------------------------------
+const stockOutUpload = upload.fields([
+  { name: 'file', maxCount: 1 },
+  { name: 'files', maxCount: 20 },
+]);
+
+/** The document itself, whether it arrived as JSON or beside the files. */
+function readPayload(req: Request): any {
+  const raw = (req.body || {}) as any;
+  if (typeof raw.payload === 'string') {
+    try { return JSON.parse(raw.payload); } catch { return null; }
+  }
+  return raw;
+}
+
 // POST /api/stock-out
-// body: { warehouse_id, stock_out_date, notes,
-//         lines: [{ farmer_id, plot_id, sapropdi_id, unit_id, quantity, price_per_unit, description }] }
-router.post('/', authenticate, async (req: Request, res: Response) => {
+// multipart: payload = JSON string of
+//   { warehouse_id, stock_out_date, notes,
+//     lines: [{ farmer_id, plot_id, sapropdi_id, unit_id, quantity, price_per_unit, description }] }
+// plus `file` / `files`
+router.post('/', authenticate, stockOutUpload, async (req: Request, res: Response) => {
   const conn = await pool.getConnection();
   try {
-    const b = req.body || {};
+    const b = readPayload(req);
+    if (!b) return res.status(422).json({ message: 'Isi dokumen tidak terbaca (payload bukan JSON yang sah).' });
+
+    // Checked first, before anything is validated or written: a refusal here must
+    // leave the warehouse exactly as it was.
+    const grouped = (req.files ?? {}) as Record<string, Express.Multer.File[]>;
+    const attachPaths = [...(grouped.file ?? []), ...(grouped.files ?? [])]
+      .map(fileToPath).filter(Boolean) as string[];
+    if (!attachPaths.length) {
+      return res.status(422).json({
+        message: 'Lampiran wajib diisi — barang keluar harus ada buktinya (tanda terima, foto serah '
+          + 'terima, atau berita acara). Lampirkan gambar atau PDF, maksimal 5 MB per berkas.',
+      });
+    }
+
     const warehouseId = Number(b.warehouse_id);
     const date = b.stock_out_date;
     const lines = Array.isArray(b.lines) ? b.lines : [];
@@ -180,6 +232,15 @@ router.post('/', authenticate, async (req: Request, res: Response) => {
          ln.unit_id != null && ln.unit_id !== '' ? Number(ln.unit_id) : null,
          price, price != null ? qty * price : 0, ln.description ?? null]
       );
+    }
+    // Inside the transaction on purpose: if anything below fails, the attachment
+    // rows go with the stock movement rather than outliving it as orphans pointing
+    // at a document that was never created.
+    for (const filePath of attachPaths) {
+      await conn.query(
+        `INSERT INTO document_attachments (document_type, document_id, category, subcategory, file_path, created_at, updated_at)
+         VALUES ('StockOut', ?, ?, NULL, ?, NOW(), NOW())`,
+        [id, (req.body as any)?.category ?? 'Bukti Serah Terima', filePath]);
     }
     await conn.commit();
 
