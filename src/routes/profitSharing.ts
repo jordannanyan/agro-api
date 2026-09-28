@@ -9,25 +9,29 @@ import { ROLE, WRITE_OVERRIDE_ROLES } from '../utils/roles';
 export const router = Router();
 
 // -----------------------------------------------------------------------------
-// Who may read this module, and who may change it
+// Who may open this module, and who may change it
 //
-// Reading is open to the operational roles. A Field Admin records the purchasing
-// and the stock that becomes a plot's investment, and a Project Manager answers for
-// the field the numbers describe — neither can check their own work against a page
-// they may not open, and both were being asked about figures they could not see.
+// Both are now the same list, by decision of 2026-09-29: everyone in the business
+// chain plus Finance Staff. A Field Admin records the purchasing and the stock that
+// becomes a plot's investment, and a Project Manager answers for the field the
+// numbers describe — they were being asked about figures they could not see, and
+// then about figures they could see but not correct.
 //
-// Changing it is not open to them. Settling a sale writes what a farmer is owed,
-// and an investment line moves the cost side of that same sum; both are decisions
-// about money, and they stay with Finance and the Director.
+// That the two lists are equal does not make this guard idle. It still refuses the
+// storekeeper and the HR, neither of whom has business here, and the Admin, who
+// reads every operational module and writes to none (middleware/readOnly.ts).
 //
-// Enforced here rather than by hiding the buttons, because until now nothing
-// enforced it at all: every write below sat behind `authenticate` alone, so any
-// signed-in account could have settled a sale by calling the endpoint directly.
-// That was invisible only because the screen was closed — opening the screen is
-// exactly what would have made it real.
+// And it still has to exist at all, which is the part worth remembering: until
+// 2026-09-29 every write below sat behind `authenticate` alone. Any signed-in
+// account could have settled a sale by calling the endpoint directly; the module
+// looked protected only because the menu was hidden from most roles. Widening who
+// may write is a decision somebody made — it should not be something the API
+// happens to allow because nobody said otherwise.
 // -----------------------------------------------------------------------------
 const PROFIT_SHARING_WRITERS: string[] = [
-  ROLE.FINANCE_MANAGER, ROLE.DIRECTOR, ...WRITE_OVERRIDE_ROLES,
+  ROLE.FIELD_ADMIN, ROLE.PROJECT_MANAGER, ROLE.PROCUREMENT,
+  ROLE.FINANCE_MANAGER, ROLE.FINANCE_STAFF, ROLE.DIRECTOR,
+  ...WRITE_OVERRIDE_ROLES,
 ];
 
 router.use((req: Request, res: Response, next) => {
@@ -36,8 +40,7 @@ router.use((req: Request, res: Response, next) => {
     return next();
   }
   return res.status(403).json({
-    message: 'Bagi hasil hanya boleh diubah oleh Finance Manager atau Direktur. '
-      + 'Peran Anda dapat melihat datanya, tidak mengubahnya.',
+    message: 'Peran Anda tidak berhak mengubah data bagi hasil.',
   });
 });
 
