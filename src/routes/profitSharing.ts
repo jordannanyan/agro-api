@@ -4,8 +4,42 @@ import { authenticate } from '../middleware/auth';
 import { crudRouter } from '../utils/crudFactory';
 import { entityScope } from '../utils/entityScope';
 import { ENTITY_COL, farmerRefScope } from '../utils/farmScope';
+import { ROLE, WRITE_OVERRIDE_ROLES } from '../utils/roles';
 
 export const router = Router();
+
+// -----------------------------------------------------------------------------
+// Who may read this module, and who may change it
+//
+// Reading is open to the operational roles. A Field Admin records the purchasing
+// and the stock that becomes a plot's investment, and a Project Manager answers for
+// the field the numbers describe — neither can check their own work against a page
+// they may not open, and both were being asked about figures they could not see.
+//
+// Changing it is not open to them. Settling a sale writes what a farmer is owed,
+// and an investment line moves the cost side of that same sum; both are decisions
+// about money, and they stay with Finance and the Director.
+//
+// Enforced here rather than by hiding the buttons, because until now nothing
+// enforced it at all: every write below sat behind `authenticate` alone, so any
+// signed-in account could have settled a sale by calling the endpoint directly.
+// That was invisible only because the screen was closed — opening the screen is
+// exactly what would have made it real.
+// -----------------------------------------------------------------------------
+const PROFIT_SHARING_WRITERS: string[] = [
+  ROLE.FINANCE_MANAGER, ROLE.DIRECTOR, ...WRITE_OVERRIDE_ROLES,
+];
+
+router.use((req: Request, res: Response, next) => {
+  if (req.method === 'GET' || req.method === 'HEAD') return next();
+  if (req.user?.type === 'User' && PROFIT_SHARING_WRITERS.includes(req.user.roleCode || '')) {
+    return next();
+  }
+  return res.status(403).json({
+    message: 'Bagi hasil hanya boleh diubah oleh Finance Manager atau Direktur. '
+      + 'Peran Anda dapat melihat datanya, tidak mengubahnya.',
+  });
+});
 
 // -----------------------------------------------------------------------------
 // How a sale is split.
