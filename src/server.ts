@@ -18,6 +18,7 @@ import paymentRequestsRoutes from './routes/paymentRequests';
 import reimbursementsRoutes from './routes/reimbursements';
 import stockInRoutes from './routes/stockIn';
 import stockOutRoutes from './routes/stockOut';
+import stockOpnameRoutes from './routes/stockOpname';
 import documentsRoutes from './routes/documents';
 import notificationsRoutes from './routes/notifications';
 import bankStatementsRoutes from './routes/bankStatements';
@@ -114,6 +115,7 @@ app.use('/api/payment-requests', ...opsGuard, paymentRequestsRoutes);
 app.use('/api/reimbursements', ...opsGuard, reimbursementsRoutes);
 app.use('/api/stock-in', ...opsGuard, stockInRoutes);
 app.use('/api/stock-out', ...opsGuard, stockOutRoutes);
+app.use('/api/stock-opname', ...opsGuard, stockOpnameRoutes);
 app.use('/api/documents', ...opsGuard, documentsRoutes);
 // Not behind opsGuard: a read-only Admin still gets told what happened, and
 // marking your own notification read is not an operational change.

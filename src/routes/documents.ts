@@ -12,7 +12,7 @@ import { issuePaymentCode } from '../utils/payments';
 export const router = Router({ mergeParams: true });
 
 const DOC_TYPES = ['PR', 'PO', 'PayReq', 'Reimbursement', 'Expense',
-                   'StockIn', 'StockInItem', 'StockOut'] as const;
+                   'StockIn', 'StockInItem', 'StockOut', 'StockOpname'] as const;
 export type DocType = (typeof DOC_TYPES)[number];
 
 /**
@@ -42,6 +42,10 @@ const DOC_TABLE: Record<DocType, string> = {
   StockIn: 'stock_in',
   StockInItem: 'stock_in_items',
   StockOut: 'stock_out',
+  // The physical count. Its attachments are optional by decision of 2026-09-29 —
+  // a signed count sheet or a photo of the shelf, when there is one — so nothing
+  // here demands them; being addressable is the whole of it.
+  StockOpname: 'stock_opname',
 };
 
 /** The document types that end in money leaving the account. */

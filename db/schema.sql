@@ -783,7 +783,7 @@ CREATE TABLE `document_approvals` (
 CREATE TABLE `document_attachments` (
   `id`            INT AUTO_INCREMENT PRIMARY KEY,
   `document_type` ENUM('PR','PO','PayReq','Reimbursement','Expense',
-                       'StockIn','StockInItem','StockOut') NOT NULL,
+                       'StockIn','StockInItem','StockOut','StockOpname') NOT NULL,
   `document_id`   INT NOT NULL,
   `category`      VARCHAR(80) NULL,
   `subcategory`   VARCHAR(80) NULL,
@@ -796,7 +796,7 @@ CREATE TABLE `document_attachments` (
 CREATE TABLE `document_activities` (
   `id`            INT AUTO_INCREMENT PRIMARY KEY,
   `document_type` ENUM('PR','PO','PayReq','Reimbursement','Expense',
-                       'StockIn','StockInItem','StockOut') NOT NULL,
+                       'StockIn','StockInItem','StockOut','StockOpname') NOT NULL,
   `document_id`   INT NOT NULL,
   `action`        VARCHAR(120) NOT NULL,
   `user_id`       INT NULL,
@@ -876,6 +876,53 @@ CREATE TABLE `stock_out` (
   KEY `fk_so_user` (`issued_by_user_id`),
   CONSTRAINT `fk_so_warehouse` FOREIGN KEY (`warehouse_id`)      REFERENCES `warehouse`(`id`),
   CONSTRAINT `fk_so_user`      FOREIGN KEY (`issued_by_user_id`) REFERENCES `users`(`id`) ON DELETE SET NULL
+) ENGINE=InnoDB;
+
+-- -----------------------------------------------------------------------------
+-- Stok opname — menghitung fisik, lalu membandingkannya dengan angka sistem.
+--
+-- Stok di sistem ini TERHITUNG (v_saprodi_stock = masuk − keluar), bukan disimpan.
+-- Opname tidak mengubahnya: ia mencatat berapa yang sebenarnya ada di rak, berapa
+-- kata sistem waktu itu, dan berapa selisihnya. Keputusan 2026-09-29 — selisihnya
+-- ditindaklanjuti lewat dokumen gudang yang biasa, bukan dengan menimpa angkanya,
+-- supaya setiap perubahan stok tetap punya dokumen yang menjelaskannya.
+--
+-- `system_qty` DISIMPAN, bukan dihitung ulang saat dibaca. Angka terhitung itu
+-- terus bergerak; sebuah hitungan bulan lalu harus tetap bisa mengatakan apa kata
+-- sistem PADA HARI ITU, kalau tidak selisihnya berubah sendiri setiap ada barang
+-- masuk dan dokumennya berhenti berarti.
+--
+-- Satu gudang satu opname per 30 hari; aturan itu dijaga API (routes/stockOpname.ts).
+-- -----------------------------------------------------------------------------
+CREATE TABLE `stock_opname` (
+  `id`                 INT AUTO_INCREMENT PRIMARY KEY,
+  `opname_number`      VARCHAR(60) NOT NULL UNIQUE,
+  `opname_date`        DATE NOT NULL,
+  `warehouse_id`       INT NOT NULL,
+  `counted_by_user_id` INT NULL,
+  `notes`              TEXT NULL,
+  `created_at`         DATETIME NULL,
+  `updated_at`         DATETIME NULL,
+  KEY `ix_opname_wh_date` (`warehouse_id`, `opname_date`),
+  CONSTRAINT `fk_opname_wh`   FOREIGN KEY (`warehouse_id`)       REFERENCES `warehouse`(`id`),
+  CONSTRAINT `fk_opname_user` FOREIGN KEY (`counted_by_user_id`) REFERENCES `users`(`id`) ON DELETE SET NULL
+) ENGINE=InnoDB;
+
+CREATE TABLE `stock_opname_items` (
+  `id`               INT AUTO_INCREMENT PRIMARY KEY,
+  `stock_opname_id`  INT NOT NULL,
+  `sapropdi_id`      INT NOT NULL,
+  -- Apa kata sistem saat dihitung, disimpan sebagai potret. Lihat catatan di atas.
+  `system_qty`       DECIMAL(15,3) NOT NULL DEFAULT 0,
+  `counted_qty`      DECIMAL(15,3) NOT NULL DEFAULT 0,
+  `unit_id`          INT NULL,
+  `remarks`          VARCHAR(255) NULL,
+  `created_at`       DATETIME NULL,
+  `updated_at`       DATETIME NULL,
+  UNIQUE KEY `uq_opname_item` (`stock_opname_id`, `sapropdi_id`),
+  CONSTRAINT `fk_opname_item_head` FOREIGN KEY (`stock_opname_id`) REFERENCES `stock_opname`(`id`) ON DELETE CASCADE,
+  CONSTRAINT `fk_opname_item_sap`  FOREIGN KEY (`sapropdi_id`)     REFERENCES `sapropdi`(`id`),
+  CONSTRAINT `fk_opname_item_unit` FOREIGN KEY (`unit_id`)         REFERENCES `units`(`id`) ON DELETE SET NULL
 ) ENGINE=InnoDB;
 
 -- -----------------------------------------------------------------------------
