@@ -8,9 +8,14 @@
 // tidak punya dokumen penjelas, dan gudang kehilangan satu-satunya sifat yang
 // membuat angkanya bisa ditelusuri: setiap pergerakan punya surat.
 //
-// Karena itu modul ini tidak punya efek samping sama sekali. Ia dokumen kontrol:
-// "tanggal sekian, di gudang ini, sistem bilang 12, yang ada 9." Menindaklanjutinya
-// urusan orang, lewat dokumen gudang yang biasa.
+// Karena itu opname tidak punya efek samping sendiri. Ia dokumen kontrol: "tanggal
+// sekian, di gudang ini, sistem bilang 12, yang ada 9."
+//
+// Sejak permintaan berikutnya, ada SATU tindakan lanjutan yang boleh dipilih:
+// POST /:id/apply memakai hitungan itu untuk membetulkan catatan. Tetap opsional,
+// tetap harus diminta, dan tetap tidak menimpa apa pun - penyesuaiannya jadi suku
+// ketiga di v_saprodi_stock yang menunjuk balik ke opname penyebabnya. Opname yang
+// sudah diterapkan tidak bisa diubah atau dihapus lagi: angka stok bersandar padanya.
 //
 // Satu gudang, satu opname per 30 hari. Aturan itu dijaga di sini dan bukan
 // dianjurkan di layar, karena "sekali sebulan" yang boleh dilanggar diam-diam
@@ -34,7 +39,7 @@ export const router = Router();
 export const OPNAME_INTERVAL_DAYS = 30;
 
 const SELECT = `
-  SELECT o.*, w.warehouse_name, u.name AS counted_by_name,
+  SELECT o.*, w.warehouse_name, u.name AS counted_by_name, ua.name AS applied_by_name,
          ent.id AS entity_id, ent.entities_name AS entity_name,
          (SELECT COUNT(*) FROM stock_opname_items i WHERE i.stock_opname_id = o.id) AS line_count,
          (SELECT COUNT(*) FROM stock_opname_items i
@@ -46,12 +51,13 @@ const SELECT = `
   LEFT JOIN kth wk       ON wk.id = w.kth_id
   LEFT JOIN entities ent ON ent.id = wk.entities_id
   LEFT JOIN users u      ON u.id = o.counted_by_user_id
+  LEFT JOIN users ua     ON ua.id = o.applied_by_user_id
 `;
 
 const LINE_SELECT = `
   SELECT i.id, i.sapropdi_id, i.system_qty, i.counted_qty,
          (i.counted_qty - i.system_qty) AS variance,
-         i.unit_id, i.remarks,
+         i.adjustment, i.unit_id, i.remarks,
          s.sapropdi_name, s.category,
          COALESCE(un.unit_name, s.unit) AS unit_name
   FROM stock_opname_items i
@@ -344,6 +350,13 @@ router.put('/:id', authenticate, async (req: Request, res: Response) => {
     const prev = await scopedOpname(req, id);
     if (!prev) { return res.status(404).json({ message: 'Stok opname tidak ditemukan' }); }
 
+    if (prev.applied_at) {
+      return res.status(409).json({
+        message: 'Opname ini sudah dipakai untuk menyesuaikan stok, jadi isinya tidak bisa '
+          + 'diubah lagi — angka stok sekarang bersandar padanya.',
+      });
+    }
+
     const b = req.body || {};
     await conn.beginTransaction();
     if (b.notes !== undefined) {
@@ -370,12 +383,105 @@ router.put('/:id', authenticate, async (req: Request, res: Response) => {
   }
 });
 
+// POST /api/stock-opname/:id/apply
+//
+// Memakai hasil hitungan untuk membetulkan catatan stok. Opsional, dan harus
+// diminta: keadaan bakunya tetap "dicatat saja".
+//
+// Penyesuaiannya tidak menimpa apa pun. Ia jadi suku ketiga di v_saprodi_stock
+// (masuk - keluar + penyesuaian), dan setiap angkanya menunjuk balik ke baris
+// opname yang menyebabkannya. Jadi stok tetap punya dokumen untuk setiap
+// perubahannya - yang justru alasan opname semula dibuat tanpa efek samping.
+//
+// Yang disimpan adalah (fisik - sisa SAAT DITERAPKAN), bukan (fisik - system_qty)
+// yang tercatat di baris. Keduanya biasanya sama, tapi barang bisa bergerak antara
+// dihitung dan diterapkan, dan yang harus benar adalah hasil akhirnya: sesudah ini
+// sisa = angka fisik.
+router.post('/:id/apply', authenticate, async (req: Request, res: Response) => {
+  const conn = await pool.getConnection();
+  try {
+    const id = Number(req.params.id);
+    const prev = await scopedOpname(req, id);
+    if (!prev) { return res.status(404).json({ message: 'Stok opname tidak ditemukan' }); }
+    if (prev.applied_at) {
+      return res.status(409).json({
+        message: 'Opname ini sudah dipakai untuk menyesuaikan stok pada '
+          + String(prev.applied_at).slice(0, 19).replace('T', ' ') + '.',
+      });
+    }
+
+    const [lineRows] = await pool.query(
+      'SELECT id, sapropdi_id, counted_qty FROM stock_opname_items WHERE stock_opname_id = ?', [id]);
+    const lines = lineRows as any[];
+    if (!lines.length) {
+      return res.status(422).json({ message: 'Opname ini tidak punya baris untuk diterapkan.' });
+    }
+
+    await conn.beginTransaction();
+
+    // Sisa saat ini, dibaca dari view yang sama dengan yang dilihat orang. Opname
+    // ini belum diterapkan, jadi angkanya belum memuat dirinya sendiri.
+    const [curRows] = await conn.query(
+      'SELECT sapropdi_id, COALESCE(remaining, 0) AS remaining FROM v_saprodi_stock WHERE warehouse_id = ?',
+      [prev.warehouse_id]);
+    const current = new Map<number, number>();
+    for (const r of curRows as any[]) current.set(Number(r.sapropdi_id), Number(r.remaining));
+
+    let moved = 0;
+    for (const l of lines) {
+      const before = current.get(Number(l.sapropdi_id)) ?? 0;
+      const adj = Number(l.counted_qty) - before;
+      await conn.query(
+        'UPDATE stock_opname_items SET adjustment = ?, updated_at = NOW() WHERE id = ?', [adj, l.id]);
+      if (adj !== 0) moved++;
+    }
+    await conn.query(
+      'UPDATE stock_opname SET applied_at = NOW(), applied_by_user_id = ?, updated_at = NOW() WHERE id = ?',
+      [req.user?.type === 'User' ? req.user.id : null, id]);
+
+    // Jejaknya ikut ditulis: sesudah ini angka stok berubah, dan harus ada yang
+    // bisa menjawab kapan dan oleh siapa tanpa membaca kolom.
+    await conn.query(
+      "INSERT INTO document_activities (document_type, document_id, action, user_id, note, created_at)"
+      + " VALUES ('StockOpname', ?, 'Stok disesuaikan dari opname', ?, ?, NOW())",
+      [id, req.user?.type === 'User' ? req.user.id : null,
+       moved + ' dari ' + lines.length + ' barang berubah angkanya']);
+
+    await conn.commit();
+
+    const [rows] = await pool.query(SELECT + ' WHERE o.id = ? LIMIT 1', [id]);
+    const data = (rows as any[])[0];
+    const [out] = await pool.query(LINE_SELECT, [id]);
+    data.lines = out;
+    return res.json({
+      message: moved
+        ? 'Stok disesuaikan - ' + moved + ' barang berubah angkanya'
+        : 'Tidak ada yang perlu disesuaikan: catatan sudah sama dengan hitungan fisik',
+      data,
+    });
+  } catch (err: any) {
+    await conn.rollback();
+    return res.status(500).json({ message: 'Server error', error: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
 // DELETE /api/stock-opname/:id
 router.delete('/:id', authenticate, async (req: Request, res: Response) => {
   try {
     const id = Number(req.params.id);
     const prev = await scopedOpname(req, id);
     if (!prev) return res.status(404).json({ message: 'Stok opname tidak ditemukan' });
+    // Menghapusnya akan menarik kembali penyesuaiannya dan menggerakkan angka stok
+    // tanpa ada dokumen yang menjelaskan kenapa. Sebuah opname yang sudah dipakai
+    // adalah bagian dari bagaimana stok hari ini sampai pada angkanya.
+    if (prev.applied_at) {
+      return res.status(409).json({
+        message: 'Opname ini sudah dipakai untuk menyesuaikan stok dan tidak bisa dihapus. '
+          + 'Untuk membetulkan, buat opname baru atau dokumen Stock In / Stock Out.',
+      });
+    }
 
     // Lampiran dialamatkan lewat (tipe, id) tanpa foreign key, jadi penghapusan
     // harus membawanya serta — kalau tidak ia akan menempel pada opname lain yang

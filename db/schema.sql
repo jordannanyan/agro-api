@@ -901,11 +901,17 @@ CREATE TABLE `stock_opname` (
   `warehouse_id`       INT NOT NULL,
   `counted_by_user_id` INT NULL,
   `notes`              TEXT NULL,
+  -- Terisi kalau selisihnya dipakai untuk membetulkan catatan stok. Opname yang
+  -- hanya dicatat membiarkannya NULL, dan itu keadaan bakunya: menyesuaikan stok
+  -- adalah tindakan tersendiri yang dipilih orang, bukan akibat dari menghitung.
+  `applied_at`         DATETIME NULL,
+  `applied_by_user_id` INT NULL,
   `created_at`         DATETIME NULL,
   `updated_at`         DATETIME NULL,
   KEY `ix_opname_wh_date` (`warehouse_id`, `opname_date`),
   CONSTRAINT `fk_opname_wh`   FOREIGN KEY (`warehouse_id`)       REFERENCES `warehouse`(`id`),
-  CONSTRAINT `fk_opname_user` FOREIGN KEY (`counted_by_user_id`) REFERENCES `users`(`id`) ON DELETE SET NULL
+  CONSTRAINT `fk_opname_user` FOREIGN KEY (`counted_by_user_id`) REFERENCES `users`(`id`) ON DELETE SET NULL,
+  CONSTRAINT `fk_opname_applier` FOREIGN KEY (`applied_by_user_id`) REFERENCES `users`(`id`) ON DELETE SET NULL
 ) ENGINE=InnoDB;
 
 CREATE TABLE `stock_opname_items` (
@@ -915,6 +921,10 @@ CREATE TABLE `stock_opname_items` (
   -- Apa kata sistem saat dihitung, disimpan sebagai potret. Lihat catatan di atas.
   `system_qty`       DECIMAL(15,3) NOT NULL DEFAULT 0,
   `counted_qty`      DECIMAL(15,3) NOT NULL DEFAULT 0,
+  -- Berapa yang benar-benar ditambahkan ke stok saat opname diterapkan. NULL
+  -- selama belum diterapkan. Disimpan, bukan dihitung ulang: ia harus tetap
+  -- menjelaskan angka stok hari ini walaupun barisnya kelak diedit.
+  `adjustment`       DECIMAL(15,3) NULL,
   `unit_id`          INT NULL,
   `remarks`          VARCHAR(255) NULL,
   `created_at`       DATETIME NULL,

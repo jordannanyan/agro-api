@@ -30,7 +30,11 @@ SELECT
   COALESCE(un.unit_name, s.unit) AS unit_name,
   COALESCE(si.total_in, 0) AS total_in,
   COALESCE(d.total_out, 0) AS total_out,
-  COALESCE(si.total_in, 0) - COALESCE(d.total_out, 0) AS remaining
+  -- Penyesuaian dari stok opname yang DITERAPKAN. Nol untuk hampir semua barang,
+  -- karena ia hanya ada kalau seseorang menghitung fisik, menemukan selisih, dan
+  -- memilih menyesuaikan catatannya. Opname yang cuma dicatat tidak menyentuhnya.
+  COALESCE(adj.total_adj, 0) AS total_adjustment,
+  COALESCE(si.total_in, 0) - COALESCE(d.total_out, 0) + COALESCE(adj.total_adj, 0) AS remaining
 FROM warehouse w
 CROSS JOIN sapropdi s
 LEFT JOIN units un ON un.id = s.unit_id
@@ -54,7 +58,21 @@ LEFT JOIN (
     AND t.type_name = 'Saprodi'
   GROUP BY pfd.warehouse_id, pfd.sapropdi_id
 ) d ON d.warehouse_id = w.id AND d.sapropdi_id = s.id
-WHERE si.total_in IS NOT NULL OR d.total_out IS NOT NULL;
+LEFT JOIN (
+  -- `adjustment` ditulis SAAT opname diterapkan, sebagai (fisik - sisa saat itu),
+  -- bukan (fisik - system_qty) yang tersimpan di baris. Keduanya biasanya sama,
+  -- tapi tidak selalu: barang bisa bergerak antara dihitung dan diterapkan, dan
+  -- yang harus benar adalah hasil akhirnya — sesudah diterapkan, sisa = fisik.
+  --
+  -- `applied_at IS NOT NULL` adalah seluruh pembedanya: opname yang hanya dicatat
+  -- ada di tabel yang sama dan tidak boleh ikut terhitung di sini.
+  SELECT o.warehouse_id, oi.sapropdi_id, SUM(oi.adjustment) AS total_adj
+  FROM stock_opname o
+  JOIN stock_opname_items oi ON oi.stock_opname_id = o.id
+  WHERE o.applied_at IS NOT NULL AND oi.adjustment IS NOT NULL
+  GROUP BY o.warehouse_id, oi.sapropdi_id
+) adj ON adj.warehouse_id = w.id AND adj.sapropdi_id = s.id
+WHERE si.total_in IS NOT NULL OR d.total_out IS NOT NULL OR adj.total_adj IS NOT NULL;
 
 -- Outstanding petani per pre-finance type:
 --   Σ distributions.total_amount(type=T, counts_as_debt=1) − Σ installment_details.amount(type=T)
