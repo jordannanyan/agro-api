@@ -72,18 +72,32 @@ router.put('/:id/polygon-points', authenticate, async (req: Request, res: Respon
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
+    // Replacing the points must not wipe the photos already uploaded for them.
+    // Newer apps echo each point's `photo_path`; for older apps that don't,
+    // carry the photo over from the old row at the same coordinate.
+    const [oldRows] = await conn.query(
+      'SELECT latitude, longitude, photo_path FROM plot_polygon_points WHERE plot_id = ? AND photo_path IS NOT NULL',
+      [plotId]
+    );
+    const coordKey = (lat: any, lng: any) => `${Number(lat).toFixed(6)},${Number(lng).toFixed(6)}`;
+    const oldPhotos = new Map<string, string>();
+    for (const r of oldRows as any[]) oldPhotos.set(coordKey(r.latitude, r.longitude), r.photo_path);
+    const echoedPhoto = (v: any): string | null =>
+      typeof v === 'string' && /^(\/storage\/|plot_polygon_points\/)[\w./-]+$/.test(v) && !v.includes('..') ? v : null;
+
     await conn.query('DELETE FROM plot_polygon_points WHERE plot_id = ?', [plotId]);
     let auto = 0;
     for (const p of points) {
       await conn.query(
         `INSERT INTO plot_polygon_points
-           (plot_id, seq, latitude, longitude, captured_at, accuracy_m, source, created_at, updated_at)
-         VALUES (?,?,?,?,?,?,?,NOW(),NOW())`,
+           (plot_id, seq, latitude, longitude, photo_path, captured_at, accuracy_m, source, created_at, updated_at)
+         VALUES (?,?,?,?,?,?,?,?,NOW(),NOW())`,
         [
           plotId,
           p.seq != null ? Number(p.seq) : ++auto,
           Number(p.latitude),
           Number(p.longitude),
+          echoedPhoto(p.photo_path) ?? oldPhotos.get(coordKey(p.latitude, p.longitude)) ?? null,
           p.captured_at ? new Date(p.captured_at) : null,
           p.accuracy_m != null && p.accuracy_m !== '' ? Number(p.accuracy_m) : null,
           p.source || 'mobile',
