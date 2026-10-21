@@ -1036,6 +1036,8 @@ CREATE TABLE `payback_rates` (
   CONSTRAINT `fk_pbr_plot`  FOREIGN KEY (`plot_id`)  REFERENCES `plot`(`id`) ON DELETE CASCADE,
   -- RESTRICT: a graded rate whose grade vanished would silently start applying
   -- to every grade.
+  -- NB: MySQL treats NULLs as distinct, so this key does not stop two ungraded
+  -- rates for the same plot and date; the API and the importer check for that.
   CONSTRAINT `fk_pbr_grade` FOREIGN KEY (`grade_id`) REFERENCES `grade`(`id`) ON DELETE RESTRICT,
   UNIQUE KEY `uq_payback_rate` (`plot_id`, `grade_id`, `effective_date`)
 ) ENGINE=InnoDB;

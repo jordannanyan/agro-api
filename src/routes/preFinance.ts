@@ -385,6 +385,18 @@ function rateInvalid(c: ReturnType<typeof rateCols>): string | null {
   return null;
 }
 
+/**
+ * Another rate for the same plot, grade and date. The UNIQUE key cannot answer
+ * this for an ungraded rate (NULL never equals NULL), so it is asked here.
+ */
+async function duplicateRate(c: ReturnType<typeof rateCols>, exceptId: number | null): Promise<boolean> {
+  const [r] = await pool.query(
+    `SELECT id FROM payback_rates WHERE plot_id = ? AND grade_id <=> ? AND effective_date = ? AND id <> ? LIMIT 1`,
+    [c.plot_id, c.grade_id, c.effective_date, exceptId ?? 0]);
+  return (r as any[]).length > 0;
+}
+const DUPLICATE_RATE = 'Plot ini sudah punya tarif untuk tanggal dan grade yang sama';
+
 /** Only a farmer's plot in the caller's own PT may be given a rate. */
 async function plotInScope(req: Request, plotId: number): Promise<boolean> {
   const scope = entityScope(req);
@@ -400,6 +412,7 @@ paybackRatesRouter.post('/', authenticate, requireRole(...RATE_WRITERS), async (
     const bad = rateInvalid(c);
     if (bad) return res.status(422).json({ message: bad });
     if (!(await plotInScope(req, c.plot_id!))) return res.status(404).json({ message: 'Plot not found' });
+    if (await duplicateRate(c, null)) return res.status(422).json({ message: DUPLICATE_RATE });
     const [r] = await pool.query(
       `INSERT INTO payback_rates (plot_id, grade_id, effective_date, full_price, saprodi_per_kg, labor_per_kg, notes, created_at, updated_at)
        VALUES (?,?,?,?,?,?,?,NOW(),NOW())`,
@@ -407,7 +420,7 @@ paybackRatesRouter.post('/', authenticate, requireRole(...RATE_WRITERS), async (
     const [rows] = await pool.query(RATE_SELECT + ' WHERE r.id = ?', [(r as any).insertId]);
     return res.status(201).json({ message: 'Payback rate created', data: (rows as any[])[0] });
   } catch (err: any) {
-    if (err.code === 'ER_DUP_ENTRY') return res.status(422).json({ message: 'Plot ini sudah punya tarif untuk tanggal dan grade yang sama' });
+    if (err.code === 'ER_DUP_ENTRY') return res.status(422).json({ message: DUPLICATE_RATE });
     return res.status(500).json({ message: 'Server error', error: err.message });
   }
 });
@@ -423,6 +436,7 @@ paybackRatesRouter.put('/:id', authenticate, requireRole(...RATE_WRITERS), async
     const bad = rateInvalid(c);
     if (bad) return res.status(422).json({ message: bad });
     if (!(await plotInScope(req, c.plot_id!))) return res.status(404).json({ message: 'Plot not found' });
+    if (await duplicateRate(c, Number(req.params.id))) return res.status(422).json({ message: DUPLICATE_RATE });
     await pool.query(
       `UPDATE payback_rates SET plot_id = ?, grade_id = ?, effective_date = ?, full_price = ?, saprodi_per_kg = ?,
               labor_per_kg = ?, notes = ?, updated_at = NOW() WHERE id = ?`,
@@ -430,7 +444,7 @@ paybackRatesRouter.put('/:id', authenticate, requireRole(...RATE_WRITERS), async
     const [rows] = await pool.query(RATE_SELECT + ' WHERE r.id = ?', [req.params.id]);
     return res.json({ message: 'Payback rate updated', data: (rows as any[])[0] });
   } catch (err: any) {
-    if (err.code === 'ER_DUP_ENTRY') return res.status(422).json({ message: 'Plot ini sudah punya tarif untuk tanggal dan grade yang sama' });
+    if (err.code === 'ER_DUP_ENTRY') return res.status(422).json({ message: DUPLICATE_RATE });
     return res.status(500).json({ message: 'Server error', error: err.message });
   }
 });

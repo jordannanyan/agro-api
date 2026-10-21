@@ -108,6 +108,7 @@ async function readRates(file) {
     password: process.env.DB_PASSWORD || '',
     database: DB,
     multipleStatements: true,
+    dateStrings: true,
   });
 
   log(`\n=== Migrasi potongan cicilan di setoran — database ${DB} ===`);
@@ -162,6 +163,24 @@ async function readRates(file) {
     }
   }
 
+  // 2b. duplicate ungraded rates — the first run of this script let the ledger's
+  //     repeated row in (NULL grade slips past the UNIQUE key). Keep the oldest.
+  if (t.n) {
+    const [dupRates] = await conn.query(
+      `SELECT r.id, r.plot_id, r.effective_date FROM payback_rates r
+       WHERE EXISTS (SELECT 1 FROM payback_rates o
+                     WHERE o.plot_id = r.plot_id AND o.grade_id <=> r.grade_id
+                       AND o.effective_date = r.effective_date AND o.id < r.id)`);
+    for (const d of dupRates) log(`  tarif duplikat #${d.id} (plot #${d.plot_id}, ${d.effective_date}) akan dihapus`);
+    if (dupRates.length) {
+      changes += dupRates.length;
+      if (APPLY) {
+        await conn.query('DELETE FROM payback_rates WHERE id IN (?)', [dupRates.map((d) => d.id)]);
+        log('   dihapus');
+      }
+    }
+  }
+
   // 3. rates from the ledger
   if (RATES_FILE) {
     log(`\n  Tarif dari: ${RATES_FILE}`);
@@ -172,6 +191,10 @@ async function readRates(file) {
     const gradeByName = new Map(grades.map((g) => [g.grade_name, g.id]));
     const tableReady = t.n || APPLY;
     let add = 0, same = 0, skip = 0;
+    // The ledger lists some rows twice (GW012001 on 2025-03-24). The UNIQUE key
+    // cannot catch that for an ungraded rate — NULL never equals NULL in MySQL —
+    // so duplicates are dropped here, and checked against the table below.
+    const seen = new Set();
     for (const r of rows) {
       const tag = `baris ${r.line} ${r.plot} ${r.date}`;
       if (!r.saprodi && !r.labor) { log(`   - ${tag}: tanpa payback — dilewati`); skip++; continue; }
@@ -185,6 +208,9 @@ async function readRates(file) {
         if (gradeId == null) { log(`   ✗ ${tag}: grade ${GRADE_SUFFIX[m[2].toUpperCase()]} tidak ada`); skip++; continue; }
       }
       if (!plot) { log(`   ✗ ${tag}: plot tidak ditemukan`); skip++; continue; }
+      const key = `${plot.id}|${gradeId ?? ''}|${r.date}`;
+      if (seen.has(key)) { log(`   - ${tag}: duplikat baris sebelumnya — dilewati`); skip++; continue; }
+      seen.add(key);
       if (plot.scheme !== 'PreFinance') log(`   ! ${tag}: plot berskema ${plot.scheme}, tarif tetap dicatat`);
       if (tableReady && t.n) {
         const [ex] = await conn.query(
@@ -195,9 +221,8 @@ async function readRates(file) {
       log(`   + ${tag} → plot #${plot.id}${gradeId ? ` grade #${gradeId}` : ''}: saprodi ${r.saprodi}/kg, labor ${r.labor}/kg, harga penuh ${r.full}`);
       add++;
       if (APPLY) {
-        // The ledger lists some rows twice; the unique key makes the second a no-op.
         await conn.query(
-          `INSERT IGNORE INTO payback_rates (plot_id, grade_id, effective_date, full_price, saprodi_per_kg, labor_per_kg, notes, created_at, updated_at)
+          `INSERT INTO payback_rates (plot_id, grade_id, effective_date, full_price, saprodi_per_kg, labor_per_kg, notes, created_at, updated_at)
            VALUES (?,?,?,?,?,?,?,NOW(),NOW())`,
           [plot.id, gradeId, r.date, r.full, r.saprodi, r.labor, `AML - Purchase Price Database baris ${r.line}`]);
       }
