@@ -27,7 +27,7 @@ import financeRoutes from './routes/finance';
 import dashboardRoutes from './routes/dashboard';
 import profitSharingRoutes from './routes/profitSharing';
 import distributedSaprodiRoutes from './routes/distributedSaprodi';
-import { distributionsRouter, installmentsRouter, outstandingRouter } from './routes/preFinance';
+import { distributionsRouter, installmentsRouter, outstandingRouter, paybackRatesRouter } from './routes/preFinance';
 import { treesRouter, treeMonSubRouter, treeMonitoringRouter, polygonPointsRouter, mapRouter } from './routes/gis';
 import { authenticate } from './middleware/auth';
 import { operationsReadOnly } from './middleware/readOnly';
@@ -130,6 +130,7 @@ app.use('/api/warehouse-stock', warehouseStockRoutes);
 app.use('/api/pre-finance/distributions', ...opsGuard, distributionsRouter);
 app.use('/api/pre-finance/installments', ...opsGuard, installmentsRouter);
 app.use('/api/pre-finance/outstanding', outstandingRouter);
+app.use('/api/pre-finance/payback-rates', ...opsGuard, paybackRatesRouter);
 
 // Per-plot saprodi handouts for the mobile app (reads pre_finance_distributions, type Saprodi).
 app.use('/api/distributed-sapropdi', distributedSaprodiRoutes);

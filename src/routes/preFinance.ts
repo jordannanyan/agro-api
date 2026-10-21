@@ -1,11 +1,13 @@
 import { Router, Request, Response } from 'express';
 import pool from '../db/connection';
-import { authenticate } from '../middleware/auth';
+import { authenticate, requireRole } from '../middleware/auth';
+import { ROLE } from '../utils/roles';
 import { upload, fileToPath } from '../middleware/upload';
 import { compressImages } from '../services/imageProcessor';
 import { entityScope } from '../utils/entityScope';
 import { distributionEntityPredicate, farmerEntityPredicate } from '../utils/farmScope';
 import { respondList } from '../utils/pagination';
+import { outstandingByType, suggestRepayment } from '../utils/repayment';
 
 // -----------------------------------------------------------------------------
 // Distributions  /api/pre-finance/distributions
@@ -166,11 +168,18 @@ distributionsRouter.delete('/:id', authenticate, async (req, res) => {
 // -----------------------------------------------------------------------------
 export const installmentsRouter = Router();
 
+// `purchasing_id` set = deducted from that delivery (booked through Purchasing);
+// NULL = a cash repayment made outside any delivery.
 const INST_SELECT = `
-  SELECT i.*, f.farmer_name, pm.method_name
+  SELECT i.*, f.farmer_name, pm.method_name,
+         IF(i.purchasing_id IS NULL, 'cash', 'delivery') AS source,
+         pu.receipt_invoice AS purchasing_invoice, pu.quantity AS purchasing_quantity,
+         pl.plot_name AS purchasing_plot_name
   FROM pre_finance_installments i
   LEFT JOIN farmers f          ON f.id = i.farmer_id
   LEFT JOIN payment_methods pm ON pm.id = i.payment_method_id
+  LEFT JOIN purchasing pu      ON pu.id = i.purchasing_id
+  LEFT JOIN plot pl            ON pl.id = pu.plot_id
 `;
 
 async function loadDetails(id: number) {
@@ -185,16 +194,27 @@ installmentsRouter.get('/', authenticate, async (req: Request, res: Response) =>
   const where: string[] = [];
   const args: any[] = [];
   if (req.query.farmer_id) { where.push('i.farmer_id = ?'); args.push(req.query.farmer_id); }
+  if (req.query.source === 'delivery') where.push('i.purchasing_id IS NOT NULL');
+  if (req.query.source === 'cash') where.push('i.purchasing_id IS NULL');
+  if (req.query.search) {
+    where.push('(f.farmer_name LIKE ? OR i.reference_no LIKE ? OR pu.receipt_invoice LIKE ?)');
+    const q = `%${req.query.search}%`;
+    args.push(q, q, q);
+  }
   // A repayment belongs to the PT that farms the debt.
   const scope = entityScope(req);
   if (scope != null) { where.push(farmerEntityPredicate('i.farmer_id')); args.push(scope); }
   const sql = INST_SELECT + (where.length ? ` WHERE ${where.join(' AND ')}` : '') + ' ORDER BY i.date DESC, i.id DESC';
-  const [rows] = await pool.query(sql, args);
-  return res.json({ data: rows });
+  // Every delivery of a pre-finance farmer now carries one, so this list grows
+  // with purchasing and pages the same way (opt-in, ?page / ?per_page).
+  return respondList(req, res, sql, args, undefined, 'COALESCE(SUM(total_payment),0) AS total_payment');
 });
 
 installmentsRouter.get('/:id', authenticate, async (req, res) => {
-  const [rows] = await pool.query(INST_SELECT + ' WHERE i.id = ? LIMIT 1', [req.params.id]);
+  const scope = entityScope(req);
+  const [rows] = await pool.query(
+    INST_SELECT + ` WHERE i.id = ?${scope != null ? ` AND ${farmerEntityPredicate('i.farmer_id')}` : ''} LIMIT 1`,
+    scope != null ? [req.params.id, scope] : [req.params.id]);
   const list = rows as any[];
   if (!list.length) return res.status(404).json({ message: 'Installment not found' });
   const data = list[0];
@@ -208,24 +228,45 @@ installmentsRouter.post('/', authenticate, upload.single('upload_proof'), async 
   try {
     const b = req.body || {};
     if (!b.farmer_id || !b.date) return res.status(422).json({ message: 'farmer_id and date are required' });
+    // A deduction from a delivery is booked with the delivery itself (Purchasing),
+    // where its amount comes from the kilos and the rate. Booking one here as well
+    // is how the same repayment ends up counted twice.
+    if (b.purchasing_id != null && b.purchasing_id !== '') {
+      return res.status(422).json({
+        message: 'Potongan dari setoran dicatat lewat Purchasing, bukan di sini. Form ini hanya untuk pembayaran tunai di luar setoran.',
+      });
+    }
     let details = b.details;
     if (typeof details === 'string') { try { details = JSON.parse(details); } catch { details = []; } }
-    details = Array.isArray(details) ? details : [];
+    details = (Array.isArray(details) ? details : []).filter((d: any) => d.pre_finance_type_id && Number(d.amount) > 0);
+    if (!details.length) return res.status(422).json({ message: 'At least one repayment amount is required' });
     const total = details.reduce((s: number, d: any) => s + Number(d.amount || 0), 0);
     const proof = fileToPath(req.file);
 
     await conn.beginTransaction();
+    // Same rule the delivery deduction follows: never pay back more than is owed.
+    await conn.query('SELECT id FROM farmers WHERE id = ? FOR UPDATE', [Number(b.farmer_id)]);
+    const owed = await outstandingByType(conn, Number(b.farmer_id), null);
+    for (const d of details) {
+      const o = owed.find((x) => x.pre_finance_type_id === Number(d.pre_finance_type_id));
+      if (!o) { await conn.rollback(); return res.status(422).json({ message: `Unknown pre_finance_type_id ${d.pre_finance_type_id}` }); }
+      if (Number(d.amount) > Math.max(0, Number(o.outstanding)) + 0.5) {
+        await conn.rollback();
+        return res.status(422).json({
+          message: `Pembayaran ${o.type_name} melebihi outstanding Rp ${Math.max(0, Number(o.outstanding)).toLocaleString('id-ID')}`,
+        });
+      }
+    }
     const [result] = await conn.query(
       `INSERT INTO pre_finance_installments (purchasing_id, farmer_id, date, payment_method_id, reference_no, upload_proof, total_payment, notes, created_at, updated_at)
        VALUES (?,?,?,?,?,?,?,?,NOW(),NOW())`,
-      [b.purchasing_id != null && b.purchasing_id !== '' ? Number(b.purchasing_id) : null,
+      [null,
        Number(b.farmer_id), b.date,
        b.payment_method_id != null && b.payment_method_id !== '' ? Number(b.payment_method_id) : null,
        b.reference_no || null, proof, total, b.notes || null]
     );
     const id = (result as any).insertId;
     for (const d of details) {
-      if (!d.pre_finance_type_id || !Number(d.amount)) continue;
       await conn.query(
         'INSERT INTO pre_finance_installment_details (installment_id, pre_finance_type_id, amount) VALUES (?,?,?)',
         [id, Number(d.pre_finance_type_id), Number(d.amount || 0)]
@@ -245,9 +286,165 @@ installmentsRouter.post('/', authenticate, upload.single('upload_proof'), async 
 });
 
 installmentsRouter.delete('/:id', authenticate, async (req, res) => {
-  const [result] = await pool.query('DELETE FROM pre_finance_installments WHERE id = ?', [req.params.id]);
-  if (!(result as any).affectedRows) return res.status(404).json({ message: 'Installment not found' });
+ try {
+  const scope = entityScope(req);
+  const [rows] = await pool.query(
+    `SELECT id, purchasing_id FROM pre_finance_installments WHERE id = ?`
+    + (scope != null ? ` AND ${farmerEntityPredicate('farmer_id')}` : '') + ' LIMIT 1',
+    scope != null ? [req.params.id, scope] : [req.params.id]);
+  const row = (rows as any[])[0];
+  if (!row) return res.status(404).json({ message: 'Installment not found' });
+  // A delivery's deduction is changed or removed on the delivery; deleting it here
+  // would leave the delivery saying the farmer was paid less than they were.
+  if (row.purchasing_id) {
+    return res.status(422).json({ message: 'Potongan setoran diubah atau dihapus lewat Purchasing-nya.' });
+  }
+  await pool.query('DELETE FROM pre_finance_installments WHERE id = ?', [row.id]);
   return res.json({ message: 'Installment deleted' });
+ } catch (err: any) { return res.status(500).json({ message: 'Server error', error: err.message }); }
+});
+
+// -----------------------------------------------------------------------------
+// Payback rates  /api/pre-finance/payback-rates
+// Rupiah per kilo deducted from a pre-finance delivery — the ledger's
+// `AML - Purchase Price Database`.
+// -----------------------------------------------------------------------------
+export const paybackRatesRouter = Router();
+
+// A rate decides how much is taken from every delivery a farmer makes, so it is
+// set by the same roles that see the Pre-Finance screens — enforced here, not
+// only by hiding the menu. Super Admin is the usual break-glass.
+const RATE_WRITERS = [
+  ROLE.PROCUREMENT, ROLE.PROJECT_MANAGER, ROLE.FINANCE_MANAGER, ROLE.DIRECTOR, ROLE.SUPER_ADMIN,
+];
+
+const RATE_SELECT = `
+  SELECT r.*, pl.plot_name, pl.scheme, f.id AS farmer_id, f.farmer_name, g.grade_name,
+         r.saprodi_per_kg + r.labor_per_kg AS total_per_kg,
+         IF(r.full_price IS NULL, NULL, r.full_price - r.saprodi_per_kg - r.labor_per_kg) AS final_price
+  FROM payback_rates r
+  JOIN plot pl          ON pl.id = r.plot_id
+  LEFT JOIN farmers f   ON f.id = pl.farmer_id
+  LEFT JOIN grade g     ON g.id = r.grade_id
+`;
+
+// GET /preview?plot_id=&grade_id=&date=&quantity=&purchasing_id=
+// What a delivery would deduct — the purchasing form shows this before saving.
+// `purchasing_id` leaves that delivery's own current deduction out of the
+// outstanding, so editing a delivery does not count its deduction against itself.
+paybackRatesRouter.get('/preview', authenticate, async (req: Request, res: Response) => {
+  try {
+    const num = (v: any) => (v != null && v !== '' ? Number(v) : null);
+    const s = await suggestRepayment(pool, {
+      plotId: num(req.query.plot_id), gradeId: num(req.query.grade_id),
+      date: String(req.query.date || '').slice(0, 10), quantity: Number(req.query.quantity || 0),
+      excludePurchasingId: num(req.query.purchasing_id),
+    });
+    return res.json({ data: s });
+  } catch (err: any) {
+    return res.status(500).json({ message: 'Server error', error: err.message });
+  }
+});
+
+paybackRatesRouter.get('/', authenticate, async (req: Request, res: Response) => {
+  const where: string[] = [];
+  const args: any[] = [];
+  if (req.query.plot_id) { where.push('r.plot_id = ?'); args.push(req.query.plot_id); }
+  if (req.query.farmer_id) { where.push('pl.farmer_id = ?'); args.push(req.query.farmer_id); }
+  if (req.query.search) {
+    where.push('(pl.plot_name LIKE ? OR f.farmer_name LIKE ?)');
+    const q = `%${req.query.search}%`;
+    args.push(q, q);
+  }
+  const scope = entityScope(req);
+  if (scope != null) { where.push(farmerEntityPredicate('pl.farmer_id')); args.push(scope); }
+  const sql = RATE_SELECT + (where.length ? ` WHERE ${where.join(' AND ')}` : '')
+    + ' ORDER BY pl.plot_name, r.effective_date DESC, g.grade_name';
+  return respondList(req, res, sql, args);
+});
+
+function rateCols(b: any) {
+  const num = (v: any) => (v != null && v !== '' ? Number(v) : null);
+  return {
+    plot_id: num(b.plot_id),
+    grade_id: num(b.grade_id),
+    effective_date: b.effective_date ? String(b.effective_date).slice(0, 10) : null,
+    full_price: num(b.full_price),
+    saprodi_per_kg: num(b.saprodi_per_kg) ?? 0,
+    labor_per_kg: num(b.labor_per_kg) ?? 0,
+    notes: b.notes || null,
+  };
+}
+
+function rateInvalid(c: ReturnType<typeof rateCols>): string | null {
+  if (!c.plot_id || !c.effective_date) return 'plot_id and effective_date are required';
+  if (c.saprodi_per_kg < 0 || c.labor_per_kg < 0) return 'Rates cannot be negative';
+  if (c.full_price != null && c.saprodi_per_kg + c.labor_per_kg > c.full_price) {
+    return 'Total payback per kg cannot exceed the full price';
+  }
+  return null;
+}
+
+/** Only a farmer's plot in the caller's own PT may be given a rate. */
+async function plotInScope(req: Request, plotId: number): Promise<boolean> {
+  const scope = entityScope(req);
+  if (scope == null) return true;
+  const [r] = await pool.query(
+    `SELECT pl.id FROM plot pl WHERE pl.id = ? AND ${farmerEntityPredicate('pl.farmer_id')} LIMIT 1`, [plotId, scope]);
+  return (r as any[]).length > 0;
+}
+
+paybackRatesRouter.post('/', authenticate, requireRole(...RATE_WRITERS), async (req: Request, res: Response) => {
+  try {
+    const c = rateCols(req.body || {});
+    const bad = rateInvalid(c);
+    if (bad) return res.status(422).json({ message: bad });
+    if (!(await plotInScope(req, c.plot_id!))) return res.status(404).json({ message: 'Plot not found' });
+    const [r] = await pool.query(
+      `INSERT INTO payback_rates (plot_id, grade_id, effective_date, full_price, saprodi_per_kg, labor_per_kg, notes, created_at, updated_at)
+       VALUES (?,?,?,?,?,?,?,NOW(),NOW())`,
+      [c.plot_id, c.grade_id, c.effective_date, c.full_price, c.saprodi_per_kg, c.labor_per_kg, c.notes]);
+    const [rows] = await pool.query(RATE_SELECT + ' WHERE r.id = ?', [(r as any).insertId]);
+    return res.status(201).json({ message: 'Payback rate created', data: (rows as any[])[0] });
+  } catch (err: any) {
+    if (err.code === 'ER_DUP_ENTRY') return res.status(422).json({ message: 'Plot ini sudah punya tarif untuk tanggal dan grade yang sama' });
+    return res.status(500).json({ message: 'Server error', error: err.message });
+  }
+});
+
+// A rate change applies to deliveries saved from now on. Deliveries already
+// booked keep their deduction: it is what the farmer was actually paid.
+paybackRatesRouter.put('/:id', authenticate, requireRole(...RATE_WRITERS), async (req: Request, res: Response) => {
+  try {
+    const [ex] = await pool.query('SELECT * FROM payback_rates WHERE id = ? LIMIT 1', [req.params.id]);
+    const cur = (ex as any[])[0];
+    if (!cur || !(await plotInScope(req, cur.plot_id))) return res.status(404).json({ message: 'Payback rate not found' });
+    const c = rateCols({ ...cur, ...(req.body || {}) });
+    const bad = rateInvalid(c);
+    if (bad) return res.status(422).json({ message: bad });
+    if (!(await plotInScope(req, c.plot_id!))) return res.status(404).json({ message: 'Plot not found' });
+    await pool.query(
+      `UPDATE payback_rates SET plot_id = ?, grade_id = ?, effective_date = ?, full_price = ?, saprodi_per_kg = ?,
+              labor_per_kg = ?, notes = ?, updated_at = NOW() WHERE id = ?`,
+      [c.plot_id, c.grade_id, c.effective_date, c.full_price, c.saprodi_per_kg, c.labor_per_kg, c.notes, req.params.id]);
+    const [rows] = await pool.query(RATE_SELECT + ' WHERE r.id = ?', [req.params.id]);
+    return res.json({ message: 'Payback rate updated', data: (rows as any[])[0] });
+  } catch (err: any) {
+    if (err.code === 'ER_DUP_ENTRY') return res.status(422).json({ message: 'Plot ini sudah punya tarif untuk tanggal dan grade yang sama' });
+    return res.status(500).json({ message: 'Server error', error: err.message });
+  }
+});
+
+paybackRatesRouter.delete('/:id', authenticate, requireRole(...RATE_WRITERS), async (req: Request, res: Response) => {
+  try {
+    const [ex] = await pool.query('SELECT plot_id FROM payback_rates WHERE id = ? LIMIT 1', [req.params.id]);
+    const cur = (ex as any[])[0];
+    if (!cur || !(await plotInScope(req, cur.plot_id))) return res.status(404).json({ message: 'Payback rate not found' });
+    await pool.query('DELETE FROM payback_rates WHERE id = ?', [req.params.id]);
+    return res.json({ message: 'Payback rate deleted' });
+  } catch (err: any) {
+    return res.status(500).json({ message: 'Server error', error: err.message });
+  }
 });
 
 // -----------------------------------------------------------------------------

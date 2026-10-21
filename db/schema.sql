@@ -993,7 +993,12 @@ CREATE TABLE `pre_finance_installments` (
   `notes`             TEXT NULL,
   `created_at`        DATETIME NULL,
   `updated_at`        DATETIME NULL,
-  CONSTRAINT `fk_pfi_purchasing` FOREIGN KEY (`purchasing_id`)     REFERENCES `purchasing`(`id`) ON DELETE SET NULL,
+  -- A repayment with a purchasing is the deduction taken from that delivery
+  -- (AML ledger: `Repayment Farmer Loan`). One delivery, one deduction — and it
+  -- goes with the delivery: a deleted delivery was never paid out, so nothing was
+  -- deducted from it either. NULL is a cash repayment made outside a delivery.
+  UNIQUE KEY `uq_pfi_purchasing` (`purchasing_id`),
+  CONSTRAINT `fk_pfi_purchasing` FOREIGN KEY (`purchasing_id`)     REFERENCES `purchasing`(`id`) ON DELETE CASCADE,
   CONSTRAINT `fk_pfi_farmer`     FOREIGN KEY (`farmer_id`)         REFERENCES `farmers`(`id`) ON DELETE CASCADE,
   CONSTRAINT `fk_pfi_method`     FOREIGN KEY (`payment_method_id`) REFERENCES `payment_methods`(`id`) ON DELETE SET NULL
 ) ENGINE=InnoDB;
@@ -1006,6 +1011,33 @@ CREATE TABLE `pre_finance_installment_details` (
   CONSTRAINT `fk_pfid_installment` FOREIGN KEY (`installment_id`)      REFERENCES `pre_finance_installments`(`id`) ON DELETE CASCADE,
   CONSTRAINT `fk_pfid_type`        FOREIGN KEY (`pre_finance_type_id`) REFERENCES `pre_finance_types`(`id`),
   UNIQUE KEY `uq_installment_type` (`installment_id`, `pre_finance_type_id`)
+) ENGINE=InnoDB;
+
+-- Rupiah per kilo deducted from a pre-finance farmer's delivery to pay back the
+-- loan — the ledger's `AML - Purchase Price Database`. A rate holds from its
+-- `effective_date` until the plot's next one. `grade_id` NULL applies to every
+-- grade; a graded row (the ledger's `-OGA`/`-OGB`… plot suffixes) wins over it
+-- on the same date.
+--
+-- `full_price` is what a kilo is worth before the deduction. The purchase itself
+-- keeps the FINAL price (full − payback), as every imported delivery already does,
+-- so purchasing value + repayment = what the company spent on the fruit.
+CREATE TABLE `payback_rates` (
+  `id`             INT AUTO_INCREMENT PRIMARY KEY,
+  `plot_id`        INT NOT NULL,
+  `grade_id`       INT NULL,
+  `effective_date` DATE NOT NULL,
+  `full_price`     DECIMAL(15,2) NULL,
+  `saprodi_per_kg` DECIMAL(15,2) NOT NULL DEFAULT 0,
+  `labor_per_kg`   DECIMAL(15,2) NOT NULL DEFAULT 0,
+  `notes`          VARCHAR(255) NULL,
+  `created_at`     DATETIME NULL,
+  `updated_at`     DATETIME NULL,
+  CONSTRAINT `fk_pbr_plot`  FOREIGN KEY (`plot_id`)  REFERENCES `plot`(`id`) ON DELETE CASCADE,
+  -- RESTRICT: a graded rate whose grade vanished would silently start applying
+  -- to every grade.
+  CONSTRAINT `fk_pbr_grade` FOREIGN KEY (`grade_id`) REFERENCES `grade`(`id`) ON DELETE RESTRICT,
+  UNIQUE KEY `uq_payback_rate` (`plot_id`, `grade_id`, `effective_date`)
 ) ENGINE=InnoDB;
 
 -- -----------------------------------------------------------------------------

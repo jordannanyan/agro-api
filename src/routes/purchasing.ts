@@ -6,6 +6,9 @@ import { compressImages } from '../services/imageProcessor';
 import { entityScope } from '../utils/entityScope';
 import { ENTITY_COL, purchasingScope } from '../utils/farmScope';
 import { respondList } from '../utils/pagination';
+import {
+  RepaymentError, parseRepaymentBody, syncPurchasingRepayment, loadPurchasingRepayment, RepaymentResult,
+} from '../utils/repayment';
 
 export const router = Router();
 
@@ -26,8 +29,14 @@ const SELECT = `
          c.commodities_name AS commodity__commodities_name,
          g.grade_name AS grade__grade_name,
          w.warehouse_name AS warehouse__warehouse_name,
-         COALESCE(pl.scheme, 'BeliPutus') AS scheme
+         COALESCE(pl.scheme, 'BeliPutus') AS scheme,
+         -- The loan repayment deducted from this delivery (pre-finance only), and
+         -- so what actually reached the farmer.
+         COALESCE(ri.total_payment, 0) AS repayment_total,
+         ri.id AS installment_id,
+         p.total_value - COALESCE(ri.total_payment, 0) AS net_payment
   FROM purchasing p
+  LEFT JOIN pre_finance_installments ri ON ri.purchasing_id = p.id
   LEFT JOIN plot pl        ON pl.id = p.plot_id
   LEFT JOIN farmers f      ON f.id = pl.farmer_id
   LEFT JOIN collectors col ON col.id = p.collector_id
@@ -82,7 +91,8 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
   const sql = SELECT + purchasingScope('p')
     + (where.length ? ` WHERE ${where.join(' AND ')}` : '') + ' ORDER BY p.date DESC, p.id DESC';
   return respondList(req, res, sql, args, shape,
-    'COALESCE(SUM(quantity),0) AS quantity, COALESCE(SUM(total_value),0) AS total_value');
+    'COALESCE(SUM(quantity),0) AS quantity, COALESCE(SUM(total_value),0) AS total_value, '
+    + 'COALESCE(SUM(repayment_total),0) AS repayment_total');
 });
 
 // GET /api/purchasing/:id
@@ -94,11 +104,22 @@ router.get('/:id', authenticate, async (req: Request, res: Response) => {
   const [rows] = await pool.query(sql, scope != null ? [req.params.id, scope] : [req.params.id]);
   const list = rows as any[];
   if (!list.length) return res.status(404).json({ message: 'Purchasing not found' });
-  return res.json({ data: shape(list[0]) });
+  const data = shape(list[0]);
+  data.repayment = await loadPurchasingRepayment(pool, Number(req.params.id));
+  return res.json({ data });
 });
+
+/** A short note for the caller when the deduction is not what the rate alone says. */
+function repaymentNote(r: RepaymentResult | null): string | undefined {
+  if (!r) return undefined;
+  if (r.no_rate) return 'Plot Pre-Finance ini belum punya tarif potongan — tidak ada cicilan yang dipotong.';
+  if (r.capped) return 'Potongan dibatasi sisa utang petani.';
+  return undefined;
+}
 
 // POST /api/purchasing
 router.post('/', authenticate, files, async (req: Request, res: Response) => {
+  const conn = await pool.getConnection();
   try {
     const b = req.body || {};
     const f = req.files as Record<string, Express.Multer.File[]> | undefined;
@@ -116,6 +137,8 @@ router.post('/', authenticate, files, async (req: Request, res: Response) => {
     const price = scheme === 'ProfitSharing'
       ? 0
       : (b.price_per_unit != null ? Number(b.price_per_unit) : 0);
+
+    const repaymentMode = parseRepaymentBody(b.repayment);
 
     await compressImages([f?.invoice_file?.[0]?.path, f?.payment_proof?.[0]?.path]);
 
@@ -138,24 +161,44 @@ router.post('/', authenticate, files, async (req: Request, res: Response) => {
       updated_at: new Date(),
     };
     const keys = Object.keys(cols);
-    const [result] = await pool.query(
+    // The delivery and the loan repayment deducted from it are one event: both
+    // are written, or neither is.
+    await conn.beginTransaction();
+    const [result] = await conn.query(
       `INSERT INTO purchasing (${keys.map((k) => `\`${k}\``).join(',')}) VALUES (${keys.map(() => '?').join(',')})`,
       keys.map((k) => cols[k])
     );
-    const [rows] = await pool.query(SELECT + ' WHERE p.id = ? LIMIT 1', [(result as any).insertId]);
-    return res.status(201).json({ message: 'Purchasing created', data: shape((rows as any[])[0]) });
+    const newId = (result as any).insertId;
+    const rep = await syncPurchasingRepayment(conn, newId, repaymentMode);
+    await conn.commit();
+    const [rows] = await pool.query(SELECT + ' WHERE p.id = ? LIMIT 1', [newId]);
+    const data = shape((rows as any[])[0]);
+    data.repayment = await loadPurchasingRepayment(pool, newId);
+    return res.status(201).json({ message: 'Purchasing created', data, repayment_note: repaymentNote(rep) });
   } catch (err: any) {
+    await conn.rollback().catch(() => {});
+    if (err instanceof RepaymentError) return res.status(err.status).json({ message: err.message });
     return res.status(500).json({ message: 'Server error', error: err.message });
+  } finally {
+    conn.release();
   }
 });
 
 // PUT /api/purchasing/:id
 const update = async (req: Request, res: Response) => {
+  const conn = await pool.getConnection();
   try {
     const id = req.params.id;
-    const [ex] = await pool.query('SELECT id, plot_id FROM purchasing WHERE id = ? LIMIT 1', [id]);
+    const [ex] = await pool.query(
+      'SELECT id, plot_id, grade_id, date, quantity, supplier_type FROM purchasing WHERE id = ? LIMIT 1', [id]);
     if (!(ex as any[]).length) return res.status(404).json({ message: 'Purchasing not found' });
+    const before = (ex as any[])[0];
     const b = req.body || {};
+    // Sent explicitly -> exactly that. Not sent -> recomputed from the rate, but only
+    // when something the rate depends on changed, so an edit to the invoice number
+    // does not overwrite a deduction someone adjusted by hand.
+    const explicitRepayment = b.repayment !== undefined && b.repayment !== '';
+    const repaymentMode = parseRepaymentBody(b.repayment);
     const f = req.files as Record<string, Express.Multer.File[]> | undefined;
     if (b.payment_status && !PAYMENT_STATUSES.includes(b.payment_status)) return res.status(422).json({ message: 'Invalid payment_status' });
 
@@ -189,14 +232,40 @@ const update = async (req: Request, res: Response) => {
     if (f?.payment_proof?.[0]) updates.payment_proof = fileToPath(f.payment_proof[0]);
 
     const keys = Object.keys(updates);
+    const changed = (k: string, cur: any, norm: (v: any) => any = (v) => v) =>
+      k in updates && norm(updates[k]) !== norm(cur);
+    const drivesRate =
+      changed('plot_id', before.plot_id, (v) => (v == null ? null : Number(v)))
+      || changed('grade_id', before.grade_id, (v) => (v == null ? null : Number(v)))
+      || changed('quantity', before.quantity, (v) => Number(v))
+      || changed('date', before.date, (v) => String(v).slice(0, 10))
+      || changed('supplier_type', before.supplier_type);
+
+    await conn.beginTransaction();
     if (keys.length) {
       updates.updated_at = new Date(); keys.push('updated_at');
-      await pool.query(`UPDATE purchasing SET ${keys.map((k) => `\`${k}\` = ?`).join(', ')} WHERE id = ?`, [...keys.map((k) => updates[k]), id]);
+      await conn.query(`UPDATE purchasing SET ${keys.map((k) => `\`${k}\` = ?`).join(', ')} WHERE id = ?`, [...keys.map((k) => updates[k]), id]);
     }
+    let rep: RepaymentResult | null = null;
+    if (explicitRepayment || drivesRate) {
+      rep = await syncPurchasingRepayment(conn, Number(id), repaymentMode);
+    } else if ('receipt_invoice' in updates) {
+      // The deduction's reference is the delivery's receipt; keep them in step.
+      await conn.query(
+        'UPDATE pre_finance_installments SET reference_no = ?, updated_at = NOW() WHERE purchasing_id = ?',
+        [updates.receipt_invoice || null, id]);
+    }
+    await conn.commit();
     const [rows] = await pool.query(SELECT + ' WHERE p.id = ? LIMIT 1', [id]);
-    return res.json({ message: 'Purchasing updated', data: shape((rows as any[])[0]) });
+    const data = shape((rows as any[])[0]);
+    data.repayment = await loadPurchasingRepayment(pool, Number(id));
+    return res.json({ message: 'Purchasing updated', data, repayment_note: repaymentNote(rep) });
   } catch (err: any) {
+    await conn.rollback().catch(() => {});
+    if (err instanceof RepaymentError) return res.status(err.status).json({ message: err.message });
     return res.status(500).json({ message: 'Server error', error: err.message });
+  } finally {
+    conn.release();
   }
 };
 router.put('/:id', authenticate, files, update);
@@ -207,6 +276,8 @@ router.post('/:id', authenticate, files, (req, res) => {
 
 // DELETE /api/purchasing/:id
 router.delete('/:id', authenticate, async (req: Request, res: Response) => {
+  // The loan repayment deducted from this delivery goes with it (FK CASCADE): a
+  // delivery that never happened deducted nothing, so the debt comes back.
   const [result] = await pool.query('DELETE FROM purchasing WHERE id = ?', [req.params.id]);
   if (!(result as any).affectedRows) return res.status(404).json({ message: 'Purchasing not found' });
   return res.json({ message: 'Purchasing deleted' });
