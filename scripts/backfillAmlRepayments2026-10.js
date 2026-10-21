@@ -108,6 +108,18 @@ async function readLedger(file) {
   const [types] = await conn.query("SELECT id, type_name FROM pre_finance_types WHERE type_name IN ('Saprodi','Labor')");
   const typeId = Object.fromEntries(types.map((t) => [t.type_name, t.id]));
 
+  // `GE007002-OGA` = plot GE007002, grade A (same reading as the rates importer);
+  // a plot that really has the suffix in its name is matched as itself.
+  const GRADE_SUFFIX = { OGA: 'A', OGB: 'B', OGC: 'C', OGNG: 'Non-Grade' };
+  const [plotRows] = await conn.query('SELECT UPPER(TRIM(plot_name)) AS n FROM plot');
+  const plotNames = new Set(plotRows.map((p) => p.n));
+  const resolve = (code) => {
+    const up = code.toUpperCase();
+    const m = up.match(/^(.+)-(OGA|OGB|OGC|OGNG)$/);
+    if (!plotNames.has(up) && m && plotNames.has(m[1])) return { plot: m[1], grade: GRADE_SUFFIX[m[2]] };
+    return { plot: up, grade: null };
+  };
+
   const stats = { matched: 0, already: 0, none: 0, many: 0, noRate: 0, differs: 0, booked: 0, amount: 0 };
   const perFarmer = new Map();
   const problems = [];
@@ -122,8 +134,9 @@ async function readLedger(file) {
        FROM purchasing pu
        JOIN plot pl ON pl.id = pu.plot_id
        LEFT JOIN farmers f ON f.id = pl.farmer_id
-       WHERE UPPER(pl.plot_name) = UPPER(?) AND pu.date = ? AND ABS(pu.quantity - ?) < 0.0005`,
-      [r.plot, r.date, r.qty]);
+       WHERE UPPER(TRIM(pl.plot_name)) = ? AND pu.date = ? AND ABS(pu.quantity - ?) < 0.0005
+         AND (? IS NULL OR pu.grade_id = (SELECT id FROM grade WHERE grade_name = ?))`,
+      [resolve(r.plot).plot, r.date, r.qty, resolve(r.plot).grade, resolve(r.plot).grade]);
     if (!cands.length) { problems.push(`${tag}: tidak ada purchasing yang cocok`); stats.none++; continue; }
     // Same plot, day and kilos twice: either a duplicate import or two genuine
     // deliveries. Take the ones without a deduction yet, oldest first, one per
