@@ -21,6 +21,12 @@
 // dianjurkan di layar, karena "sekali sebulan" yang boleh dilanggar diam-diam
 // bukan jadwal, cuma niat.
 //
+// Menyesuaikan stok butuh persetujuan PM (2026-10-22). Petugas gudang mencatat
+// hitungan (Draft), lalu MENGAJUKAN penyesuaian; Project Manager PT pemilik gudang
+// menyetujui — dan saat itulah stok disesuaikan — atau menolak dengan alasan.
+// Tidak ada jalan lain ke penyesuaian: POST /:id/apply yang dulu bisa dipanggil
+// siapa saja kini menolak dan menunjuk ke alur ini.
+//
 // Lampiran opsional — lembar hitung bertanda tangan atau foto rak, kalau ada.
 // Sengaja tidak diwajibkan (permintaan 2026-09-29, "untuk sekarang"), tidak seperti
 // Stock In dan Stock Out yang justru wajib.
@@ -29,6 +35,8 @@ import { Router, Request, Response } from 'express';
 import pool from '../db/connection';
 import { authenticate } from '../middleware/auth';
 import { nextDocNumber } from '../utils/docNumber';
+import { ROLE } from '../utils/roles';
+import { notifyRoles, notifyUsers } from '../utils/notify';
 import { entityScope } from '../utils/entityScope';
 import { warehouseEntityPredicate } from '../utils/farmScope';
 import { respondList } from '../utils/pagination';
@@ -40,6 +48,7 @@ export const OPNAME_INTERVAL_DAYS = 30;
 
 const SELECT = `
   SELECT o.*, w.warehouse_name, u.name AS counted_by_name, ua.name AS applied_by_name,
+         us.name AS submitted_by_name, ur.name AS reviewed_by_name,
          ent.id AS entity_id, ent.entities_name AS entity_name,
          (SELECT COUNT(*) FROM stock_opname_items i WHERE i.stock_opname_id = o.id) AS line_count,
          (SELECT COUNT(*) FROM stock_opname_items i
@@ -52,6 +61,8 @@ const SELECT = `
   LEFT JOIN entities ent ON ent.id = wk.entities_id
   LEFT JOIN users u      ON u.id = o.counted_by_user_id
   LEFT JOIN users ua     ON ua.id = o.applied_by_user_id
+  LEFT JOIN users us     ON us.id = o.submitted_by_user_id
+  LEFT JOIN users ur     ON ur.id = o.reviewed_by_user_id
 `;
 
 const LINE_SELECT = `
@@ -188,6 +199,7 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
     if (req.query.from) { where.push('o.opname_date >= ?'); args.push(req.query.from); }
     if (req.query.to) { where.push('o.opname_date <= ?'); args.push(req.query.to); }
     if (req.query.search) { where.push('o.opname_number LIKE ?'); args.push(`%${req.query.search}%`); }
+    if (req.query.approval_status) { where.push('o.approval_status = ?'); args.push(String(req.query.approval_status)); }
     const sql = SELECT + (where.length ? ` WHERE ${where.join(' AND ')}` : '')
       + ' ORDER BY o.opname_date DESC, o.id DESC';
     return await respondList(req, res, sql, args);
@@ -356,6 +368,13 @@ router.put('/:id', authenticate, async (req: Request, res: Response) => {
           + 'diubah lagi — angka stok sekarang bersandar padanya.',
       });
     }
+    // PM menyetujui apa yang diajukan; isinya tidak boleh bergeser di bawahnya.
+    if (prev.approval_status === 'Pending') {
+      return res.status(409).json({
+        message: 'Opname ini sedang menunggu persetujuan PM dan tidak bisa diubah. '
+          + 'Minta PM menolaknya bila ada yang perlu dibetulkan.',
+      });
+    }
 
     const b = req.body || {};
     await conn.beginTransaction();
@@ -383,87 +402,201 @@ router.put('/:id', authenticate, async (req: Request, res: Response) => {
   }
 });
 
-// POST /api/stock-opname/:id/apply
-//
-// Memakai hasil hitungan untuk membetulkan catatan stok. Opsional, dan harus
-// diminta: keadaan bakunya tetap "dicatat saja".
-//
-// Penyesuaiannya tidak menimpa apa pun. Ia jadi suku ketiga di v_saprodi_stock
-// (masuk - keluar + penyesuaian), dan setiap angkanya menunjuk balik ke baris
-// opname yang menyebabkannya. Jadi stok tetap punya dokumen untuk setiap
-// perubahannya - yang justru alasan opname semula dibuat tanpa efek samping.
-//
-// Yang disimpan adalah (fisik - sisa SAAT DITERAPKAN), bukan (fisik - system_qty)
-// yang tercatat di baris. Keduanya biasanya sama, tapi barang bisa bergerak antara
-// dihitung dan diterapkan, dan yang harus benar adalah hasil akhirnya: sesudah ini
-// sisa = angka fisik.
-router.post('/:id/apply', authenticate, async (req: Request, res: Response) => {
+/**
+ * Pakai hasil hitungan untuk membetulkan catatan stok — dipanggil HANYA dari
+ * persetujuan PM, di dalam transaksinya.
+ *
+ * Penyesuaiannya tidak menimpa apa pun. Ia jadi suku ketiga di v_saprodi_stock
+ * (masuk - keluar + penyesuaian), dan setiap angkanya menunjuk balik ke baris
+ * opname yang menyebabkannya.
+ *
+ * Yang disimpan adalah (fisik - sisa SAAT DITERAPKAN), bukan (fisik - system_qty)
+ * yang tercatat di baris. Keduanya biasanya sama, tapi barang bisa bergerak antara
+ * dihitung dan disetujui, dan yang harus benar adalah hasil akhirnya: sesudah ini
+ * sisa = angka fisik.
+ */
+async function applyOpname(conn: any, opname: any, userId: number | null) {
+  const [lineRows] = await conn.query(
+    'SELECT id, sapropdi_id, counted_qty FROM stock_opname_items WHERE stock_opname_id = ?', [opname.id]);
+  const lines = lineRows as any[];
+  const [curRows] = await conn.query(
+    'SELECT sapropdi_id, COALESCE(remaining, 0) AS remaining FROM v_saprodi_stock WHERE warehouse_id = ?',
+    [opname.warehouse_id]);
+  const current = new Map<number, number>();
+  for (const r of curRows as any[]) current.set(Number(r.sapropdi_id), Number(r.remaining));
+
+  let moved = 0;
+  for (const l of lines) {
+    const before = current.get(Number(l.sapropdi_id)) ?? 0;
+    const adj = Number(l.counted_qty) - before;
+    await conn.query(
+      'UPDATE stock_opname_items SET adjustment = ?, updated_at = NOW() WHERE id = ?', [adj, l.id]);
+    if (adj !== 0) moved++;
+  }
+  await conn.query(
+    'UPDATE stock_opname SET applied_at = NOW(), applied_by_user_id = ?, updated_at = NOW() WHERE id = ?',
+    [userId, opname.id]);
+  return { moved, total: lines.length };
+}
+
+const uid = (req: Request) => (req.user?.type === 'User' ? req.user.id : null);
+
+async function logActivity(conn: any, id: number, action: string, userId: number | null, note: string | null) {
+  await conn.query(
+    "INSERT INTO document_activities (document_type, document_id, action, user_id, note, created_at)"
+    + " VALUES ('StockOpname', ?, ?, ?, ?, NOW())", [id, action, userId, note]);
+}
+
+async function reload(id: number) {
+  const [rows] = await pool.query(SELECT + ' WHERE o.id = ? LIMIT 1', [id]);
+  const data = (rows as any[])[0];
+  const [out] = await pool.query(LINE_SELECT, [id]);
+  data.lines = out;
+  return data;
+}
+
+/**
+ * Boleh menyetujui/menolak opname ini? Project Manager PT pemilik gudangnya —
+ * peran tanpa lintas-entitas wajib satu PT dengan dokumennya, sama seperti rantai
+ * approval PR/PO (jebakan no. 3). Super Admin tetap jalan darurat.
+ */
+function mayReview(req: Request, opname: any): boolean {
+  const u = req.user;
+  if (!u || u.type !== 'User') return false;
+  if (u.roleCode === ROLE.SUPER_ADMIN) return true;
+  if (u.roleCode !== ROLE.PROJECT_MANAGER) return false;
+  return !!u.roleCrossEntity || Number(u.entityId) === Number(opname.entity_id);
+}
+
+// POST /api/stock-opname/:id/apply — jalan lama, sekarang ditutup.
+router.post('/:id/apply', authenticate, (_req: Request, res: Response) => res.status(403).json({
+  message: 'Penyesuaian stok dari opname sekarang butuh persetujuan Project Manager. '
+    + 'Ajukan opname ini (POST /:id/submit); stok disesuaikan saat PM menyetujuinya.',
+}));
+
+// POST /api/stock-opname/:id/submit — ajukan penyesuaian ke PM.
+router.post('/:id/submit', authenticate, async (req: Request, res: Response) => {
+  try {
+    const id = Number(req.params.id);
+    const prev = await scopedOpname(req, id);
+    if (!prev) return res.status(404).json({ message: 'Stok opname tidak ditemukan' });
+    if (prev.applied_at || prev.approval_status === 'Approved') {
+      return res.status(409).json({ message: 'Opname ini sudah disetujui dan stoknya sudah disesuaikan.' });
+    }
+    if (prev.approval_status === 'Pending') {
+      return res.status(409).json({ message: 'Opname ini sudah diajukan dan sedang menunggu PM.' });
+    }
+    if (!Number(prev.variance_lines)) {
+      return res.status(422).json({
+        message: 'Tidak ada selisih antara catatan dan hitungan fisik — tidak ada yang perlu disesuaikan.',
+      });
+    }
+    await pool.query(
+      `UPDATE stock_opname SET approval_status = 'Pending', submitted_by_user_id = ?, submitted_at = NOW(),
+              reviewed_by_user_id = NULL, reviewed_at = NULL, updated_at = NOW() WHERE id = ?`,
+      [uid(req), id]);
+    await logActivity(pool, id, 'Diajukan ke PM untuk penyesuaian stok', uid(req),
+      `${prev.variance_lines} barang berselisih`);
+    await notifyRoles([ROLE.PROJECT_MANAGER], prev.entity_id ?? null, {
+      kind: 'opname_submitted',
+      title: `Stok opname ${prev.opname_number} menunggu persetujuan Anda`,
+      body: `${prev.warehouse_name || 'Gudang'} · ${prev.variance_lines} barang berselisih — `
+        + 'stok disesuaikan setelah Anda setujui.',
+      documentType: 'StockOpname', documentId: id, link: `/warehouse/opname/${id}`,
+    }, { exceptUserId: uid(req) });
+    return res.json({ message: 'Opname diajukan ke PM', data: await reload(id) });
+  } catch (err: any) {
+    return res.status(500).json({ message: 'Server error', error: err.message });
+  }
+});
+
+// POST /api/stock-opname/:id/approve — PM setuju; stok disesuaikan saat itu juga.
+router.post('/:id/approve', authenticate, async (req: Request, res: Response) => {
   const conn = await pool.getConnection();
   try {
     const id = Number(req.params.id);
     const prev = await scopedOpname(req, id);
-    if (!prev) { return res.status(404).json({ message: 'Stok opname tidak ditemukan' }); }
-    if (prev.applied_at) {
-      return res.status(409).json({
-        message: 'Opname ini sudah dipakai untuk menyesuaikan stok pada '
-          + String(prev.applied_at).slice(0, 19).replace('T', ' ') + '.',
+    if (!prev) return res.status(404).json({ message: 'Stok opname tidak ditemukan' });
+    if (!mayReview(req, prev)) {
+      return res.status(403).json({
+        message: 'Hanya Project Manager PT pemilik gudang ini yang bisa menyetujui penyesuaian stok.',
       });
     }
-
-    const [lineRows] = await pool.query(
-      'SELECT id, sapropdi_id, counted_qty FROM stock_opname_items WHERE stock_opname_id = ?', [id]);
-    const lines = lineRows as any[];
-    if (!lines.length) {
-      return res.status(422).json({ message: 'Opname ini tidak punya baris untuk diterapkan.' });
+    if (prev.approval_status !== 'Pending' || prev.applied_at) {
+      return res.status(409).json({ message: 'Opname ini tidak sedang menunggu persetujuan.' });
     }
+    const note = req.body?.note ? String(req.body.note).slice(0, 1000) : null;
 
     await conn.beginTransaction();
-
-    // Sisa saat ini, dibaca dari view yang sama dengan yang dilihat orang. Opname
-    // ini belum diterapkan, jadi angkanya belum memuat dirinya sendiri.
-    const [curRows] = await conn.query(
-      'SELECT sapropdi_id, COALESCE(remaining, 0) AS remaining FROM v_saprodi_stock WHERE warehouse_id = ?',
-      [prev.warehouse_id]);
-    const current = new Map<number, number>();
-    for (const r of curRows as any[]) current.set(Number(r.sapropdi_id), Number(r.remaining));
-
-    let moved = 0;
-    for (const l of lines) {
-      const before = current.get(Number(l.sapropdi_id)) ?? 0;
-      const adj = Number(l.counted_qty) - before;
-      await conn.query(
-        'UPDATE stock_opname_items SET adjustment = ?, updated_at = NOW() WHERE id = ?', [adj, l.id]);
-      if (adj !== 0) moved++;
+    // Dikunci supaya dua klik (atau dua PM) tidak menerapkan penyesuaian dua kali.
+    const [lock] = await conn.query(
+      'SELECT approval_status, applied_at FROM stock_opname WHERE id = ? FOR UPDATE', [id]);
+    const cur = (lock as any[])[0];
+    if (!cur || cur.approval_status !== 'Pending' || cur.applied_at) {
+      await conn.rollback();
+      return res.status(409).json({ message: 'Opname ini tidak sedang menunggu persetujuan.' });
     }
+    const r = await applyOpname(conn, prev, uid(req));
     await conn.query(
-      'UPDATE stock_opname SET applied_at = NOW(), applied_by_user_id = ?, updated_at = NOW() WHERE id = ?',
-      [req.user?.type === 'User' ? req.user.id : null, id]);
-
-    // Jejaknya ikut ditulis: sesudah ini angka stok berubah, dan harus ada yang
-    // bisa menjawab kapan dan oleh siapa tanpa membaca kolom.
-    await conn.query(
-      "INSERT INTO document_activities (document_type, document_id, action, user_id, note, created_at)"
-      + " VALUES ('StockOpname', ?, 'Stok disesuaikan dari opname', ?, ?, NOW())",
-      [id, req.user?.type === 'User' ? req.user.id : null,
-       moved + ' dari ' + lines.length + ' barang berubah angkanya']);
-
+      `UPDATE stock_opname SET approval_status = 'Approved', reviewed_by_user_id = ?, reviewed_at = NOW(),
+              review_note = ?, updated_at = NOW() WHERE id = ?`, [uid(req), note, id]);
+    await logActivity(conn, id, 'Disetujui PM — stok disesuaikan', uid(req),
+      `${r.moved} dari ${r.total} barang berubah angkanya${note ? ` · ${note}` : ''}`);
     await conn.commit();
 
-    const [rows] = await pool.query(SELECT + ' WHERE o.id = ? LIMIT 1', [id]);
-    const data = (rows as any[])[0];
-    const [out] = await pool.query(LINE_SELECT, [id]);
-    data.lines = out;
+    try {
+      await notifyUsers([prev.submitted_by_user_id, prev.counted_by_user_id].filter(Boolean), {
+        kind: 'opname_approved',
+        title: `Stok opname ${prev.opname_number} disetujui`,
+        body: `Stok ${prev.warehouse_name || 'gudang'} disesuaikan — ${r.moved} barang berubah angkanya.`,
+        documentType: 'StockOpname', documentId: id, link: `/warehouse/opname/${id}`,
+      }, uid(req));
+    } catch (e: any) { console.error('[notify] opname_approved gagal:', e?.message || e); }
+
     return res.json({
-      message: moved
-        ? 'Stok disesuaikan - ' + moved + ' barang berubah angkanya'
-        : 'Tidak ada yang perlu disesuaikan: catatan sudah sama dengan hitungan fisik',
-      data,
+      message: r.moved
+        ? `Disetujui — stok disesuaikan, ${r.moved} barang berubah angkanya`
+        : 'Disetujui — catatan sudah sama dengan hitungan fisik, tidak ada yang berubah',
+      data: await reload(id),
     });
   } catch (err: any) {
-    await conn.rollback();
+    await conn.rollback().catch(() => {});
     return res.status(500).json({ message: 'Server error', error: err.message });
   } finally {
     conn.release();
+  }
+});
+
+// POST /api/stock-opname/:id/reject { note } — PM menolak; bisa diperbaiki lalu diajukan lagi.
+router.post('/:id/reject', authenticate, async (req: Request, res: Response) => {
+  try {
+    const id = Number(req.params.id);
+    const prev = await scopedOpname(req, id);
+    if (!prev) return res.status(404).json({ message: 'Stok opname tidak ditemukan' });
+    if (!mayReview(req, prev)) {
+      return res.status(403).json({
+        message: 'Hanya Project Manager PT pemilik gudang ini yang bisa menolak penyesuaian stok.',
+      });
+    }
+    if (prev.approval_status !== 'Pending') {
+      return res.status(409).json({ message: 'Opname ini tidak sedang menunggu persetujuan.' });
+    }
+    const note = String(req.body?.note || '').trim();
+    // Penolakan tanpa alasan meninggalkan petugas gudang menebak apa yang harus dihitung ulang.
+    if (!note) return res.status(422).json({ message: 'Tuliskan alasan penolakannya.' });
+    await pool.query(
+      `UPDATE stock_opname SET approval_status = 'Rejected', reviewed_by_user_id = ?, reviewed_at = NOW(),
+              review_note = ?, updated_at = NOW() WHERE id = ?`, [uid(req), note.slice(0, 1000), id]);
+    await logActivity(pool, id, 'Ditolak PM', uid(req), note.slice(0, 1000));
+    await notifyUsers([prev.submitted_by_user_id, prev.counted_by_user_id].filter(Boolean), {
+      kind: 'opname_rejected',
+      title: `Stok opname ${prev.opname_number} ditolak PM`,
+      body: note.slice(0, 400),
+      documentType: 'StockOpname', documentId: id, link: `/warehouse/opname/${id}`,
+    }, uid(req)).catch((e: any) => console.error('[notify] opname_rejected gagal:', e?.message || e));
+    return res.json({ message: 'Opname ditolak', data: await reload(id) });
+  } catch (err: any) {
+    return res.status(500).json({ message: 'Server error', error: err.message });
   }
 });
 
@@ -481,6 +614,9 @@ router.delete('/:id', authenticate, async (req: Request, res: Response) => {
         message: 'Opname ini sudah dipakai untuk menyesuaikan stok dan tidak bisa dihapus. '
           + 'Untuk membetulkan, buat opname baru atau dokumen Stock In / Stock Out.',
       });
+    }
+    if (prev.approval_status === 'Pending') {
+      return res.status(409).json({ message: 'Opname ini sedang menunggu persetujuan PM dan tidak bisa dihapus.' });
     }
 
     // Lampiran dialamatkan lewat (tipe, id) tanpa foreign key, jadi penghapusan

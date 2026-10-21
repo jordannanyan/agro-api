@@ -157,13 +157,37 @@ function revisionForUser(docType: DocType, user: AuthUser, scope: number | null)
         AND (${byUser}${requesterRoleSql(docType)} = ?)`, args);
 }
 
-// GET /api/documents/inbox → { PR, PO, PayReq, Reimbursement, total }
+/**
+ * Stock counts waiting on this person (2026-10-22). Not a chain from
+ * approval_routes — one fixed step, the PM of the warehouse's PT — so it is
+ * counted from `stock_opname.approval_status` directly:
+ *   approval: Pending opnames a Project Manager may sign (their PT; Super Admin all)
+ *   revision: Rejected opnames this person submitted, waiting to be fixed
+ */
+async function opnameCounts(user: AuthUser, scope: number | null) {
+  const wh = `(SELECT wk.entities_id FROM warehouse w JOIN kth wk ON wk.id = w.kth_id WHERE w.id = o.warehouse_id)`;
+  let approval = 0;
+  if (user.roleCode === ROLE.PROJECT_MANAGER || user.roleCode === ROLE.SUPER_ADMIN) {
+    const own = user.roleCode === ROLE.PROJECT_MANAGER && !user.roleCrossEntity;
+    approval = await countOne(
+      `SELECT COUNT(*) AS n FROM stock_opname o WHERE o.approval_status = 'Pending'`
+      + (own ? ` AND ${wh} = ?` : scope != null ? ` AND ${wh} = ?` : ''),
+      own ? [user.entityId] : scope != null ? [scope] : []);
+  }
+  const revision = await countOne(
+    `SELECT COUNT(*) AS n FROM stock_opname o WHERE o.approval_status = 'Rejected' AND o.submitted_by_user_id = ?`,
+    [user.id]);
+  return { approval, revision, total: approval + revision };
+}
+
+// GET /api/documents/inbox → { PR, PO, PayReq, Reimbursement, StockOpname, total }
 router.get('/inbox', authenticate, async (req: Request, res: Response) => {
   const empty = {
     PR: { approval: 0, revision: 0, total: 0 },
     PO: { approval: 0, revision: 0, total: 0 },
     PayReq: { approval: 0, revision: 0, payment: 0, total: 0 },
     Reimbursement: { approval: 0, revision: 0, payment: 0, total: 0 },
+    StockOpname: { approval: 0, revision: 0, total: 0 },
     total: 0,
   };
   const user = req.user;
@@ -227,9 +251,11 @@ router.get('/inbox', authenticate, async (req: Request, res: Response) => {
       approval: rbApproval + exApproval, revision: rbRevision + exRevision, payment: rbPayment,
       total: rbApproval + exApproval + rbRevision + exRevision + rbPayment,
     },
+    StockOpname: await opnameCounts(user, scope),
     total: 0,
   };
-  data.total = data.PR.total + data.PO.total + data.PayReq.total + data.Reimbursement.total;
+  data.total = data.PR.total + data.PO.total + data.PayReq.total + data.Reimbursement.total
+    + data.StockOpname.total;
   return res.json({ data });
 });
 

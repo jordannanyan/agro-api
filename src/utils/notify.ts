@@ -23,7 +23,10 @@ export type NotificationKind =
   | 'payreq_approved'   // a payment request cleared its chain — the transfer may go
   | 'payreq_paid'       // finance settled a payment request
   | 'goods_in_transit'  // that payment was for an order, so the goods are coming
-  | 'stock_shortage';   // what arrived did not match what was ordered
+  | 'stock_shortage'    // what arrived did not match what was ordered
+  | 'opname_submitted'  // a stock count asks the PM to adjust the stock
+  | 'opname_approved'   // the PM agreed; the stock now matches the count
+  | 'opname_rejected';  // the PM sent it back, with the reason
 
 export interface NotificationInput {
   kind: NotificationKind;

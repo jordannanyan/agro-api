@@ -906,12 +906,24 @@ CREATE TABLE `stock_opname` (
   -- adalah tindakan tersendiri yang dipilih orang, bukan akibat dari menghitung.
   `applied_at`         DATETIME NULL,
   `applied_by_user_id` INT NULL,
+  -- Menyesuaikan stok butuh persetujuan Project Manager PT pemilik gudang
+  -- (2026-10-22). Draft = baru dicatat; Pending = diajukan, menunggu PM;
+  -- Approved = PM setuju dan stok disesuaikan saat itu juga (applied_* = PM);
+  -- Rejected = PM menolak, bisa diperbaiki lalu diajukan lagi.
+  `approval_status`      ENUM('Draft','Pending','Approved','Rejected') NOT NULL DEFAULT 'Draft',
+  `submitted_by_user_id` INT NULL,
+  `submitted_at`         DATETIME NULL,
+  `reviewed_by_user_id`  INT NULL,
+  `reviewed_at`          DATETIME NULL,
+  `review_note`          TEXT NULL,
   `created_at`         DATETIME NULL,
   `updated_at`         DATETIME NULL,
   KEY `ix_opname_wh_date` (`warehouse_id`, `opname_date`),
   CONSTRAINT `fk_opname_wh`   FOREIGN KEY (`warehouse_id`)       REFERENCES `warehouse`(`id`),
   CONSTRAINT `fk_opname_user` FOREIGN KEY (`counted_by_user_id`) REFERENCES `users`(`id`) ON DELETE SET NULL,
-  CONSTRAINT `fk_opname_applier` FOREIGN KEY (`applied_by_user_id`) REFERENCES `users`(`id`) ON DELETE SET NULL
+  CONSTRAINT `fk_opname_applier` FOREIGN KEY (`applied_by_user_id`) REFERENCES `users`(`id`) ON DELETE SET NULL,
+  CONSTRAINT `fk_opname_submitter` FOREIGN KEY (`submitted_by_user_id`) REFERENCES `users`(`id`) ON DELETE SET NULL,
+  CONSTRAINT `fk_opname_reviewer`  FOREIGN KEY (`reviewed_by_user_id`)  REFERENCES `users`(`id`) ON DELETE SET NULL
 ) ENGINE=InnoDB;
 
 CREATE TABLE `stock_opname_items` (
