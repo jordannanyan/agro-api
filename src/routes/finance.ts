@@ -162,7 +162,9 @@ router.get('/budget-vs-actual', authenticate, async (req: Request, res: Response
       const k = String(code ?? 'none');
       if (!by.has(k)) {
         by.set(k, {
-          budget_code_id: code, budget_code: label ?? 'Tanpa budget code', main_account: main ?? '—', sub_account: sub ?? '—',
+          // A retired code (1_Investment … 9_Tax) has no main/sub: shown as itself under "Kode lama".
+          budget_code_id: code, budget_code: label ?? 'Tanpa budget code',
+          main_account: main ?? (label ? 'Kode lama' : '—'), sub_account: sub ?? label ?? 'Tanpa budget code',
           budget: 0, actual: 0, lines: 0, transactions: 0,
         });
       }
