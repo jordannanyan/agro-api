@@ -178,10 +178,17 @@ export async function paidByLine(db: Db, lineIds: number[]) {
   return m;
 }
 
-/** "PT Sumatra Nature Based Solutions (SNBS)" → "SNBS". */
+/**
+ * The PT's short code: "PT Java Nature Based Solutions (JNBS)" → "JNBS",
+ * "SNBS Lampung" → "SNBS" (the first all-capitals word), else a sanitised name.
+ */
 export function entityShort(name: string | null | undefined, id: number): string {
-  const m = String(name || '').match(/\(([^)]+)\)/);
-  return (m ? m[1] : String(name || `E${id}`)).replace(/[^A-Za-z0-9]/g, '').toUpperCase().slice(0, 12) || `E${id}`;
+  const n = String(name || '');
+  const paren = n.match(/\(([^)]+)\)/);
+  if (paren) return paren[1].replace(/[^A-Za-z0-9]/g, '').toUpperCase().slice(0, 12) || `E${id}`;
+  const caps = n.match(/\b([A-Z]{2,8})\b/);
+  if (caps && caps[1] !== 'PT') return caps[1];
+  return n.replace(/[^A-Za-z0-9]/g, '').toUpperCase().slice(0, 12) || `E${id}`;
 }
 
 export function prevPeriod(p: string): string {
