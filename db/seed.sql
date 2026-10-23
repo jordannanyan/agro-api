@@ -40,7 +40,11 @@ INSERT INTO `roles` (id, role_code, role_name, is_cross_entity, created_at, upda
 -- HR at WLI. Files the two payment requests that never come from procurement —
 -- the farmer reimbursement paid through a KTH, and the expense somebody laid out —
 -- and approves nothing. Cross-entity: one of them serves every PT.
-(10, 'HR', 'HR', 1, NOW(), NOW());
+(10, 'HR', 'HR', 1, NOW(), NOW()),
+-- Group / HQ. Reads every PT like the Admin and changes nothing in the operational
+-- modules; signs the Director and HQ stages of the Fund Request when listed in
+-- fund_request_signers. No Settings access — that stays with the Admin.
+(11, 'HQ', 'HQ', 1, NOW(), NOW());
 
 -- Users (staff login) — the real people from Dokumentasi_Role_Approval_Procurement.pdf.
 -- Login accepts either `username` or `email`.
@@ -64,18 +68,90 @@ INSERT INTO `users` (id, entity_id, role_id, name, username, email, password, po
 -- NBSV — system administration, outside the business flow
 (10, 4, 7, 'Jordan Nanyan',          'jordan.nanyan',     'jordan.nanyan@nbsv.earth',     @PW, 'Super Admin', 1, NOW(), NOW()),
 (11, 4, 8, 'Pinky Kathlea Diatmiko', 'pinky.kathlea',     'pinky.kathlea@nbsv.earth',     @PW, 'Admin',       1, NOW(), NOW()),
-(12, 4, 8, 'Sven Koenig',            'sven.koenig',       'sven.koenig@nbsv.earth',       @PW, 'Admin',       1, NOW(), NOW()),
-(13, 4, 8, 'Paul Schuller',          'paul.schuller',     'paul.schuller@nbsv.earth',     @PW, 'Admin',       1, NOW(), NOW()),
-(14, 3, 8, 'Cindra Veranita',        'cindra.veranita',   'cindra.veranita@wli.earth',    @PW, 'Admin',       1, NOW(), NOW());
+(12, 4, 11, 'Sven Koenig',           'sven.koenig',       'sven.koenig@nbsv.earth',       @PW, '[HQ] Group COO', 1, NOW(), NOW()),
+(13, 4, 11, 'Paul Schuller',         'paul.schuller',     'paul.schuller@nbsv.earth',     @PW, '[HQ] Director',  1, NOW(), NOW()),
+(14, 3, 8, 'Cindra Veranita',        'cindra.veranita',   'cindra.veranita@wli.earth',    @PW, 'Admin',       1, NOW(), NOW()),
+-- Director of WLI — co-signs the Director stage of every Fund Request.
+(15, 3, 11, 'Arim',                  'arim',              'arim@wli.earth',               @PW, '[WLI] Director', 1, NOW(), NOW());
+
+-- Fund Request signers (Director stage: both must sign; then HQ: both must sign).
+INSERT INTO `fund_request_signers` (stage, user_id, entity_id, title, sort_order, is_active, created_at, updated_at) VALUES
+('director', 9,  NULL, '[IDN] Director (Entity)', 1, 1, NOW(), NOW()),
+('director', 15, NULL, '[WLI] Director',          2, 1, NOW(), NOW()),
+('hq',       12, NULL, '[HQ] Group COO',          1, 1, NOW(), NOW()),
+('hq',       13, NULL, '[HQ] Director',           2, 1, NOW(), NOW());
 
 -- Master lookups
-INSERT INTO `budget_codes` (id, code, name, is_active) VALUES
-(1, '1_Investment', 'Investment',  1),
-(2, '2_Operational','Operational', 1),
-(3, '3_Materials',  'Materials',   1),
-(4, '4_Salary',     'Salary',      1),
-(5, '5_Transport',  'Transport',   1),
-(6, '6_Rent',       'Rent',        1);
+-- Budget codes and finance dimensions — 260929_SPV_Budget Codes Master File.xlsx (sheet COA).
+INSERT INTO `budget_codes` (id, code, name, main_account, sub_account, sort_order, is_active) VALUES
+(1, '01-Operational Expenditures - Commission-Offtake', 'Commission-Offtake', 'Operational Expenditures', 'Commission-Offtake', 1, 1),
+(2, '01-Operational Expenditures - Delivery Costs-Non-Offtake', 'Delivery Costs-Non-Offtake', 'Operational Expenditures', 'Delivery Costs-Non-Offtake', 2, 1),
+(3, '01-Operational Expenditures - Delivery Costs-Offtake', 'Delivery Costs-Offtake', 'Operational Expenditures', 'Delivery Costs-Offtake', 3, 1),
+(4, '01-Operational Expenditures - Labour-Non Offtake', 'Labour-Non Offtake', 'Operational Expenditures', 'Labour-Non Offtake', 4, 1),
+(5, '01-Operational Expenditures - Labour-Offtake', 'Labour-Offtake', 'Operational Expenditures', 'Labour-Offtake', 5, 1),
+(6, '01-Operational Expenditures - Maintenance', 'Maintenance', 'Operational Expenditures', 'Maintenance', 6, 1),
+(7, '01-Operational Expenditures - Material-Non-Offtake', 'Material-Non-Offtake', 'Operational Expenditures', 'Material-Non-Offtake', 7, 1),
+(8, '01-Operational Expenditures - Material-Offtake', 'Material-Offtake', 'Operational Expenditures', 'Material-Offtake', 8, 1),
+(9, '01-Operational Expenditures - Profit Sharing', 'Profit Sharing', 'Operational Expenditures', 'Profit Sharing', 9, 1),
+(10, '01-Operational Expenditures - Purchase-Offtake', 'Purchase-Offtake', 'Operational Expenditures', 'Purchase-Offtake', 10, 1),
+(11, '01-Operational Expenditures - Rental Expenses - Building', 'Rental Expenses - Building', 'Operational Expenditures', 'Rental Expenses - Building', 11, 1),
+(12, '01-Operational Expenditures - Socialisation Cost', 'Socialisation Cost', 'Operational Expenditures', 'Socialisation Cost', 12, 1),
+(13, '02-Investment Expenditures - Building Costs', 'Building Costs', 'Investment Expenditures', 'Building Costs', 13, 1),
+(14, '02-Investment Expenditures - Fixed Asset - Office Equipment', 'Fixed Asset - Office Equipment', 'Investment Expenditures', 'Fixed Asset - Office Equipment', 14, 1),
+(15, '02-Investment Expenditures - Fixed Asset - PP&E', 'Fixed Asset - PP&E', 'Investment Expenditures', 'Fixed Asset - PP&E', 15, 1),
+(16, '02-Investment Expenditures - Fixed Asset - Vehicle', 'Fixed Asset - Vehicle', 'Investment Expenditures', 'Fixed Asset - Vehicle', 16, 1),
+(17, '03-Financing Expenditures - Injection - Capital', 'Injection - Capital', 'Financing Expenditures', 'Injection - Capital', 17, 1),
+(18, '03-Financing Expenditures - Injection - Equity', 'Injection - Equity', 'Financing Expenditures', 'Injection - Equity', 18, 1),
+(19, '03-Financing Expenditures - Injection - Loan', 'Injection - Loan', 'Financing Expenditures', 'Injection - Loan', 19, 1),
+(20, '04-Personnel Expenditures - Compensation', 'Compensation', 'Personnel Expenditures', 'Compensation', 20, 1),
+(21, '04-Personnel Expenditures - Net Salary', 'Net Salary', 'Personnel Expenditures', 'Net Salary', 21, 1),
+(22, '04-Personnel Expenditures - Religious Allowance', 'Religious Allowance', 'Personnel Expenditures', 'Religious Allowance', 22, 1),
+(23, '04-Personnel Expenditures - Social Security', 'Social Security', 'Personnel Expenditures', 'Social Security', 23, 1),
+(24, '05-Travel Expenditures - Rental Expenses - Car/Bike Rental', 'Rental Expenses - Car/Bike Rental', 'Travel Expenditures', 'Rental Expenses - Car/Bike Rental', 24, 1),
+(25, '05-Travel Expenditures - Travel Expenses - Accommodation', 'Travel Expenses - Accommodation', 'Travel Expenditures', 'Travel Expenses - Accommodation', 25, 1),
+(26, '05-Travel Expenditures - Travel Expenses - Bus/Travel Ticket', 'Travel Expenses - Bus/Travel Ticket', 'Travel Expenditures', 'Travel Expenses - Bus/Travel Ticket', 26, 1),
+(27, '05-Travel Expenditures - Travel Expenses - Flight Ticket', 'Travel Expenses - Flight Ticket', 'Travel Expenditures', 'Travel Expenses - Flight Ticket', 27, 1),
+(28, '05-Travel Expenditures - Travel Expenses - Food/Drink Consumption With External', 'Travel Expenses - Food/Drink Consumption With External', 'Travel Expenditures', 'Travel Expenses - Food/Drink Consumption With External', 28, 1),
+(29, '05-Travel Expenditures - Travel Expenses - Gasoline', 'Travel Expenses - Gasoline', 'Travel Expenditures', 'Travel Expenses - Gasoline', 29, 1),
+(30, '05-Travel Expenditures - Travel Expenses - Per Diem', 'Travel Expenses - Per Diem', 'Travel Expenditures', 'Travel Expenses - Per Diem', 30, 1),
+(31, '05-Travel Expenditures - Travel Expenses - Travel-Related Cost', 'Travel Expenses - Travel-Related Cost', 'Travel Expenditures', 'Travel Expenses - Travel-Related Cost', 31, 1),
+(32, '06-Administrative Expenditures - Bank Fee/Charge', 'Bank Fee/Charge', 'Administrative Expenditures', 'Bank Fee/Charge', 32, 1),
+(33, '06-Administrative Expenditures - Internal Cash Out', 'Internal Cash Out', 'Administrative Expenditures', 'Internal Cash Out', 33, 1),
+(34, '06-Administrative Expenditures - License', 'License', 'Administrative Expenditures', 'License', 34, 1),
+(35, '06-Administrative Expenditures - Medical Support', 'Medical Support', 'Administrative Expenditures', 'Medical Support', 35, 1),
+(36, '06-Administrative Expenditures - Office Expenses - Cleaning Service', 'Office Expenses - Cleaning Service', 'Administrative Expenditures', 'Office Expenses - Cleaning Service', 36, 1),
+(37, '06-Administrative Expenditures - Office Expenses - Equipments', 'Office Expenses - Equipments', 'Administrative Expenditures', 'Office Expenses - Equipments', 37, 1),
+(38, '06-Administrative Expenditures - Office Expenses - Supplies', 'Office Expenses - Supplies', 'Administrative Expenditures', 'Office Expenses - Supplies', 38, 1),
+(39, '06-Administrative Expenditures - Office Expenses - Utilities', 'Office Expenses - Utilities', 'Administrative Expenditures', 'Office Expenses - Utilities', 39, 1),
+(40, '06-Administrative Expenditures - Other G&A', 'Other G&A', 'Administrative Expenditures', 'Other G&A', 40, 1),
+(41, '06-Administrative Expenditures - Team Events', 'Team Events', 'Administrative Expenditures', 'Team Events', 41, 1),
+(42, '06-Administrative Expenditures - Training', 'Training', 'Administrative Expenditures', 'Training', 42, 1),
+(43, '06-Administrative Expenditures - Vehicle Administration', 'Vehicle Administration', 'Administrative Expenditures', 'Vehicle Administration', 43, 1),
+(44, '07-External Services - Audit', 'Audit', 'External Services', 'Audit', 44, 1),
+(45, '07-External Services - Consulting', 'Consulting', 'External Services', 'Consulting', 45, 1),
+(46, '07-External Services - Service Fee Affiliate Companies', 'Service Fee Affiliate Companies', 'External Services', 'Service Fee Affiliate Companies', 46, 1),
+(47, '07-External Services - Tax/Legal Advise', 'Tax/Legal Advise', 'External Services', 'Tax/Legal Advise', 47, 1),
+(48, '08-Tax Expenditures - Income Tax - Expenses', 'Income Tax - Expenses', 'Tax Expenditures', 'Income Tax - Expenses', 48, 1),
+(49, '08-Tax Expenditures - Income Tax Article 21', 'Income Tax Article 21', 'Tax Expenditures', 'Income Tax Article 21', 49, 1),
+(50, '08-Tax Expenditures - Income Tax Article 23', 'Income Tax Article 23', 'Tax Expenditures', 'Income Tax Article 23', 50, 1),
+(51, '08-Tax Expenditures - Income Tax Article 4 (2)', 'Income Tax Article 4 (2)', 'Tax Expenditures', 'Income Tax Article 4 (2)', 51, 1);
+
+INSERT INTO `finance_dimensions` (dim_type, name, sort_order, is_active) VALUES
+('cash_flow_type', 'Cash Inflow', 1, 1),
+('cash_flow_type', 'Cash Outflow', 2, 1),
+('budget_purpose', 'Overhead', 1, 1),
+('budget_purpose', 'Operational Non-Offtake', 2, 1),
+('budget_purpose', 'Operational Offtake', 3, 1),
+('profit_center', 'Social Forestry - Secured - East Lampung', 1, 1),
+('profit_center', 'Social Forestry - Secured - KUPS Sumber Jaya', 2, 1),
+('profit_center', 'Social Forestry - Secured - Tulungagung', 3, 1),
+('budget_inflow', 'Bank Interest', 1, 1),
+('budget_inflow', 'Injection', 2, 1),
+('budget_inflow', 'Other Income', 3, 1),
+('budget_inflow', 'Sales-Cavendish Banana', 4, 1),
+('budget_inflow', 'Sales-Cocoa', 5, 1),
+('budget_inflow', 'Sales-Coffee', 6, 1),
+('budget_inflow', 'Services', 7, 1);
 
 INSERT INTO `units` (id, unit_name, symbol) VALUES
 (1, 'Kg', 'kg'), (2, 'Gram', 'g'), (3, 'Liter', 'L'), (4, 'Ml', 'ml'),
@@ -210,8 +286,5 @@ INSERT INTO `approval_routes` (document_type, entity_id, step_order, step_label,
 -- Reorder levels are seeded in db/seed_saprodi.sql — they reference sapropdi rows,
 -- which do not exist yet at this point in the script.
 
--- Budgets (contoh)
-INSERT INTO `budgets` (entity_id, period, budget_code_id, sub_category, budget_amount) VALUES
-(1, '2026', 3, 'Fertilizer & Pesticide', 500000000),
-(1, '2026', 1, 'Equipment',              200000000),
-(2, '2026', 3, 'Fertilizer & Pesticide', 350000000);
+-- No budget rows: since 2026-10 the budget is the approved Fund Request lines
+-- (input once). The `budgets` table is legacy and nothing writes it any more.

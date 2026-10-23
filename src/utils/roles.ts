@@ -20,6 +20,10 @@ export const ROLE = {
   // KTH's workers, an expense somebody laid out — and nothing else. Cross-entity,
   // because there is one of them for the whole group.
   HR: 'HR',
+  // Group / HQ (2026-10). Reads every PT like the Admin and changes nothing in the
+  // operational modules; its one act is signing a Fund Request, and only when the
+  // account is listed in fund_request_signers. Unlike the Admin it has no Settings.
+  HQ: 'HQ',
 } as const;
 
 export type RoleCode = (typeof ROLE)[keyof typeof ROLE];
@@ -45,7 +49,7 @@ export const WRITE_OVERRIDE_ROLES: RoleCode[] = [ROLE.SUPER_ADMIN];
  * warehouse movements, transactions, pre-finance). Enforced by
  * middleware/readOnly.ts, not by each handler.
  */
-export const OPERATIONS_READ_ONLY_ROLES: RoleCode[] = [ROLE.ADMIN];
+export const OPERATIONS_READ_ONLY_ROLES: RoleCode[] = [ROLE.ADMIN, ROLE.HQ];
 
 /**
  * Who may raise a payment request that has no procurement behind it — the farmer
@@ -60,3 +64,6 @@ export const CLAIM_CREATOR_ROLES: RoleCode[] = [ROLE.FIELD_ADMIN, ROLE.HR];
 
 /** May execute a payment once a PayReq is fully approved (Finance Manager + Finance Staff). */
 export const PAYMENT_EXECUTOR_ROLES: RoleCode[] = [ROLE.FINANCE_MANAGER, ROLE.FINANCE_STAFF];
+
+/** Prepare, compile and correct a Fund Request: Finance (and the Super Admin break-glass). */
+export const FUND_REQUEST_FINANCE_ROLES: RoleCode[] = [ROLE.FINANCE_MANAGER, ROLE.FINANCE_STAFF];

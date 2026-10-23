@@ -107,14 +107,32 @@ export const banksRouter = crudRouter({
   label: 'Bank',
 });
 
+// The SPV Budget Codes Master File: `code` is the combined "NN-Main - Sub" label,
+// main/sub its halves (the Fund Request cascades Main → Sub). Active first, in the
+// sheet's own order; the legacy 1_… 9_… codes sort after as inactive rows.
 export const budgetCodesRouter = crudRouter({
   table: 'budget_codes',
-  columns: ['code', 'name', 'is_active'],
+  columns: ['code', 'name', 'main_account', 'sub_account', 'sort_order', 'is_active'],
   required: ['code'],
+  numeric: ['sort_order'],
   boolean: ['is_active'],
-  searchColumns: ['code', 'name'],
-  orderBy: 'code ASC',
+  searchColumns: ['code', 'name', 'main_account', 'sub_account'],
+  filterColumns: ['main_account', 'is_active'],
+  orderBy: 'is_active DESC, sort_order ASC, code ASC',
   label: 'Budget code',
+});
+
+// Budget Purpose / Profit Center / Budget Inflow / Cash Flow Type of the same file.
+export const financeDimensionsRouter = crudRouter({
+  table: 'finance_dimensions',
+  columns: ['dim_type', 'name', 'sort_order', 'is_active'],
+  required: ['dim_type', 'name'],
+  numeric: ['sort_order'],
+  boolean: ['is_active'],
+  searchColumns: ['name'],
+  filterColumns: ['dim_type', 'is_active'],
+  orderBy: 'dim_type ASC, sort_order ASC, name ASC',
+  label: 'Finance dimension',
 });
 
 export const unitsRouter = crudRouter({
@@ -269,11 +287,4 @@ export const reorderLevelsRouter = crudRouter({
   label: 'Reorder level',
 });
 
-export const budgetsRouter = crudRouter({
-  table: 'budgets',
-  columns: ['entity_id', 'period', 'budget_code_id', 'sub_category', 'budget_amount', 'notes'],
-  required: ['entity_id', 'period', 'budget_code_id'],
-  numeric: ['entity_id', 'budget_code_id', 'budget_amount'],
-  filterColumns: ['entity_id', 'period', 'budget_code_id'],
-  label: 'Budget',
-});
+// (budgets crud removed 2026-10 — the budget is the approved Fund Request lines.)

@@ -169,13 +169,37 @@ CREATE TABLE `company_bank_accounts` (
   KEY `idx_cba_entity` (`entity_id`)
 ) ENGINE=InnoDB;
 
+-- Budget codes = the "Budget Outflow" chart of the SPV Budget Codes Master File
+-- (260929_SPV_Budget Codes Master File.xlsx, sheet COA). `code` is the combined
+-- label the sheet uses — "01-Operational Expenditures - Material-Non-Offtake" —
+-- and `main_account` / `sub_account` are its two halves, kept apart so screens can
+-- cascade Main → Sub the way the Fund Request does. The older 1_Investment …
+-- 9_Tax codes stay as inactive rows: documents that already point at them keep
+-- saying what they said.
 CREATE TABLE `budget_codes` (
+  `id`           INT AUTO_INCREMENT PRIMARY KEY,
+  `code`         VARCHAR(160) NOT NULL UNIQUE,
+  `name`         VARCHAR(150) NULL,
+  `main_account` VARCHAR(80) NULL,
+  `sub_account`  VARCHAR(120) NULL,
+  `sort_order`   INT NOT NULL DEFAULT 0,
+  `is_active`    TINYINT(1) NOT NULL DEFAULT 1,
+  `created_at`   DATETIME NULL,
+  `updated_at`   DATETIME NULL
+) ENGINE=InnoDB;
+
+-- The other lists of the same master file: Budget Purpose, Profit Center, Budget
+-- Inflow and Cash Flow Type. One table because each is a plain name list that
+-- Finance maintains, and none carries anything the others do not.
+CREATE TABLE `finance_dimensions` (
   `id`         INT AUTO_INCREMENT PRIMARY KEY,
-  `code`       VARCHAR(60) NOT NULL UNIQUE,   -- 1_Investment .. 6_Rent
-  `name`       VARCHAR(150) NULL,
+  `dim_type`   ENUM('budget_purpose','profit_center','budget_inflow','cash_flow_type') NOT NULL,
+  `name`       VARCHAR(150) NOT NULL,
+  `sort_order` INT NOT NULL DEFAULT 0,
   `is_active`  TINYINT(1) NOT NULL DEFAULT 1,
   `created_at` DATETIME NULL,
-  `updated_at` DATETIME NULL
+  `updated_at` DATETIME NULL,
+  UNIQUE KEY `uq_findim` (`dim_type`, `name`)
 ) ENGINE=InnoDB;
 
 CREATE TABLE `units` (
@@ -593,6 +617,230 @@ CREATE TABLE `purchase_order_extra_costs` (
   CONSTRAINT `fk_poec_po` FOREIGN KEY (`po_id`) REFERENCES `purchase_orders`(`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB;
 
+-- -----------------------------------------------------------------------------
+-- CLUSTER: Fund Request (2026-10) — the monthly funding request per PT, laid out
+-- like "Example_Fund_Request_-_Aug_2026.xlsx" and the Ledger template:
+--
+--   Section 1  1.1 bank balances · 1.2 shifted items · 1.3 = 1.1 − 1.2
+--              1.4 new / forecasted items (overhead, operational, offtake in/out)
+--              1.5 = 1.3 − overhead − operational + offtake net
+--              1.6 minimum balances (negative) · 1.7 others
+--              1.8 fund request = IF(1.5+1.6+1.7 > 0, 0, −(1.5+1.6+1.7))
+--   Section 2  per trading commodity: bank − shifted − new + minimum → its own request
+--   Approval   Requested (PM) → Prepared (Finance) → every Director signer → every HQ signer
+--
+-- INPUT ONCE: the approved budget lines of these documents ARE the budget. There
+-- is no second place to type a budget, and Actual is never typed against them
+-- either — it is the Paid payment requests that point at a line
+-- (payment_requests.fund_request_line_id), plus what Finance books by hand for
+-- spending that never passes through a payment request (salaries, bank charges).
+-- -----------------------------------------------------------------------------
+CREATE TABLE `fund_requests` (
+  `id`                  INT AUTO_INCREMENT PRIMARY KEY,
+  `fr_number`           VARCHAR(40) NOT NULL UNIQUE,      -- FR-2026-08-SNBS
+  `entity_id`           INT NOT NULL,
+  `period`              CHAR(7) NOT NULL,                  -- YYYY-MM
+  `fx_date`             DATE NULL,
+  `last_update`         DATE NULL,
+  `prev_update`         DATE NULL,
+  `balance_date`        DATE NULL,
+  -- IDR per one unit of the currency, as of fx_date.
+  `rate_eur`            DECIMAL(15,4) NOT NULL DEFAULT 0,
+  `rate_usd`            DECIMAL(15,4) NOT NULL DEFAULT 0,
+  `rate_sgd`            DECIMAL(15,4) NOT NULL DEFAULT 0,
+  -- 'requested' is the working state: the sections are being filled in. A
+  -- rejection sends the document back here (rejected_* say by whom and why).
+  `stage`               ENUM('requested','prepared','director_approved','hq_approved') NOT NULL DEFAULT 'requested',
+  `prepared_at`         DATETIME NULL,
+  `prepared_by_user_id` INT NULL,
+  `approved_at`         DATETIME NULL,
+  `rejected_at`         DATETIME NULL,
+  `rejected_by_user_id` INT NULL,
+  `reject_note`         TEXT NULL,
+  -- Set once every remaining budget of this month has been shifted or saved in the
+  -- next month's request. Nothing changes after that.
+  `closed_at`           DATETIME NULL,
+  -- Section 4 — funding pattern.
+  `funding_wli_pct`     DECIMAL(6,4) NOT NULL DEFAULT 0.2000,
+  `funding_entity_pct`  DECIMAL(6,4) NOT NULL DEFAULT 0.8000,
+  `processing_fee_sgd`  DECIMAL(12,2) NOT NULL DEFAULT 35,
+  `funding_label`       ENUM('[Loan]','[Equity]') NOT NULL DEFAULT '[Loan]',
+  `created_by_user_id`  INT NULL,
+  `created_at`          DATETIME NULL,
+  `updated_at`          DATETIME NULL,
+  -- One document per PT per month, which is what lets every role work on the same one.
+  UNIQUE KEY `uq_fr_entity_period` (`entity_id`, `period`),
+  CONSTRAINT `fk_fr_entity`   FOREIGN KEY (`entity_id`)           REFERENCES `entities`(`id`),
+  CONSTRAINT `fk_fr_prepared` FOREIGN KEY (`prepared_by_user_id`) REFERENCES `users`(`id`) ON DELETE SET NULL,
+  CONSTRAINT `fk_fr_rejected` FOREIGN KEY (`rejected_by_user_id`) REFERENCES `users`(`id`) ON DELETE SET NULL,
+  CONSTRAINT `fk_fr_creator`  FOREIGN KEY (`created_by_user_id`)  REFERENCES `users`(`id`) ON DELETE SET NULL
+) ENGINE=InnoDB;
+
+-- Named groups of 1.4 ("1.0 Personnel Costs", "1.0 Own-managed Plantation"…), the
+-- offtake groups of 1.4 and the commodity blocks of Section 2. `owner_role` is who
+-- fills the group in: HR the personnel costs, the PM operations and offtake,
+-- Finance everything else.
+CREATE TABLE `fund_request_groups` (
+  `id`              INT AUTO_INCREMENT PRIMARY KEY,
+  `fund_request_id` INT NOT NULL,
+  `area`            ENUM('overhead','operational','offtake','trading') NOT NULL,
+  `label`           VARCHAR(200) NOT NULL,
+  `owner_role`      ENUM('finance','hr','pm') NOT NULL DEFAULT 'finance',
+  `sort_order`      INT NOT NULL DEFAULT 0,
+  `created_at`      DATETIME NULL,
+  `updated_at`      DATETIME NULL,
+  CONSTRAINT `fk_frg_fr` FOREIGN KEY (`fund_request_id`) REFERENCES `fund_requests`(`id`) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+CREATE TABLE `fund_request_lines` (
+  `id`              INT AUTO_INCREMENT PRIMARY KEY,
+  `fund_request_id` INT NOT NULL,
+  `group_id`        INT NULL,
+  --   bank_balance 1.1 · shifted 1.2 · new_item 1.4 · offtake_in/out 1.4 offtake
+  --   min_balance 1.6 · others 1.7 · trading_* the four tables of a Section 2 block
+  `section`         ENUM('bank_balance','shifted','new_item','offtake_in','offtake_out','min_balance','others',
+                         'trading_bank','trading_shifted','trading_new','trading_min') NOT NULL,
+  `kind`            ENUM('overhead','operational') NULL,   -- 1.2 shifted only
+  `description`     VARCHAR(500) NOT NULL DEFAULT '',
+  -- The amount in its own currency; IDR is derived with the document's rates.
+  -- Bank balances can be SGD; budget lines are IDR.
+  `currency`        ENUM('IDR','SGD','USD','EUR') NOT NULL DEFAULT 'IDR',
+  `amount`          DECIMAL(18,2) NOT NULL DEFAULT 0,
+  -- The budget dimensions of the Excel "Budget Detail" sheet.
+  `budget_code_id`    INT NULL,
+  `reason`            VARCHAR(500) NULL,
+  `link`              VARCHAR(500) NULL,
+  `filter_tag`        VARCHAR(80) NULL,
+  `period_to_be_paid` VARCHAR(40) NULL,
+  `activities`        VARCHAR(150) NULL,
+  `species`           VARCHAR(60) NULL,
+  `profit_center_id`  INT NULL,
+  -- Spending that never passes through a payment request (salaries paid by the
+  -- bank, bank charges). Finance books it here; everything else is the Paid
+  -- payment requests pointing at this line.
+  `actual_manual`      DECIMAL(18,2) NULL,
+  `actual_manual_note` VARCHAR(255) NULL,
+  `finance_note`      VARCHAR(500) NULL,
+  `pm_note`           VARCHAR(500) NULL,
+  -- A 1.2 line created from last month's remaining points at the line it came from.
+  `source_line_id`    INT NULL,
+  -- On a budget line of an approved month: what became of its remaining budget when
+  -- the next month's request processed it. shifted + saving = the remaining then.
+  `remaining_shifted`      DECIMAL(18,2) NULL,
+  `remaining_saving`       DECIMAL(18,2) NULL,
+  `remaining_processed_at` DATETIME NULL,
+  `sort_order`         INT NOT NULL DEFAULT 0,
+  `created_by_user_id` INT NULL,
+  `updated_by_user_id` INT NULL,
+  `created_at`         DATETIME NULL,
+  `updated_at`         DATETIME NULL,
+  KEY `ix_frl_fr_section` (`fund_request_id`, `section`),
+  CONSTRAINT `fk_frl_fr`     FOREIGN KEY (`fund_request_id`)  REFERENCES `fund_requests`(`id`) ON DELETE CASCADE,
+  CONSTRAINT `fk_frl_group`  FOREIGN KEY (`group_id`)         REFERENCES `fund_request_groups`(`id`) ON DELETE CASCADE,
+  CONSTRAINT `fk_frl_budget` FOREIGN KEY (`budget_code_id`)   REFERENCES `budget_codes`(`id`) ON DELETE SET NULL,
+  CONSTRAINT `fk_frl_pc`     FOREIGN KEY (`profit_center_id`) REFERENCES `finance_dimensions`(`id`) ON DELETE SET NULL,
+  CONSTRAINT `fk_frl_source` FOREIGN KEY (`source_line_id`)   REFERENCES `fund_request_lines`(`id`) ON DELETE SET NULL,
+  CONSTRAINT `fk_frl_cby`    FOREIGN KEY (`created_by_user_id`) REFERENCES `users`(`id`) ON DELETE SET NULL,
+  CONSTRAINT `fk_frl_uby`    FOREIGN KEY (`updated_by_user_id`) REFERENCES `users`(`id`) ON DELETE SET NULL
+) ENGINE=InnoDB;
+
+-- Who signs the Director and HQ stages. Every active signer of a stage must sign
+-- before it closes (template: Rizky + Arim, then Sven + Paul). entity_id NULL = all PTs.
+CREATE TABLE `fund_request_signers` (
+  `id`         INT AUTO_INCREMENT PRIMARY KEY,
+  `stage`      ENUM('director','hq') NOT NULL,
+  `user_id`    INT NOT NULL,
+  `entity_id`  INT NULL,
+  `title`      VARCHAR(120) NULL,
+  `sort_order` INT NOT NULL DEFAULT 0,
+  `is_active`  TINYINT(1) NOT NULL DEFAULT 1,
+  `created_at` DATETIME NULL,
+  `updated_at` DATETIME NULL,
+  UNIQUE KEY `uq_frsigner` (`stage`, `user_id`, `entity_id`),
+  CONSTRAINT `fk_frs_user`   FOREIGN KEY (`user_id`)   REFERENCES `users`(`id`) ON DELETE CASCADE,
+  CONSTRAINT `fk_frs_entity` FOREIGN KEY (`entity_id`) REFERENCES `entities`(`id`) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+CREATE TABLE `fund_request_signatures` (
+  `id`              INT AUTO_INCREMENT PRIMARY KEY,
+  `fund_request_id` INT NOT NULL,
+  `stage`           ENUM('director','hq') NOT NULL,
+  `user_id`         INT NOT NULL,
+  `note`            VARCHAR(500) NULL,
+  `signed_at`       DATETIME NOT NULL,
+  UNIQUE KEY `uq_frsig` (`fund_request_id`, `stage`, `user_id`),
+  CONSTRAINT `fk_frsig_fr`   FOREIGN KEY (`fund_request_id`) REFERENCES `fund_requests`(`id`) ON DELETE CASCADE,
+  CONSTRAINT `fk_frsig_user` FOREIGN KEY (`user_id`)         REFERENCES `users`(`id`) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+-- Progress of each owner's part, so Finance can see what is still being filled in.
+CREATE TABLE `fund_request_sections` (
+  `id`                 INT AUTO_INCREMENT PRIMARY KEY,
+  `fund_request_id`    INT NOT NULL,
+  `section_key`        ENUM('personnel','overhead_other','operational','offtake','finance_core') NOT NULL,
+  `status`             ENUM('not_started','in_progress','done') NOT NULL DEFAULT 'not_started',
+  `updated_by_user_id` INT NULL,
+  `updated_at`         DATETIME NULL,
+  UNIQUE KEY `uq_frsec` (`fund_request_id`, `section_key`),
+  CONSTRAINT `fk_frsec_fr`   FOREIGN KEY (`fund_request_id`)    REFERENCES `fund_requests`(`id`) ON DELETE CASCADE,
+  CONSTRAINT `fk_frsec_user` FOREIGN KEY (`updated_by_user_id`) REFERENCES `users`(`id`) ON DELETE SET NULL
+) ENGINE=InnoDB;
+
+-- Section 3.1 — moving budget between lines of an approved month. The total never
+-- changes; a line's budget = amount + approved movements in − out.
+CREATE TABLE `fund_request_reallocations` (
+  `id`                   INT AUTO_INCREMENT PRIMARY KEY,
+  `fund_request_id`      INT NOT NULL,
+  `to_line_id`           INT NOT NULL,
+  `total`                DECIMAL(18,2) NOT NULL DEFAULT 0,
+  `reason`               VARCHAR(500) NOT NULL,
+  `status`               ENUM('pending','approved','rejected') NOT NULL DEFAULT 'pending',
+  `requested_by_user_id` INT NULL,
+  `requested_at`         DATETIME NULL,
+  `decided_by_user_id`   INT NULL,
+  `decided_at`           DATETIME NULL,
+  `decide_note`          VARCHAR(500) NULL,
+  CONSTRAINT `fk_frr_fr`   FOREIGN KEY (`fund_request_id`)      REFERENCES `fund_requests`(`id`) ON DELETE CASCADE,
+  CONSTRAINT `fk_frr_to`   FOREIGN KEY (`to_line_id`)           REFERENCES `fund_request_lines`(`id`) ON DELETE CASCADE,
+  CONSTRAINT `fk_frr_req`  FOREIGN KEY (`requested_by_user_id`) REFERENCES `users`(`id`) ON DELETE SET NULL,
+  CONSTRAINT `fk_frr_dec`  FOREIGN KEY (`decided_by_user_id`)   REFERENCES `users`(`id`) ON DELETE SET NULL
+) ENGINE=InnoDB;
+
+CREATE TABLE `fund_request_realloc_lines` (
+  `id`               INT AUTO_INCREMENT PRIMARY KEY,
+  `reallocation_id`  INT NOT NULL,
+  `from_line_id`     INT NOT NULL,
+  `amount`           DECIMAL(18,2) NOT NULL DEFAULT 0,
+  CONSTRAINT `fk_frrl_r`    FOREIGN KEY (`reallocation_id`) REFERENCES `fund_request_reallocations`(`id`) ON DELETE CASCADE,
+  CONSTRAINT `fk_frrl_from` FOREIGN KEY (`from_line_id`)    REFERENCES `fund_request_lines`(`id`) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+CREATE TABLE `fund_request_comments` (
+  `id`              INT AUTO_INCREMENT PRIMARY KEY,
+  `fund_request_id` INT NOT NULL,
+  `line_id`         INT NOT NULL,
+  `user_id`         INT NULL,
+  `body`            TEXT NOT NULL,
+  `created_at`      DATETIME NULL,
+  `edited_at`       DATETIME NULL,
+  KEY `ix_frc_line` (`line_id`),
+  CONSTRAINT `fk_frc_fr`   FOREIGN KEY (`fund_request_id`) REFERENCES `fund_requests`(`id`) ON DELETE CASCADE,
+  CONSTRAINT `fk_frc_line` FOREIGN KEY (`line_id`)         REFERENCES `fund_request_lines`(`id`) ON DELETE CASCADE,
+  CONSTRAINT `fk_frc_user` FOREIGN KEY (`user_id`)         REFERENCES `users`(`id`) ON DELETE SET NULL
+) ENGINE=InnoDB;
+
+CREATE TABLE `fund_request_activities` (
+  `id`              INT AUTO_INCREMENT PRIMARY KEY,
+  `fund_request_id` INT NOT NULL,
+  `user_id`         INT NULL,
+  `section_key`     VARCHAR(30) NULL,
+  `action`          VARCHAR(500) NOT NULL,
+  `created_at`      DATETIME NULL,
+  KEY `ix_fra_fr` (`fund_request_id`, `id`),
+  CONSTRAINT `fk_fra_fr`   FOREIGN KEY (`fund_request_id`) REFERENCES `fund_requests`(`id`) ON DELETE CASCADE,
+  CONSTRAINT `fk_fra_user` FOREIGN KEY (`user_id`)         REFERENCES `users`(`id`) ON DELETE SET NULL
+) ENGINE=InnoDB;
+
 CREATE TABLE `payment_requests` (
   `id`                  INT AUTO_INCREMENT PRIMARY KEY,
   `payreq_number`       VARCHAR(60) NOT NULL UNIQUE,
@@ -621,6 +869,9 @@ CREATE TABLE `payment_requests` (
   `entity_id`           INT NOT NULL,
   `kth_id`              INT NULL,      -- Reimbursement only: whose account is paid
   `budget_code_id`      INT NULL,
+  -- The Fund Request budget line this payment realises. Paid requests pointing at a
+  -- line are that line's Actual (see the Fund Request cluster above).
+  `fund_request_line_id` INT NULL,
   `reason`              TEXT NULL,
   `person_in_charge`    VARCHAR(150) NULL,
   -- Who filed it. Without this, guardDelete could only fall back to "whoever holds
@@ -660,6 +911,7 @@ CREATE TABLE `payment_requests` (
   CONSTRAINT `fk_payreq_kth`    FOREIGN KEY (`kth_id`)              REFERENCES `kth`(`id`) ON DELETE SET NULL,
   CONSTRAINT `fk_payreq_requester` FOREIGN KEY (`requested_by_user_id`) REFERENCES `users`(`id`) ON DELETE SET NULL,
   CONSTRAINT `fk_payreq_budget` FOREIGN KEY (`budget_code_id`)      REFERENCES `budget_codes`(`id`) ON DELETE SET NULL,
+  CONSTRAINT `fk_payreq_frline` FOREIGN KEY (`fund_request_line_id`) REFERENCES `fund_request_lines`(`id`) ON DELETE SET NULL,
   CONSTRAINT `fk_payreq_method` FOREIGN KEY (`payment_method_id`)   REFERENCES `payment_methods`(`id`) ON DELETE SET NULL,
   CONSTRAINT `fk_payreq_paidby` FOREIGN KEY (`paid_by_user_id`)     REFERENCES `users`(`id`) ON DELETE SET NULL,
   CONSTRAINT `fk_payreq_bank`   FOREIGN KEY (`bank_id`)             REFERENCES `banks`(`id`) ON DELETE SET NULL,
@@ -1138,6 +1390,9 @@ CREATE TABLE `profit_sharing` (
 -- -----------------------------------------------------------------------------
 -- CLUSTER: Finance (budget vs actual = view)
 -- -----------------------------------------------------------------------------
+-- LEGACY (2026-10): the manual budget. Superseded by the approved Fund Request
+-- lines — the budget is entered once, in the Fund Request — and no screen or
+-- endpoint writes it any more. Kept so the rows already in it stay readable.
 CREATE TABLE `budgets` (
   `id`             INT AUTO_INCREMENT PRIMARY KEY,
   `entity_id`      INT NOT NULL,

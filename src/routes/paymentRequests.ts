@@ -19,6 +19,8 @@ export const router = Router();
 
 const SELECT = `
   SELECT pay.*, e.entities_name AS entity_name, bc.code AS budget_code,
+         frl.description AS fund_request_line_desc, frq.fr_number AS fund_request_number,
+         frq.period AS fund_request_period, frq.id AS fund_request_id,
          pr.pr_number, po.po_number,
          bnk.bank_code, bnk.bank_name AS bank_list_name, bnk.is_self AS bank_is_self,
          CASE WHEN pay.purchase_order_id IS NOT NULL THEN 'via_po' ELSE 'direct' END AS route,
@@ -29,6 +31,8 @@ ${PENDING_STEP_COLUMNS}
   LEFT JOIN purchase_requests pr  ON pr.id = pay.purchase_request_id
   LEFT JOIN purchase_orders po    ON po.id = pay.purchase_order_id
   LEFT JOIN banks bnk             ON bnk.id = pay.bank_id
+  LEFT JOIN fund_request_lines frl ON frl.id = pay.fund_request_line_id
+  LEFT JOIN fund_requests frq      ON frq.id = frl.fund_request_id
 ${pendingStepJoin(PAYREQ_DOC_TYPES, 'pay')}
 `;
 
@@ -433,6 +437,7 @@ function bodyToCols(b: any) {
     purchase_order_id: b.purchase_order_id != null && b.purchase_order_id !== '' ? Number(b.purchase_order_id) : null,
     entity_id: b.entity_id != null ? Number(b.entity_id) : null,
     budget_code_id: b.budget_code_id != null && b.budget_code_id !== '' ? Number(b.budget_code_id) : null,
+    fund_request_line_id: b.fund_request_line_id != null && b.fund_request_line_id !== '' ? Number(b.fund_request_line_id) : null,
     reason: b.reason ?? null,
     person_in_charge: b.person_in_charge ?? null,
     activity_date: b.activity_date || null,
@@ -477,6 +482,27 @@ function creatorMayFile(req: Request, kind: string): string | null {
     + '(tanpa PR/PO). Payment Request atas PR atau PO diajukan oleh Procurement.';
 }
 
+/**
+ * The Fund Request budget line a payment realises. It must be a budget line of an
+ * approved, still-open month of the SAME PT — paying JNBS money against an SNBS
+ * budget would make both reports wrong. Returns the line's budget code so a
+ * request that names a line need not name the code twice.
+ */
+async function fundRequestLine(lineId: number, entityId: number): Promise<{ budgetCodeId: number | null } | { error: string }> {
+  const [rows] = await pool.query(
+    `SELECT l.id, l.section, l.budget_code_id, fr.entity_id, fr.stage, fr.closed_at, fr.fr_number
+       FROM fund_request_lines l JOIN fund_requests fr ON fr.id = l.fund_request_id WHERE l.id = ? LIMIT 1`, [lineId]);
+  const l = (rows as any[])[0];
+  if (!l) return { error: 'Item fund request tidak ditemukan.' };
+  if (Number(l.entity_id) !== Number(entityId)) return { error: 'Item fund request itu milik PT lain.' };
+  if (!['shifted', 'new_item', 'offtake_out', 'trading_shifted', 'trading_new'].includes(l.section)) {
+    return { error: 'Yang bisa dipilih hanya item budget (pengeluaran) dari fund request.' };
+  }
+  if (l.stage !== 'hq_approved') return { error: `Fund request ${l.fr_number} belum disetujui HQ.` };
+  if (l.closed_at) return { error: `Fund request ${l.fr_number} sudah ditutup.` };
+  return { budgetCodeId: l.budget_code_id ?? null };
+}
+
 // POST /api/payment-requests  (CHECK: PR or PO source required)
 router.post('/', authenticate, requireRole(...PAYREQ_CREATORS), async (req: Request, res: Response) => {
   try {
@@ -506,11 +532,18 @@ router.post('/', authenticate, requireRole(...PAYREQ_CREATORS), async (req: Requ
       if ('error' in scoped) return res.status(422).json({ message: scoped.error });
       entityId = scoped.entityId;
     }
+    // The Fund Request line it realises (optional): same PT, approved month.
+    let lineCode: number | null = null;
+    if (b.fund_request_line_id != null && b.fund_request_line_id !== '') {
+      const fl = await fundRequestLine(Number(b.fund_request_line_id), entityId);
+      if ('error' in fl) return res.status(422).json({ message: fl.error });
+      lineCode = fl.budgetCodeId;
+    }
     // Called "Project Code" on a PayReq and "Budget Code" on a PR/PO, but it is the
     // same budget_codes list. Optional upstream, mandatory here: this is the document
     // that moves cash, so the spend has to land against a code.
     const inheritedCode = (b.budget_code_id == null || b.budget_code_id === '')
-      ? (expense ? null : await budgetCodeFromSource(b))
+      ? (lineCode ?? (expense ? null : await budgetCodeFromSource(b)))
       : null;
     if ((b.budget_code_id == null || b.budget_code_id === '') && inheritedCode == null) {
       return res.status(422).json({
@@ -613,6 +646,16 @@ const update = async (req: Request, res: Response) => {
     // Editing may leave the code alone, but it may not clear it.
     if (b.budget_code_id !== undefined && (b.budget_code_id === null || b.budget_code_id === '')) {
       return res.status(422).json({ message: 'budget_code_id (Project Code) cannot be cleared' });
+    }
+    if (b.fund_request_line_id != null && b.fund_request_line_id !== ''
+        && Number(b.fund_request_line_id) !== Number(prev.fund_request_line_id)) {
+      const fl = await fundRequestLine(Number(b.fund_request_line_id), Number(prev.entity_id));
+      if ('error' in fl) return res.status(422).json({ message: fl.error });
+    }
+    // Once paid, the money is the Actual of its line; moving it would rewrite a closed figure.
+    if (b.fund_request_line_id !== undefined && prev.status === 'Paid'
+        && Number(b.fund_request_line_id || 0) !== Number(prev.fund_request_line_id || 0)) {
+      return res.status(409).json({ message: 'Payment request yang sudah Paid tidak bisa dipindah ke item fund request lain.' });
     }
     const c: any = bodyToCols(b);
     // Only set provided fields.

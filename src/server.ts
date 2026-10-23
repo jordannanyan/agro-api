@@ -24,6 +24,7 @@ import notificationsRoutes from './routes/notifications';
 import bankStatementsRoutes from './routes/bankStatements';
 import warehouseStockRoutes from './routes/warehouseStock';
 import financeRoutes from './routes/finance';
+import fundRequestRoutes from './routes/fundRequests';
 import dashboardRoutes from './routes/dashboard';
 import profitSharingRoutes from './routes/profitSharing';
 import distributedSaprodiRoutes from './routes/distributedSaprodi';
@@ -36,7 +37,7 @@ import {
   budgetCodesRouter, unitsRouter, paymentMethodsRouter,
   preFinanceTypesRouter, sapropdiRouter, commoditiesRouter, gradesRouter, offtakersRouter,
   kthRouter, warehousesRouter, collectorsRouter, vendorsRouter, approvalRoutesRouter,
-  reorderLevelsRouter, budgetsRouter,
+  reorderLevelsRouter, financeDimensionsRouter,
 } from './routes/masters';
 
 const app = express();
@@ -88,7 +89,8 @@ app.use('/api/collectors', collectorsRouter);
 app.use('/api/vendors', vendorsRouter);
 app.use('/api/approval-routes', approvalRoutesRouter);
 app.use('/api/reorder-levels', reorderLevelsRouter);
-app.use('/api/budgets', budgetsRouter);
+// /api/budgets (manual budget) is retired: the budget is the approved Fund Request lines.
+app.use('/api/finance-dimensions', financeDimensionsRouter);
 
 // Business transactions are read-only for roles that only supervise them (Admin).
 // Master data, users and roles are deliberately outside this guard.
@@ -140,6 +142,8 @@ app.use('/api/distributed-sapropdi', distributedSaprodiRoutes);
 // transaction, not master-data upkeep, so the supervising roles read it only.
 app.use('/api/profit-sharing', ...opsGuard, profitSharingRoutes);
 app.use('/api/finance', financeRoutes);
+// Not behind opsGuard: HQ and Admin read it, and the HQ signs — rights are per action.
+app.use('/api/fund-requests', fundRequestRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 
 // 404

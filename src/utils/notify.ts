@@ -26,7 +26,12 @@ export type NotificationKind =
   | 'stock_shortage'    // what arrived did not match what was ordered
   | 'opname_submitted'  // a stock count asks the PM to adjust the stock
   | 'opname_approved'   // the PM agreed; the stock now matches the count
-  | 'opname_rejected';  // the PM sent it back, with the reason
+  | 'opname_rejected'   // the PM sent it back, with the reason
+  | 'fr_prepared'       // a fund request waits for the Director signers
+  | 'fr_director_approved' // … then for the HQ signers
+  | 'fr_approved'       // fully signed: the month's budget is active
+  | 'fr_rejected'       // sent back to Finance, with the reason
+  | 'fr_realloc';       // a budget move asks for / got the Director's decision
 
 export interface NotificationInput {
   kind: NotificationKind;

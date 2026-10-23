@@ -180,7 +180,32 @@ async function opnameCounts(user: AuthUser, scope: number | null) {
   return { approval, revision, total: approval + revision };
 }
 
-// GET /api/documents/inbox → { PR, PO, PayReq, Reimbursement, StockOpname, total }
+/**
+ * Fund requests waiting on this person (2026-10): a signature at the stage they
+ * sign, a budget move a Director has to decide, and — for Finance — a request sent
+ * back to them.
+ */
+async function fundRequestCounts(user: AuthUser) {
+  const signerStage = `(SELECT COUNT(*) FROM fund_request_signers s
+      WHERE s.user_id = ? AND s.is_active = 1 AND (s.entity_id IS NULL OR s.entity_id = fr.entity_id)
+        AND s.stage = IF(fr.stage = 'prepared', 'director', 'hq'))`;
+  const approval = await countOne(
+    `SELECT COUNT(*) AS n FROM fund_requests fr
+      WHERE fr.closed_at IS NULL AND fr.stage IN ('prepared','director_approved')
+        AND ${signerStage} > 0
+        AND NOT EXISTS (SELECT 1 FROM fund_request_signatures g WHERE g.fund_request_id = fr.id AND g.user_id = ?
+                          AND g.stage = IF(fr.stage = 'prepared', 'director', 'hq'))`, [user.id, user.id])
+    + await countOne(
+      `SELECT COUNT(*) AS n FROM fund_request_reallocations r JOIN fund_requests fr ON fr.id = r.fund_request_id
+        WHERE r.status = 'pending' AND EXISTS (SELECT 1 FROM fund_request_signers s WHERE s.user_id = ?
+          AND s.stage = 'director' AND s.is_active = 1 AND (s.entity_id IS NULL OR s.entity_id = fr.entity_id))`, [user.id]);
+  const isFinance = user.roleCode === ROLE.FINANCE_MANAGER || user.roleCode === ROLE.FINANCE_STAFF;
+  const revision = isFinance ? await countOne(
+    `SELECT COUNT(*) AS n FROM fund_requests WHERE stage = 'requested' AND rejected_at IS NOT NULL AND closed_at IS NULL`, []) : 0;
+  return { approval, revision, total: approval + revision };
+}
+
+// GET /api/documents/inbox → { PR, PO, PayReq, Reimbursement, StockOpname, FundRequest, total }
 router.get('/inbox', authenticate, async (req: Request, res: Response) => {
   const empty = {
     PR: { approval: 0, revision: 0, total: 0 },
@@ -188,6 +213,7 @@ router.get('/inbox', authenticate, async (req: Request, res: Response) => {
     PayReq: { approval: 0, revision: 0, payment: 0, total: 0 },
     Reimbursement: { approval: 0, revision: 0, payment: 0, total: 0 },
     StockOpname: { approval: 0, revision: 0, total: 0 },
+    FundRequest: { approval: 0, revision: 0, total: 0 },
     total: 0,
   };
   const user = req.user;
@@ -252,10 +278,11 @@ router.get('/inbox', authenticate, async (req: Request, res: Response) => {
       total: rbApproval + exApproval + rbRevision + exRevision + rbPayment,
     },
     StockOpname: await opnameCounts(user, scope),
+    FundRequest: await fundRequestCounts(user),
     total: 0,
   };
   data.total = data.PR.total + data.PO.total + data.PayReq.total + data.Reimbursement.total
-    + data.StockOpname.total;
+    + data.StockOpname.total + data.FundRequest.total;
   return res.json({ data });
 });
 
