@@ -13,6 +13,11 @@ import type { Pool, PoolConnection } from 'mysql2/promise';
 // The deduction never exceeds what the farmer still owes on that type: past the
 // last rupiah of the loan there is nothing left to deduct, and booking it anyway
 // would turn the farmer's debt into a debt owed to the farmer.
+//
+// A deduction typed by hand that differs from what the rate gives is allowed —
+// SNBS cocoa farmers often pay more than the Rp 5.000/kg minimum when a harvest
+// is good — but it is flagged `is_manual` and needs a reason, so an audit can
+// tell a farmer's choice from a typo.
 // -----------------------------------------------------------------------------
 
 type Db = Pool | PoolConnection;
@@ -129,10 +134,11 @@ export interface RepaymentResult {
   total: number;
   capped: boolean;   // auto deduction limited by the outstanding debt
   no_rate: boolean;  // pre-finance delivery, but no payback rate covers it
+  manual: boolean;   // amounts differ from what the rate gives
 }
 
 export async function syncPurchasingRepayment(
-  conn: PoolConnection, purchasingId: number, mode: 'auto' | RepaymentInput[],
+  conn: PoolConnection, purchasingId: number, mode: 'auto' | RepaymentInput[], reason?: string | null,
 ): Promise<RepaymentResult> {
   const [pRows] = await conn.query(
     `SELECT p.id, p.plot_id, p.grade_id, p.date, p.quantity, p.receipt_invoice, p.supplier_type
@@ -141,11 +147,12 @@ export async function syncPurchasingRepayment(
   if (!pu) throw new RepaymentError('Purchasing not found');
 
   const [exRows] = await conn.query(
-    'SELECT id FROM pre_finance_installments WHERE purchasing_id = ? LIMIT 1', [purchasingId]);
+    'SELECT id, manual_reason FROM pre_finance_installments WHERE purchasing_id = ? LIMIT 1', [purchasingId]);
   const existingId: number | null = (exRows as any[])[0]?.id ?? null;
+  const existingReason: string | null = (exRows as any[])[0]?.manual_reason ?? null;
   const removeExisting = async (noRate = false): Promise<RepaymentResult> => {
     if (existingId) await conn.query('DELETE FROM pre_finance_installments WHERE id = ?', [existingId]);
-    return { installment_id: null, total: 0, capped: false, no_rate: noRate };
+    return { installment_id: null, total: 0, capped: false, no_rate: noRate, manual: false };
   };
 
   const plotId = pu.supplier_type === 'farmer' ? pu.plot_id : null;
@@ -187,20 +194,35 @@ export async function syncPurchasingRepayment(
     }
   }
   lines = lines.filter((l) => l.amount > 0);
+
+  // Manual = what is booked is not what the rate gives, per type.
+  const manual = mode !== 'auto' && s.lines.some((l) => {
+    const typed = lines.find((x) => x.pre_finance_type_id === l.pre_finance_type_id)?.amount ?? 0;
+    return Math.abs(typed - l.amount) > 0.5;
+  });
+  // An edit that re-sends the same manual amounts keeps the reason already given.
+  const why = manual ? (String(reason ?? '').trim() || existingReason || '').slice(0, 255) : '';
+  if (manual && !why) {
+    throw new RepaymentError('Potongan berbeda dari tarif — isi alasannya (mis. petani membayar lebih)');
+  }
+
   if (!lines.length) return removeExisting(mode === 'auto' && !s.rate);
 
   const total = round2(lines.reduce((sum, l) => sum + l.amount, 0));
   let id = existingId;
   if (id) {
     await conn.query(
-      `UPDATE pre_finance_installments SET farmer_id = ?, date = ?, reference_no = ?, total_payment = ?, updated_at = NOW()
-       WHERE id = ?`, [s.farmer_id, pu.date, pu.receipt_invoice || null, total, id]);
+      `UPDATE pre_finance_installments SET farmer_id = ?, date = ?, reference_no = ?, total_payment = ?,
+              is_manual = ?, manual_reason = ?, updated_at = NOW()
+       WHERE id = ?`, [s.farmer_id, pu.date, pu.receipt_invoice || null, total, manual ? 1 : 0, manual ? why : null, id]);
     await conn.query('DELETE FROM pre_finance_installment_details WHERE installment_id = ?', [id]);
   } else {
     const [r] = await conn.query(
-      `INSERT INTO pre_finance_installments (purchasing_id, farmer_id, date, reference_no, total_payment, notes, created_at, updated_at)
-       VALUES (?,?,?,?,?,?,NOW(),NOW())`,
-      [purchasingId, s.farmer_id, pu.date, pu.receipt_invoice || null, total, 'Potongan setoran']);
+      `INSERT INTO pre_finance_installments (purchasing_id, farmer_id, date, reference_no, total_payment, notes,
+              is_manual, manual_reason, created_at, updated_at)
+       VALUES (?,?,?,?,?,?,?,?,NOW(),NOW())`,
+      [purchasingId, s.farmer_id, pu.date, pu.receipt_invoice || null, total, 'Potongan setoran',
+       manual ? 1 : 0, manual ? why : null]);
     id = (r as any).insertId;
   }
   for (const l of lines) {
@@ -208,7 +230,7 @@ export async function syncPurchasingRepayment(
       'INSERT INTO pre_finance_installment_details (installment_id, pre_finance_type_id, amount) VALUES (?,?,?)',
       [id, l.pre_finance_type_id, l.amount]);
   }
-  return { installment_id: id, total, capped: mode === 'auto' && s.capped, no_rate: false };
+  return { installment_id: id, total, capped: mode === 'auto' && s.capped, no_rate: false, manual };
 }
 
 /** The deduction already booked on a delivery, per type. */

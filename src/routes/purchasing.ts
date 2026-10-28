@@ -34,6 +34,7 @@ const SELECT = `
          -- so what actually reached the farmer.
          COALESCE(ri.total_payment, 0) AS repayment_total,
          ri.id AS installment_id,
+         COALESCE(ri.is_manual, 0) AS repayment_manual, ri.manual_reason AS repayment_reason,
          p.total_value - COALESCE(ri.total_payment, 0) AS net_payment
   FROM purchasing p
   LEFT JOIN pre_finance_installments ri ON ri.purchasing_id = p.id
@@ -169,7 +170,7 @@ router.post('/', authenticate, files, async (req: Request, res: Response) => {
       keys.map((k) => cols[k])
     );
     const newId = (result as any).insertId;
-    const rep = await syncPurchasingRepayment(conn, newId, repaymentMode);
+    const rep = await syncPurchasingRepayment(conn, newId, repaymentMode, b.repayment_reason);
     await conn.commit();
     const [rows] = await pool.query(SELECT + ' WHERE p.id = ? LIMIT 1', [newId]);
     const data = shape((rows as any[])[0]);
@@ -248,7 +249,7 @@ const update = async (req: Request, res: Response) => {
     }
     let rep: RepaymentResult | null = null;
     if (explicitRepayment || drivesRate) {
-      rep = await syncPurchasingRepayment(conn, Number(id), repaymentMode);
+      rep = await syncPurchasingRepayment(conn, Number(id), repaymentMode, b.repayment_reason);
     } else if ('receipt_invoice' in updates) {
       // The deduction's reference is the delivery's receipt; keep them in step.
       await conn.query(

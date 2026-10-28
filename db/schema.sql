@@ -1255,6 +1255,10 @@ CREATE TABLE `pre_finance_installments` (
   `upload_proof`      VARCHAR(255) NULL,
   `total_payment`     DECIMAL(18,2) NOT NULL DEFAULT 0,   -- = SUM(details)
   `notes`             TEXT NULL,
+  -- A delivery deduction typed by hand that differs from the payback rate (the
+  -- farmer paid more, say). Allowed, but it must say why.
+  `is_manual`         TINYINT(1) NOT NULL DEFAULT 0,
+  `manual_reason`     VARCHAR(255) NULL,
   `created_at`        DATETIME NULL,
   `updated_at`        DATETIME NULL,
   -- A repayment with a purchasing is the deduction taken from that delivery
