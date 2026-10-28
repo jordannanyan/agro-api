@@ -16,6 +16,8 @@
 //      deduction (2026-05-07) falls in.
 //      NB: these farmers' cocoa loans (ledger: Rp 261,6 jt) are not in the system
 //      yet, so the deduction stays capped at Rp 0 until they are imported.
+//   4. The same Rp 5.000/kg on those farmers' other Pre-Finance plots (added
+//      2026-10-29: the planted plot carrying the loan had no rate).
 //   3. SJ0007 (Kaji) and SJ0013 (Samsi) are Pre-Finance in the list, Beli Putus
 //      here; the list wins.
 //
@@ -100,6 +102,28 @@ async function hasColumn(c, table, col) {
       }
     }
     log(`+ payback_rates Rp ${RATE_PER_KG}/kg since ${RATE_DATE}: ${added} new, ${SNBS_COCOA_PF.length - added} already there`);
+
+    // 4. The minimum is the farmer's, not the plot's: the same farmers' other
+    //    Pre-Finance plots (the planted S0…/N0… plot the loan sits on, a second
+    //    SJ1331… plot) left the purchasing form saying "no rate" for them.
+    //    Only plots with no rate of their own; only farmers holding an SNBS cocoa
+    //    loan (importSnbsCocoaLoans2026-10.js), or on the list above.
+    const [others] = await c.query(
+      `SELECT pl.id, pl.plot_name FROM plot pl
+       WHERE pl.scheme = 'PreFinance'
+         AND pl.farmer_id IN (
+           SELECT farmer_id FROM pre_finance_distributions WHERE description LIKE '%[SNBS-KAKAO-2026-10]%'
+           UNION SELECT farmer_id FROM plot WHERE plot_name IN (?))
+         AND NOT EXISTS (SELECT 1 FROM payback_rates r WHERE r.plot_id = pl.id)
+       ORDER BY pl.plot_name`, [SNBS_COCOA_PF]);
+    if (APPLY) {
+      for (const p of others) {
+        await c.query(
+          `INSERT INTO payback_rates (plot_id, grade_id, effective_date, full_price, saprodi_per_kg, labor_per_kg, notes, created_at, updated_at)
+           VALUES (?, NULL, ?, NULL, ?, 0, ?, NOW(), NOW())`, [p.id, RATE_DATE, RATE_PER_KG, RATE_NOTE]);
+      }
+    }
+    log(`+ payback_rates on the same farmers' other Pre-Finance plots: ${others.length} new${others.length ? ` (${others.map((p) => p.plot_name).join(', ')})` : ''}`);
     log(APPLY ? 'done' : 'dry-run only; re-run with --apply');
   } finally {
     await c.end();
