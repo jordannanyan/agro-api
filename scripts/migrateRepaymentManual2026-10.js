@@ -54,7 +54,7 @@ async function hasColumn(c, table, col) {
 (async () => {
   const c = await mysql.createConnection({
     host: process.env.DB_HOST, port: Number(process.env.DB_PORT || 3306),
-    user: process.env.DB_USER, password: process.env.DB_PASS, database: DB,
+    user: process.env.DB_USER || 'root', password: process.env.DB_PASSWORD || '', database: DB,
   });
   log(`${APPLY ? 'APPLY' : 'DRY-RUN'} on ${DB}`);
   try {
