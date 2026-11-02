@@ -14,7 +14,7 @@ const SELECT = `
   SELECT p.id, p.plot_name, p.land_area, p.number_of_plants, p.exp_cin_plants,
          p.latitude, p.longitude, p.farmer_id, p.scheme, p.created_at, p.updated_at,
          p.parent_plot_id, pp.plot_name AS parent_plot_name,
-         p.commodities_id, c.commodities_name AS commodity_name,
+         p.commodities_id, c.commodities_name AS commodity_name, p.ledger_code,
          ST_AsText(p.polygon) AS polygon_wkt,
          f.farmer_name AS farmer__farmer_name, f.kth_id AS farmer__kth_id
   FROM plot p
@@ -165,6 +165,29 @@ router.get('/:id', authenticate, async (req: Request, res: Response) => {
 
 function validScheme(s: any) { return s === undefined || SCHEMES.includes(s); }
 
+/**
+ * A land has one plot ID: a subplot is named "<land> · <commodity>" ("SJ0015 ·
+ * Pisang"), never by a code of its own. Null when the plot is not a subplot.
+ * Same rule as scripts/migrateSubplotNames2026-11.js.
+ */
+async function subplotName(parentId: number | null | undefined, commodityId: number | null | undefined) {
+  if (!parentId || !commodityId) return null;
+  const [[p]] = await pool.query('SELECT plot_name FROM plot WHERE id = ?', [parentId]) as any;
+  const [[c]] = await pool.query('SELECT commodities_name FROM commodities WHERE id = ?', [commodityId]) as any;
+  if (!p || !c) return null;
+  const short = String(c.commodities_name).match(/\(([^)]+)\)/)?.[1] ?? c.commodities_name;
+  return `${p.plot_name} · ${short}`;
+}
+
+/** After a land is renamed, its subplots follow. */
+async function renameSubplots(landId: number) {
+  const [kids] = await pool.query('SELECT id, commodities_id FROM plot WHERE parent_plot_id = ?', [landId]);
+  for (const k of kids as any[]) {
+    const name = await subplotName(landId, k.commodities_id);
+    if (name) await pool.query('UPDATE plot SET plot_name = ?, updated_at = NOW() WHERE id = ?', [name, k.id]);
+  }
+}
+
 const optNum = (v: any) => (v === undefined ? undefined : v === null || v === '' ? null : Number(v));
 
 /**
@@ -191,6 +214,9 @@ async function subplotError(selfId: number | null, farmerId: number, parentId: n
 router.post('/', authenticate, async (req: Request, res: Response) => {
   try {
     const b = req.body || {};
+    const autoName = await subplotName(b.parent_plot_id != null && b.parent_plot_id !== '' ? Number(b.parent_plot_id) : null,
+      b.commodities_id != null && b.commodities_id !== '' ? Number(b.commodities_id) : null);
+    if (autoName) { if (b.plot_name && b.plot_name !== autoName) b.ledger_code = b.ledger_code ?? b.plot_name; b.plot_name = autoName; }
     if (!b.plot_name || !b.farmer_id) return res.status(422).json({ message: 'plot_name and farmer_id are required' });
     if (!validScheme(b.scheme)) return res.status(422).json({ message: `Invalid scheme. Allowed: ${SCHEMES.join(', ')}` });
     const num = (v: any) => (v != null && v !== '' ? Number(v) : null);
@@ -207,6 +233,7 @@ router.post('/', authenticate, async (req: Request, res: Response) => {
       longitude: num(b.longitude),
       parent_plot_id: num(b.parent_plot_id),
       commodities_id: num(b.commodities_id),
+      ledger_code: b.ledger_code || null,
       created_at: new Date(),
       updated_at: new Date(),
     };
@@ -235,7 +262,7 @@ const update = async (req: Request, res: Response) => {
     const id = req.params.id;
     const b = req.body || {};
     if (!validScheme(b.scheme)) return res.status(422).json({ message: `Invalid scheme. Allowed: ${SCHEMES.join(', ')}` });
-    const [ex] = await pool.query('SELECT id, farmer_id, parent_plot_id FROM plot WHERE id = ? LIMIT 1', [id]);
+    const [ex] = await pool.query('SELECT id, farmer_id, parent_plot_id, commodities_id, plot_name FROM plot WHERE id = ? LIMIT 1', [id]);
     if (!(ex as any[]).length) return res.status(404).json({ message: 'Plot not found' });
     const cur = (ex as any[])[0];
     const parentId = optNum(b.parent_plot_id);
@@ -258,6 +285,17 @@ const update = async (req: Request, res: Response) => {
     set('longitude', b.longitude != null ? Number(b.longitude) : undefined);
     set('parent_plot_id', parentId);
     set('commodities_id', optNum(b.commodities_id));
+    set('ledger_code', b.ledger_code === undefined ? undefined : (b.ledger_code || null));
+    // A subplot's name is its land's plus its commodity, whatever was sent.
+    const finalParent = parentId === undefined ? cur.parent_plot_id : parentId;
+    const finalCommodity = optNum(b.commodities_id) === undefined ? cur.commodities_id : optNum(b.commodities_id);
+    const autoName = await subplotName(finalParent, finalCommodity);
+    if (autoName) {
+      if (!cur.parent_plot_id && autoName !== cur.plot_name && updates.ledger_code === undefined) {
+        updates.ledger_code = cur.plot_name;
+      }
+      updates.plot_name = autoName;
+    }
     const keys = Object.keys(updates);
     const assignments = keys.map((k) => `\`${k}\` = ?`);
     const args: any[] = keys.map((k) => updates[k]);
@@ -275,6 +313,7 @@ const update = async (req: Request, res: Response) => {
       assignments.push('`updated_at` = ?'); args.push(new Date());
       await pool.query(`UPDATE plot SET ${assignments.join(', ')} WHERE id = ?`, [...args, id]);
     }
+    if ('plot_name' in updates && !finalParent) await renameSubplots(Number(id));
     const [rows] = await pool.query(SELECT + ' WHERE p.id = ? LIMIT 1', [id]);
     return res.json({ message: 'Plot updated', data: shape((rows as any[])[0]) });
   } catch (err: any) {

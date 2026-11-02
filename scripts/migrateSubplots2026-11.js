@@ -57,6 +57,7 @@ async function hasColumn(c, col) {
       }
     } else log('= columns already there');
     const cols = APPLY || (await hasColumn(c, 'parent_plot_id'));
+    const hasCode = await hasColumn(c, 'ledger_code');
 
     // 2. links
     const commodity = async (prefix) => {
@@ -67,10 +68,13 @@ async function hasColumn(c, col) {
     for (const L of LANDS) {
       const [rows] = await c.query(
         `SELECT p.id, p.plot_name, p.scheme, p.farmer_id, f.farmer_name
-              ${cols ? ', p.parent_plot_id, p.commodities_id' : ''}
-         FROM plot p LEFT JOIN farmers f ON f.id = p.farmer_id WHERE p.plot_name IN (?, ?)`, [L.land, L.subplot]);
+              ${cols ? ', p.parent_plot_id, p.commodities_id' : ''}${hasCode ? ', p.ledger_code' : ''}
+         FROM plot p LEFT JOIN farmers f ON f.id = p.farmer_id
+         WHERE p.plot_name IN (?, ?)${hasCode ? ' OR p.ledger_code = ?' : ''}`, [L.land, L.subplot, L.subplot]);
+      // After migrateSubplotNames2026-11.js the subplot is called "SJ0015 · Pisang"
+      // and its ledger code lives in ledger_code.
       const land = rows.find((r) => r.plot_name === L.land);
-      const sub = rows.find((r) => r.plot_name === L.subplot);
+      const sub = rows.find((r) => r.plot_name === L.subplot || r.ledger_code === L.subplot);
       if (!land || !sub || rows.length !== 2) throw new Error(`${L.land} / ${L.subplot}: plot tidak ditemukan tepat satu kali`);
       if (land.farmer_id !== sub.farmer_id) throw new Error(`${L.land} dan ${L.subplot} beda petani`);
       if (land.scheme !== 'PreFinance' || sub.scheme !== 'ProfitSharing') {

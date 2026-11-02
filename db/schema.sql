@@ -348,6 +348,10 @@ CREATE TABLE `plot` (
   -- What is harvested from this plot. Within one land it tells the subplots apart,
   -- and purchasing refuses a commodity booked on the sibling that does not grow it.
   `commodities_id`   INT NULL,
+  -- A land has ONE plot ID (user, 2026-11-02): a subplot is named after its land
+  -- and commodity ("SJ0015 · Pisang"). The code the ledgers use for it ("SUW 1")
+  -- is kept here, for matching ledger rows; it is not shown.
+  `ledger_code`      VARCHAR(100) NULL,
   `created_at`       DATETIME NULL,
   `updated_at`       DATETIME NULL,
   CONSTRAINT `fk_plot_farmer` FOREIGN KEY (`farmer_id`) REFERENCES `farmers`(`id`) ON DELETE CASCADE,
