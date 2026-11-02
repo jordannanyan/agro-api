@@ -13,11 +13,15 @@ const SCHEMES = ['BeliPutus', 'PreFinance', 'ProfitSharing'] as const;
 const SELECT = `
   SELECT p.id, p.plot_name, p.land_area, p.number_of_plants, p.exp_cin_plants,
          p.latitude, p.longitude, p.farmer_id, p.scheme, p.created_at, p.updated_at,
+         p.parent_plot_id, pp.plot_name AS parent_plot_name,
+         p.commodities_id, c.commodities_name AS commodity_name,
          ST_AsText(p.polygon) AS polygon_wkt,
          f.farmer_name AS farmer__farmer_name, f.kth_id AS farmer__kth_id
   FROM plot p
-  LEFT JOIN farmers f ON f.id = p.farmer_id
-  LEFT JOIN kth k     ON k.id = f.kth_id
+  LEFT JOIN farmers f     ON f.id = p.farmer_id
+  LEFT JOIN kth k         ON k.id = f.kth_id
+  LEFT JOIN plot pp       ON pp.id = p.parent_plot_id
+  LEFT JOIN commodities c ON c.id = p.commodities_id
 `;
 
 function shape(row: any) {
@@ -161,6 +165,28 @@ router.get('/:id', authenticate, async (req: Request, res: Response) => {
 
 function validScheme(s: any) { return s === undefined || SCHEMES.includes(s); }
 
+const optNum = (v: any) => (v === undefined ? undefined : v === null || v === '' ? null : Number(v));
+
+/**
+ * A subplot lies on another plot of the SAME farmer, one level deep: the parent
+ * is a land, not itself a subplot, and a plot that already has subplots cannot
+ * become one. Returns an error message, or null.
+ */
+async function subplotError(selfId: number | null, farmerId: number, parentId: number | null) {
+  if (parentId == null) return null;
+  if (selfId != null && parentId === selfId) return 'Plot tidak bisa menjadi subplot dirinya sendiri.';
+  const [rows] = await pool.query('SELECT id, farmer_id, parent_plot_id FROM plot WHERE id = ? LIMIT 1', [parentId]);
+  const parent = (rows as any[])[0];
+  if (!parent) return 'Lahan induk tidak ditemukan.';
+  if (Number(parent.farmer_id) !== Number(farmerId)) return 'Lahan induk harus milik petani yang sama.';
+  if (parent.parent_plot_id) return 'Lahan induk itu sendiri subplot — subplot hanya satu tingkat.';
+  if (selfId != null) {
+    const [kids] = await pool.query('SELECT 1 FROM plot WHERE parent_plot_id = ? LIMIT 1', [selfId]);
+    if ((kids as any[]).length) return 'Plot ini sudah punya subplot, jadi tidak bisa menjadi subplot.';
+  }
+  return null;
+}
+
 // POST /api/plots
 router.post('/', authenticate, async (req: Request, res: Response) => {
   try {
@@ -168,6 +194,8 @@ router.post('/', authenticate, async (req: Request, res: Response) => {
     if (!b.plot_name || !b.farmer_id) return res.status(422).json({ message: 'plot_name and farmer_id are required' });
     if (!validScheme(b.scheme)) return res.status(422).json({ message: `Invalid scheme. Allowed: ${SCHEMES.join(', ')}` });
     const num = (v: any) => (v != null && v !== '' ? Number(v) : null);
+    const subErr = await subplotError(null, Number(b.farmer_id), num(b.parent_plot_id));
+    if (subErr) return res.status(422).json({ message: subErr });
     const cols: any = {
       plot_name: b.plot_name,
       farmer_id: Number(b.farmer_id),
@@ -177,6 +205,8 @@ router.post('/', authenticate, async (req: Request, res: Response) => {
       exp_cin_plants: num(b.exp_cin_plants),
       latitude: num(b.latitude),
       longitude: num(b.longitude),
+      parent_plot_id: num(b.parent_plot_id),
+      commodities_id: num(b.commodities_id),
       created_at: new Date(),
       updated_at: new Date(),
     };
@@ -205,8 +235,17 @@ const update = async (req: Request, res: Response) => {
     const id = req.params.id;
     const b = req.body || {};
     if (!validScheme(b.scheme)) return res.status(422).json({ message: `Invalid scheme. Allowed: ${SCHEMES.join(', ')}` });
-    const [ex] = await pool.query('SELECT id FROM plot WHERE id = ? LIMIT 1', [id]);
+    const [ex] = await pool.query('SELECT id, farmer_id, parent_plot_id FROM plot WHERE id = ? LIMIT 1', [id]);
     if (!(ex as any[]).length) return res.status(404).json({ message: 'Plot not found' });
+    const cur = (ex as any[])[0];
+    const parentId = optNum(b.parent_plot_id);
+    const farmerId = b.farmer_id != null ? Number(b.farmer_id) : Number(cur.farmer_id);
+    // Checked whenever either side of the link could move: a new parent, or the
+    // plot moving to another farmer while it is (or has) a subplot.
+    if (parentId !== undefined || b.farmer_id != null) {
+      const subErr = await subplotError(Number(id), farmerId, parentId === undefined ? cur.parent_plot_id : parentId);
+      if (subErr) return res.status(422).json({ message: subErr });
+    }
     const updates: Record<string, any> = {};
     const set = (k: string, v: any) => { if (v !== undefined) updates[k] = v; };
     set('plot_name', b.plot_name);
@@ -217,6 +256,8 @@ const update = async (req: Request, res: Response) => {
     set('exp_cin_plants', b.exp_cin_plants != null ? Number(b.exp_cin_plants) : undefined);
     set('latitude', b.latitude != null ? Number(b.latitude) : undefined);
     set('longitude', b.longitude != null ? Number(b.longitude) : undefined);
+    set('parent_plot_id', parentId);
+    set('commodities_id', optNum(b.commodities_id));
     const keys = Object.keys(updates);
     const assignments = keys.map((k) => `\`${k}\` = ?`);
     const args: any[] = keys.map((k) => updates[k]);

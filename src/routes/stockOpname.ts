@@ -17,9 +17,14 @@
 // ketiga di v_saprodi_stock yang menunjuk balik ke opname penyebabnya. Opname yang
 // sudah diterapkan tidak bisa diubah atau dihapus lagi: angka stok bersandar padanya.
 //
-// Satu gudang, satu opname per 30 hari. Aturan itu dijaga di sini dan bukan
-// dianjurkan di layar, karena "sekali sebulan" yang boleh dilanggar diam-diam
-// bukan jadwal, cuma niat.
+// Opname boleh kapan saja (2026-11-02: aturan "satu gudang satu opname per 30
+// hari" dicabut — hitungan JNBS 28 Oktober jatuh 29 hari setelah yang September).
+// Yang tetap dijaga hanya yang membuat angka stok salah, bukan jadwalnya:
+//   - satu gudang, satu opname per TANGGAL;
+//   - tidak ada opname baru selama opname gudang itu masih menunggu PM;
+//   - opname yang lebih tua dari opname terakhir yang sudah diterapkan tidak bisa
+//     disetujui. Penyesuaian = fisik − sisa SAAT disetujui, jadi hitungan lama
+//     yang disetujui belakangan akan menimpa hitungan yang lebih baru.
 //
 // Menyesuaikan stok butuh persetujuan PM (2026-10-22). Petugas gudang mencatat
 // hitungan (Draft), lalu MENGAJUKAN penyesuaian; Project Manager PT pemilik gudang
@@ -43,8 +48,6 @@ import { respondList } from '../utils/pagination';
 
 export const router = Router();
 
-/** Sekali setiap 30 hari, per gudang. */
-export const OPNAME_INTERVAL_DAYS = 30;
 
 const SELECT = `
   SELECT o.*, w.warehouse_name, u.name AS counted_by_name, ua.name AS applied_by_name,
@@ -86,34 +89,27 @@ const LINE_SELECT = `
  * perhitungan terpisah untuk satu aturan adalah dua perhitungan yang suatu saat
  * berbeda pendapat.
  */
-async function intervalCheck(warehouseId: number, forDate: string) {
+/** Boleh membuat opname di gudang ini pada tanggal ini? */
+async function openCheck(warehouseId: number, forDate: string) {
   const [rows] = await pool.query(
-    `SELECT id, opname_number, opname_date,
-            DATEDIFF(?, opname_date) AS day_gap
+    `SELECT id, opname_number, opname_date, approval_status
        FROM stock_opname
-      WHERE warehouse_id = ?
-      ORDER BY ABS(DATEDIFF(?, opname_date)) ASC
+      WHERE warehouse_id = ? AND (opname_date = ? OR approval_status = 'Pending')
+      ORDER BY (approval_status = 'Pending') DESC, id DESC
       LIMIT 1`,
-    [forDate, warehouseId, forDate]);
-  const last = (rows as any[])[0];
-  if (!last) return { ok: true as const, last: null };
-
-  const gap = Math.abs(Number(last.day_gap));
-  if (gap >= OPNAME_INTERVAL_DAYS) return { ok: true as const, last };
-
-  // Tanggal boleh berikutnya dihitung dari opname TERDEKAT, bukan yang terakhir
-  // dibuat: sebuah hitungan yang dimundurkan tanggalnya tetap menutup jendela di
-  // sekitarnya.
-  const [[next]] = await pool.query(
-    'SELECT DATE_ADD(?, INTERVAL ? DAY) AS d', [last.opname_date, OPNAME_INTERVAL_DAYS]) as any;
-  return {
-    ok: false as const,
-    last,
-    nextAllowed: next.d,
-    message: `Gudang ini sudah diopname pada ${String(last.opname_date).slice(0, 10)} `
-      + `(${last.opname_number}). Opname berikutnya paling cepat `
-      + `${String(next.d).slice(0, 10)} — satu gudang satu opname per ${OPNAME_INTERVAL_DAYS} hari.`,
-  };
+    [warehouseId, forDate]);
+  const hit = (rows as any[])[0];
+  const [lastRows] = await pool.query(
+    'SELECT id, opname_number, opname_date FROM stock_opname WHERE warehouse_id = ? ORDER BY opname_date DESC, id DESC LIMIT 1',
+    [warehouseId]);
+  const last = (lastRows as any[])[0] || null;
+  if (!hit) return { ok: true as const, last };
+  const message = hit.approval_status === 'Pending'
+    ? `Opname ${hit.opname_number} (${String(hit.opname_date).slice(0, 10)}) di gudang ini masih menunggu `
+      + 'persetujuan PM. Selesaikan dulu — disetujui atau ditolak — sebelum membuat opname baru.'
+    : `Gudang ini sudah diopname pada ${String(hit.opname_date).slice(0, 10)} (${hit.opname_number}). `
+      + 'Satu gudang satu opname per tanggal — ubah opname itu, atau pilih tanggal lain.';
+  return { ok: false as const, last: hit, message };
 }
 
 /** Dokumen ini milik PT pemanggil? Dipakai sebelum membaca atau mengubahnya. */
@@ -154,7 +150,7 @@ router.get('/sheet', authenticate, async (req: Request, res: Response) => {
     }
 
     const date = String(req.query.date || '').slice(0, 10) || new Date().toISOString().slice(0, 10);
-    const check = await intervalCheck(warehouseId, date);
+    const check = await openCheck(warehouseId, date);
 
     // Dibaca dari view yang sama dengan yang dipakai laporan, supaya angka "sistem"
     // di lembar ini persis angka yang dilihat orang di Inventory Saprodi.
@@ -177,9 +173,9 @@ router.get('/sheet', authenticate, async (req: Request, res: Response) => {
         date,
         allowed: check.ok,
         last_opname: check.last,
-        next_allowed: check.ok ? null : (check as any).nextAllowed,
+        next_allowed: null,
         message: check.ok ? null : (check as any).message,
-        interval_days: OPNAME_INTERVAL_DAYS,
+        interval_days: null,
         items,
       },
     });
@@ -313,13 +309,10 @@ router.post('/', authenticate, async (req: Request, res: Response) => {
       }
     }
 
-    // Aturan 30 hari diperiksa SEBELUM apa pun ditulis.
-    const check = await intervalCheck(warehouseId, date);
+    // Diperiksa SEBELUM apa pun ditulis.
+    const check = await openCheck(warehouseId, date);
     if (!check.ok) {
-      return res.status(409).json({
-        message: (check as any).message,
-        data: { last_opname: check.last, next_allowed: (check as any).nextAllowed },
-      });
+      return res.status(409).json({ message: (check as any).message, data: { last_opname: check.last } });
     }
 
     const parsed = await readLines(warehouseId, b.lines);
@@ -352,9 +345,9 @@ router.post('/', authenticate, async (req: Request, res: Response) => {
 
 // PUT /api/stock-opname/:id — membetulkan hitungan yang salah ketik.
 //
-// Tanggal dan gudangnya TIDAK bisa diubah: keduanya yang menentukan jendela 30 hari,
-// dan memindahkannya lewat edit adalah cara paling mudah untuk menyelinap dari
-// aturan yang baru saja ditegakkan di POST.
+// Tanggal dan gudangnya TIDAK bisa diubah: angka "sistem" di setiap baris dibaca
+// untuk gudang itu, dan urutan tanggal yang menentukan opname mana yang boleh
+// disetujui.
 router.put('/:id', authenticate, async (req: Request, res: Response) => {
   const conn = await pool.getConnection();
   try {
@@ -401,6 +394,33 @@ router.put('/:id', authenticate, async (req: Request, res: Response) => {
     conn.release();
   }
 });
+
+/**
+ * Alasan opname ini belum boleh diajukan/disetujui, atau null.
+ *   - ada opname gudang yang sama yang sudah diterapkan dan TANGGALNYA lebih baru:
+ *     menyetujui yang lama akan mengembalikan stok ke hitungan yang sudah usang;
+ *   - (saat mengajukan) ada opname lain di gudang itu yang masih menunggu PM.
+ */
+async function approvalBlocker(db: any, o: any, opts: { pendingToo: boolean }) {
+  const [newer] = await db.query(
+    `SELECT opname_number, opname_date FROM stock_opname
+      WHERE warehouse_id = ? AND id <> ? AND applied_at IS NOT NULL AND opname_date > ?
+      ORDER BY opname_date DESC LIMIT 1`, [o.warehouse_id, o.id, o.opname_date]);
+  const n = (newer as any[])[0];
+  if (n) {
+    return `Gudang ini sudah punya opname yang lebih baru dan sudah diterapkan — ${n.opname_number} `
+      + `(${String(n.opname_date).slice(0, 10)}). Hitungan ${String(o.opname_date).slice(0, 10)} sudah usang; `
+      + 'menyetujuinya akan mengembalikan stok ke angka lama.';
+  }
+  if (opts.pendingToo) {
+    const [pend] = await db.query(
+      `SELECT opname_number FROM stock_opname
+        WHERE warehouse_id = ? AND id <> ? AND approval_status = 'Pending' LIMIT 1`, [o.warehouse_id, o.id]);
+    const p = (pend as any[])[0];
+    if (p) return `Opname ${p.opname_number} di gudang ini masih menunggu PM. Selesaikan dulu yang itu.`;
+  }
+  return null;
+}
 
 /**
  * Pakai hasil hitungan untuk membetulkan catatan stok — dipanggil HANYA dari
@@ -491,6 +511,8 @@ router.post('/:id/submit', authenticate, async (req: Request, res: Response) => 
         message: 'Tidak ada selisih antara catatan dan hitungan fisik — tidak ada yang perlu disesuaikan.',
       });
     }
+    const blocker = await approvalBlocker(pool, prev, { pendingToo: true });
+    if (blocker) return res.status(409).json({ message: blocker });
     await pool.query(
       `UPDATE stock_opname SET approval_status = 'Pending', submitted_by_user_id = ?, submitted_at = NOW(),
               reviewed_by_user_id = NULL, reviewed_at = NULL, updated_at = NOW() WHERE id = ?`,
@@ -535,6 +557,11 @@ router.post('/:id/approve', authenticate, async (req: Request, res: Response) =>
     if (!cur || cur.approval_status !== 'Pending' || cur.applied_at) {
       await conn.rollback();
       return res.status(409).json({ message: 'Opname ini tidak sedang menunggu persetujuan.' });
+    }
+    const blocker = await approvalBlocker(conn, prev, { pendingToo: false });
+    if (blocker) {
+      await conn.rollback();
+      return res.status(409).json({ message: blocker });
     }
     const r = await applyOpname(conn, prev, uid(req));
     await conn.query(

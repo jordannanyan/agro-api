@@ -118,6 +118,31 @@ function repaymentNote(r: RepaymentResult | null): string | undefined {
   return undefined;
 }
 
+/**
+ * One land farmed under two schemes keeps one plot per commodity (subplots,
+ * plot.parent_plot_id). A delivery booked on the sibling that does not grow the
+ * commodity would land in the wrong scheme — banana on the cocoa Pre-Finance plot
+ * gets a price and a loan deduction instead of Rp 0 and a profit share. Refused,
+ * naming the right plot. Plots outside a land, or with no commodity set, pass.
+ */
+async function subplotMismatch(plotId: number | null, commodityId: number | null): Promise<string | null> {
+  if (!plotId || !commodityId) return null;
+  const [rows] = await pool.query(
+    `SELECT p.plot_name, p.commodities_id, COALESCE(p.parent_plot_id, p.id) AS land_id
+     FROM plot p WHERE p.id = ? LIMIT 1`, [plotId]);
+  const plot = (rows as any[])[0];
+  if (!plot || !plot.commodities_id || Number(plot.commodities_id) === Number(commodityId)) return null;
+  const [sib] = await pool.query(
+    `SELECT p.plot_name, p.scheme, c.commodities_name
+     FROM plot p JOIN commodities c ON c.id = p.commodities_id
+     WHERE (p.id = ? OR p.parent_plot_id = ?) AND p.commodities_id = ? AND p.id <> ? LIMIT 1`,
+    [plot.land_id, plot.land_id, commodityId, plotId]);
+  const s = (sib as any[])[0];
+  if (!s) return null;
+  const label: Record<string, string> = { BeliPutus: 'Beli Putus', PreFinance: 'Pre-Finance', ProfitSharing: 'Profit Sharing' };
+  return `${s.commodities_name} dari lahan ini dicatat di subplot ${s.plot_name} (${label[s.scheme] ?? s.scheme}), bukan di ${plot.plot_name}.`;
+}
+
 // POST /api/purchasing
 router.post('/', authenticate, files, async (req: Request, res: Response) => {
   const conn = await pool.getConnection();
@@ -133,6 +158,8 @@ router.post('/', authenticate, files, async (req: Request, res: Response) => {
     if (b.payment_status && !PAYMENT_STATUSES.includes(b.payment_status)) return res.status(422).json({ message: 'Invalid payment_status' });
 
     const plotId = b.plot_id != null && b.plot_id !== '' ? Number(b.plot_id) : null;
+    const wrongSubplot = await subplotMismatch(supplierType === 'farmer' ? plotId : null, Number(b.commodities_id));
+    if (wrongSubplot) return res.status(422).json({ message: wrongSubplot });
     const scheme = await schemeForPlot(plotId);
     // ProfitSharing: raw material is not bought outright → price is always 0.
     const price = scheme === 'ProfitSharing'
@@ -191,7 +218,7 @@ const update = async (req: Request, res: Response) => {
   try {
     const id = req.params.id;
     const [ex] = await pool.query(
-      'SELECT id, plot_id, grade_id, date, quantity, supplier_type FROM purchasing WHERE id = ? LIMIT 1', [id]);
+      'SELECT id, plot_id, grade_id, date, quantity, supplier_type, commodities_id FROM purchasing WHERE id = ? LIMIT 1', [id]);
     if (!(ex as any[]).length) return res.status(404).json({ message: 'Purchasing not found' });
     const before = (ex as any[])[0];
     const b = req.body || {};
@@ -215,6 +242,10 @@ const update = async (req: Request, res: Response) => {
     } else {
       effectivePlotId = (ex as any[])[0].plot_id ?? null;
     }
+    const supplierAfter = b.supplier_type ?? before.supplier_type;
+    const wrongSubplot = await subplotMismatch(supplierAfter === 'farmer' ? effectivePlotId ?? null : null,
+      b.commodities_id != null ? Number(b.commodities_id) : Number(before.commodities_id));
+    if (wrongSubplot) return res.status(422).json({ message: wrongSubplot });
     const effectiveScheme = await schemeForPlot(effectivePlotId);
     set('collector_id', b.collector_id !== undefined ? (b.collector_id === '' || b.collector_id === null ? null : Number(b.collector_id)) : undefined);
     set('supplier_type', b.supplier_type);

@@ -339,9 +339,20 @@ CREATE TABLE `plot` (
   -- The ledger's `Inside KTH SJ` column. A plot outside the farmer group earns no
   -- KTH cut when its share of a sale is worked out.
   `inside_kth`       TINYINT(1) NOT NULL DEFAULT 1,
+  -- Subplot: one piece of land farmed under two schemes, one per commodity —
+  -- Suwanto's cocoa is Pre-Finance (SJ0015) and the banana between it is Profit
+  -- Sharing (SUW 1). Each keeps its own plot row, because debt, deductions,
+  -- investments and profit sharing all hang off the plot and must not mix; the
+  -- subplot points at the land it lies on. One level only: a parent has no parent.
+  `parent_plot_id`   INT NULL,
+  -- What is harvested from this plot. Within one land it tells the subplots apart,
+  -- and purchasing refuses a commodity booked on the sibling that does not grow it.
+  `commodities_id`   INT NULL,
   `created_at`       DATETIME NULL,
   `updated_at`       DATETIME NULL,
-  CONSTRAINT `fk_plot_farmer` FOREIGN KEY (`farmer_id`) REFERENCES `farmers`(`id`) ON DELETE CASCADE
+  CONSTRAINT `fk_plot_farmer` FOREIGN KEY (`farmer_id`) REFERENCES `farmers`(`id`) ON DELETE CASCADE,
+  CONSTRAINT `fk_plot_parent` FOREIGN KEY (`parent_plot_id`) REFERENCES `plot`(`id`) ON DELETE SET NULL,
+  CONSTRAINT `fk_plot_commodity` FOREIGN KEY (`commodities_id`) REFERENCES `commodities`(`id`) ON DELETE SET NULL
 ) ENGINE=InnoDB;
 
 CREATE TABLE `collectors` (
