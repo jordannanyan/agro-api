@@ -80,12 +80,16 @@ export async function outstandingByType(db: Db, farmerId: number, excludePurchas
 export async function suggestRepayment(db: Db, p: {
   plotId: number | null; gradeId: number | null; date: string; quantity: number;
   excludePurchasingId?: number | null;
+  // The delivery's own scheme (purchasing.scheme) when it already exists; the
+  // plot's current one otherwise. A Pre-Finance delivery on a plot that has since
+  // become profit sharing still repays its loan.
+  scheme?: string | null;
 }): Promise<RepaymentSuggestion> {
   const none: RepaymentSuggestion = { applies: false, farmer_id: null, rate: null, lines: [], total: 0, capped: false };
   if (!p.plotId) return none;
   const [plotRows] = await db.query('SELECT scheme, farmer_id FROM plot WHERE id = ? LIMIT 1', [p.plotId]);
   const plot = (plotRows as any[])[0];
-  if (!plot || plot.scheme !== 'PreFinance' || !plot.farmer_id) return none;
+  if (!plot || (p.scheme ?? plot.scheme) !== 'PreFinance' || !plot.farmer_id) return none;
 
   const rate = p.date ? await findPaybackRate(db, p.plotId, p.gradeId, p.date) : null;
   const perKg: Record<string, number> = {
@@ -142,7 +146,7 @@ export async function syncPurchasingRepayment(
   conn: PoolConnection, purchasingId: number, mode: 'auto' | RepaymentInput[], reason?: string | null,
 ): Promise<RepaymentResult> {
   const [pRows] = await conn.query(
-    `SELECT p.id, p.plot_id, p.grade_id, p.date, p.quantity, p.receipt_invoice, p.supplier_type
+    `SELECT p.id, p.plot_id, p.grade_id, p.date, p.quantity, p.receipt_invoice, p.supplier_type, p.scheme
      FROM purchasing p WHERE p.id = ? LIMIT 1`, [purchasingId]);
   const pu = (pRows as any[])[0];
   if (!pu) throw new RepaymentError('Purchasing not found');
@@ -167,7 +171,7 @@ export async function syncPurchasingRepayment(
 
   const s = await suggestRepayment(conn, {
     plotId, gradeId: pu.grade_id, date: String(pu.date).slice(0, 10),
-    quantity: Number(pu.quantity), excludePurchasingId: purchasingId,
+    quantity: Number(pu.quantity), excludePurchasingId: purchasingId, scheme: pu.scheme,
   });
   if (!s.applies) {
     if (mode !== 'auto' && mode.some((m) => m.amount > 0)) {

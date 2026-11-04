@@ -329,10 +329,10 @@ async function readLedger(file) {
     for (const lp of plan.purInsert) {
       const [r] = await conn.query(
         `INSERT INTO purchasing (plot_id, supplier_type, commodities_id, grade_id, warehouse_id, receipt_invoice,
-           date, quantity, price_per_unit, payment_status, is_process, created_at, updated_at)
-         VALUES (?, 'farmer', ?, ?, ?, ?, ?, ?, ?, 'paid', 0, ?, ?)`,
+           date, quantity, price_per_unit, scheme, payment_status, is_process, created_at, updated_at)
+         VALUES (?, 'farmer', ?, ?, ?, ?, ?, ?, ?, (SELECT pl.scheme FROM plot pl WHERE pl.id = ?), 'paid', 0, ?, ?)`,
         [lp.res.id, COMM_BANANA, lp.res.grade, WH_AML, `BAN-AML-${lp.doNo}`,
-          lp.date, lp.qty, lp.price, now, now]);
+          lp.date, lp.qty, lp.price, lp.res.id, now, now]);
       lp.dbId = r.insertId;
     }
     const setLinks = async (procId, pur) => {

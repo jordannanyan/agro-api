@@ -80,7 +80,9 @@ contrib AS (
          SUM(pp.volume_contributed * COALESCE(pu.price_per_unit, 0)) AS plot_purchase_value
   FROM processing_purchasings pp
   JOIN purchasing pu ON pu.id = pp.purchasing_id
-  WHERE pu.plot_id IS NOT NULL
+  -- Only deliveries made under profit sharing earn a share. A plot that was
+  -- Pre-Finance before its profit-sharing season sold those kilos outright.
+  WHERE pu.plot_id IS NOT NULL AND pu.scheme = 'ProfitSharing'
   GROUP BY pp.processing_id, pu.plot_id
 ),
 sold AS (

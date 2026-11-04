@@ -66,13 +66,13 @@ router.get('/executive', authenticate, async (req: Request, res: Response) => {
     // Purchasing by scheme. The scope fragment brings its own plot join (es_pl) —
     // the scheme is read from the one already joined here.
     const [bySchemeRows] = await pool.query(
-      `SELECT COALESCE(pl.scheme,'BeliPutus') AS scheme, COUNT(*) AS count,
+      `SELECT p.scheme AS scheme, COUNT(*) AS count,
               COALESCE(SUM(p.quantity),0) AS qty, COALESCE(SUM(p.total_value),0) AS value
        FROM purchasing p
        LEFT JOIN plot pl ON pl.id = p.plot_id
        ${purchasingScope('p')}
        ${whereClause(byEntity)}
-       GROUP BY COALESCE(pl.scheme,'BeliPutus')`, a);
+       GROUP BY p.scheme`, a);
 
     // Monthly trend (last 6 months) of purchasing value & selling revenue. Each
     // derived table is its own alias namespace, so the fragment repeats safely;

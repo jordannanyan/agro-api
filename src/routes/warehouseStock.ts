@@ -113,7 +113,7 @@ router.get('/stock-card', authenticate, async (req: Request, res: Response) => {
     `SELECT d.date AS date, 'Distribution' AS type, CONCAT('DIST-', d.id) AS ref,
             0 AS qty_in, d.quantity AS qty_out, d.warehouse_id,
             w.warehouse_name, ent.entities_name AS entity_name,
-            COALESCE(pl.scheme, 'BeliPutus') AS scheme
+            COALESCE(d.scheme, 'BeliPutus') AS scheme
      FROM pre_finance_distributions d
      JOIN pre_finance_types t ON t.id = d.pre_finance_type_id
      LEFT JOIN plot pl        ON pl.id = d.plot_id

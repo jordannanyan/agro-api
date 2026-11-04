@@ -20,7 +20,10 @@ const files = upload.fields([
   { name: 'payment_proof', maxCount: 1 },
 ]);
 
-// scheme is DERIVED from plot.scheme; collector purchases default to BeliPutus.
+// `scheme` (in `p.*`) is the plot's scheme on the day of the delivery, stored on
+// the row — a plot that changes scheme keeps its earlier deliveries under the old
+// one (the five JNBS plots were Pre-Finance until 28 Aug 2025: bought at a price,
+// loan deducted). Collector purchases are BeliPutus.
 const SELECT = `
   SELECT p.*,
          pl.plot_name AS plot__plot_name, pl.scheme AS plot__scheme, pl.farmer_id AS plot__farmer_id,
@@ -29,7 +32,6 @@ const SELECT = `
          c.commodities_name AS commodity__commodities_name,
          g.grade_name AS grade__grade_name,
          w.warehouse_name AS warehouse__warehouse_name,
-         COALESCE(pl.scheme, 'BeliPutus') AS scheme,
          -- The loan repayment deducted from this delivery (pre-finance only), and
          -- so what actually reached the farmer.
          COALESCE(ri.total_payment, 0) AS repayment_total,
@@ -77,7 +79,7 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
   if (req.query.commodities_id) { where.push('p.commodities_id = ?'); args.push(req.query.commodities_id); }
   if (req.query.supplier_type)  { where.push('p.supplier_type = ?'); args.push(req.query.supplier_type); }
   if (req.query.payment_status) { where.push('p.payment_status = ?'); args.push(req.query.payment_status); }
-  if (req.query.scheme)         { where.push("COALESCE(pl.scheme,'BeliPutus') = ?"); args.push(req.query.scheme); }
+  if (req.query.scheme)         { where.push('p.scheme = ?'); args.push(req.query.scheme); }
   // Staff bound to one PT see only that PT's purchases — the same rule the
   // dashboard counts by, so the KPI and this table cannot disagree.
   const scope = entityScope(req);
@@ -181,6 +183,7 @@ router.post('/', authenticate, files, async (req: Request, res: Response) => {
       date: b.date,
       quantity: b.quantity != null ? Number(b.quantity) : 0,
       price_per_unit: price,
+      scheme,
       payment_status: b.payment_status ?? 'unpaid',
       is_process: b.is_process ? 1 : 0,
       invoice_file: fileToPath(f?.invoice_file?.[0]),
@@ -218,7 +221,7 @@ const update = async (req: Request, res: Response) => {
   try {
     const id = req.params.id;
     const [ex] = await pool.query(
-      'SELECT id, plot_id, grade_id, date, quantity, supplier_type, commodities_id FROM purchasing WHERE id = ? LIMIT 1', [id]);
+      'SELECT id, plot_id, grade_id, date, quantity, supplier_type, commodities_id, scheme FROM purchasing WHERE id = ? LIMIT 1', [id]);
     if (!(ex as any[]).length) return res.status(404).json({ message: 'Purchasing not found' });
     const before = (ex as any[])[0];
     const b = req.body || {};
@@ -246,7 +249,11 @@ const update = async (req: Request, res: Response) => {
     const wrongSubplot = await subplotMismatch(supplierAfter === 'farmer' ? effectivePlotId ?? null : null,
       b.commodities_id != null ? Number(b.commodities_id) : Number(before.commodities_id));
     if (wrongSubplot) return res.status(422).json({ message: wrongSubplot });
-    const effectiveScheme = await schemeForPlot(effectivePlotId);
+    // A delivery keeps the scheme it was made under; only moving it to another
+    // plot takes that plot's (current) scheme.
+    const plotMoved = (effectivePlotId ?? null) !== (before.plot_id ?? null);
+    const effectiveScheme = plotMoved || !before.scheme ? await schemeForPlot(effectivePlotId) : String(before.scheme);
+    if (effectiveScheme !== before.scheme) updates.scheme = effectiveScheme;
     set('collector_id', b.collector_id !== undefined ? (b.collector_id === '' || b.collector_id === null ? null : Number(b.collector_id)) : undefined);
     set('supplier_type', b.supplier_type);
     set('commodities_id', b.commodities_id != null ? Number(b.commodities_id) : undefined);

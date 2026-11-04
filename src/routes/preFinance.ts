@@ -341,10 +341,17 @@ const RATE_SELECT = `
 paybackRatesRouter.get('/preview', authenticate, async (req: Request, res: Response) => {
   try {
     const num = (v: any) => (v != null && v !== '' ? Number(v) : null);
+    // Editing a delivery on the same plot: it keeps the scheme it was made under.
+    let scheme: string | null = null;
+    if (num(req.query.purchasing_id)) {
+      const [r] = await pool.query('SELECT plot_id, scheme FROM purchasing WHERE id = ? LIMIT 1', [num(req.query.purchasing_id)]);
+      const pu = (r as any[])[0];
+      if (pu && Number(pu.plot_id) === num(req.query.plot_id)) scheme = pu.scheme;
+    }
     const s = await suggestRepayment(pool, {
       plotId: num(req.query.plot_id), gradeId: num(req.query.grade_id),
       date: String(req.query.date || '').slice(0, 10), quantity: Number(req.query.quantity || 0),
-      excludePurchasingId: num(req.query.purchasing_id),
+      excludePurchasingId: num(req.query.purchasing_id), scheme,
     });
     return res.json({ data: s });
   } catch (err: any) {

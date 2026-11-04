@@ -36,7 +36,7 @@ const rp = (n) => 'Rp ' + Number(n || 0).toLocaleString('id-ID', { maximumFracti
 
 // The plots that changed scheme, and the first day of the new one.
 const SWITCHED = ['SM003002', 'SM019003', 'GK006001', 'GK006002', 'GW006003'];
-const PS_FROM = '2025-08-28';
+const PS_FROM = '2025-08-29';   // first profit-sharing day; 28 Aug was still bought and deducted (see migratePurchasingScheme2026-11.js)
 
 function viewSql() {
   const src = fs.readFileSync(path.join(__dirname, '..', 'db', 'views.sql'), 'utf8');

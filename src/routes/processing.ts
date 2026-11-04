@@ -73,7 +73,7 @@ function shape(row: any) {
 async function loadContributions(processingId: number) {
   const [rows] = await pool.query(
     `SELECT pp.*, p.receipt_invoice, p.date AS purchasing_date, p.quantity AS purchasing_qty,
-            COALESCE(pl.scheme,'BeliPutus') AS scheme
+            p.scheme AS scheme
      FROM processing_purchasings pp
      JOIN purchasing p ON p.id = pp.purchasing_id
      LEFT JOIN plot pl ON pl.id = p.plot_id

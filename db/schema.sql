@@ -390,7 +390,8 @@ CREATE TABLE `collector_farmers` (
   UNIQUE KEY `uq_collector_farmer` (`collector_id`, `farmer_id`)
 ) ENGINE=InnoDB;
 
--- Purchasing: scheme diturunkan dari plot; price_per_unit DEFAULT 0 (0 utk ProfitSharing).
+-- Purchasing: price_per_unit DEFAULT 0 (0 utk ProfitSharing). `scheme` = skema lahan
+-- PADA TANGGAL setoran, disimpan saat ditulis (lihat kolomnya).
 CREATE TABLE `purchasing` (
   `id`              INT AUTO_INCREMENT PRIMARY KEY,
   `plot_id`         INT NULL,
@@ -404,6 +405,11 @@ CREATE TABLE `purchasing` (
   `quantity`        DECIMAL(15,3) NOT NULL DEFAULT 0,
   `price_per_unit`  DECIMAL(15,2) NOT NULL DEFAULT 0,   -- 0 utk ProfitSharing
   `total_value`     DECIMAL(18,2) GENERATED ALWAYS AS (`quantity` * `price_per_unit`) STORED,
+  -- The plot's scheme on the day of the delivery (collector: BeliPutus). Decides
+  -- the price rule, whether a loan is deducted, and whether the kilos earn a
+  -- profit share. Stored, not read from the plot: the five JNBS plots of Mustari,
+  -- Eko Irawan and Yudis delivered as Pre-Finance until 28 Aug 2025.
+  `scheme`          ENUM('BeliPutus','PreFinance','ProfitSharing') NOT NULL DEFAULT 'BeliPutus',
   `payment_status`  ENUM('paid','unpaid') NOT NULL DEFAULT 'unpaid',
   `is_process`      TINYINT(1) NOT NULL DEFAULT 0,
   `invoice_file`    VARCHAR(255) NULL,
