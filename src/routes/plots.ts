@@ -15,6 +15,10 @@ const SELECT = `
          p.latitude, p.longitude, p.farmer_id, p.scheme, p.created_at, p.updated_at,
          p.parent_plot_id, pp.plot_name AS parent_plot_name,
          p.commodities_id, c.commodities_name AS commodity_name, p.ledger_code,
+         -- What grows on the plot (plot_commodities), most plants first.
+         (SELECT GROUP_CONCAT(pcc.commodities_name ORDER BY pc.plants IS NULL, pc.plants DESC SEPARATOR '|')
+            FROM plot_commodities pc JOIN commodities pcc ON pcc.id = pc.commodities_id
+           WHERE pc.plot_id = p.id) AS planted,
          ST_AsText(p.polygon) AS polygon_wkt,
          f.farmer_name AS farmer__farmer_name, f.kth_id AS farmer__kth_id
   FROM plot p

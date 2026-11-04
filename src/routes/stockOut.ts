@@ -86,6 +86,122 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
   } catch (err: any) { return res.status(500).json({ message: 'Server error', error: err.message }); }
 });
 
+// GET /api/stock-out/summary?group=farmer|plot|commodity&warehouse_id=&from=YYYY-MM&to=YYYY-MM&search=
+//
+// The same goods-out lines as the documents, read the way people ask about them:
+// what did each farmer receive, what went onto each plot, what went to each
+// commodity. One row per group with its totals and the items inside it, the items
+// grouped by the commodity they were for — "Suparno · Pisang: Urea 120 kg, KCL 80
+// kg · Kopi: …" instead of a reader adding up document lines.
+// Plots carry what grows on them (plot_commodities), so a plot is read with its crops.
+// Only lines on a Stock Out document: a loan booked straight from a ledger never
+// left a warehouse in this system and is not a stock-out.
+router.get('/summary', authenticate, async (req: Request, res: Response) => {
+  try {
+    const group = ['farmer', 'plot', 'commodity'].includes(String(req.query.group)) ? String(req.query.group) : 'farmer';
+    const where: string[] = ['d.stock_out_id IS NOT NULL'];
+    const args: any[] = [];
+    if (req.query.warehouse_id) { where.push('so.warehouse_id = ?'); args.push(req.query.warehouse_id); }
+    if (req.query.from) { where.push("DATE_FORMAT(so.stock_out_date, '%Y-%m') >= ?"); args.push(String(req.query.from).slice(0, 7)); }
+    if (req.query.to) { where.push("DATE_FORMAT(so.stock_out_date, '%Y-%m') <= ?"); args.push(String(req.query.to).slice(0, 7)); }
+    if (req.query.search) {
+      where.push('(f.farmer_name LIKE ? OR p.plot_name LIKE ? OR s.sapropdi_name LIKE ? OR c.commodities_name LIKE ?)');
+      const q = `%${req.query.search}%`; args.push(q, q, q, q);
+    }
+    const scope = entityScope(req);
+    if (scope != null) { where.push(warehouseEntityPredicate('so.warehouse_id')); args.push(scope); }
+
+    const KEY: Record<string, string> = { farmer: 'd.farmer_id', plot: 'COALESCE(d.plot_id, 0)', commodity: 'COALESCE(d.commodities_id, 0)' };
+    const key = KEY[group];
+    const FROM = `
+         FROM pre_finance_distributions d
+         JOIN stock_out so       ON so.id = d.stock_out_id
+         LEFT JOIN warehouse w   ON w.id = so.warehouse_id
+         LEFT JOIN kth wk        ON wk.id = w.kth_id
+         LEFT JOIN entities ent  ON ent.id = wk.entities_id
+         LEFT JOIN farmers f     ON f.id = d.farmer_id
+         LEFT JOIN plot p        ON p.id = d.plot_id
+         LEFT JOIN sapropdi s    ON s.id = d.sapropdi_id
+         LEFT JOIN units un      ON un.id = d.unit_id
+         LEFT JOIN commodities c ON c.id = d.commodities_id
+        WHERE ${where.join(' AND ')}`;
+
+    // One row per (group, commodity, item).
+    const [lines] = await pool.query(
+      `SELECT ${key} AS group_id,
+              COALESCE(d.commodities_id, 0) AS commodity_id, COALESCE(c.commodities_name, 'Tanpa komoditas') AS commodity_name,
+              MIN(d.sapropdi_id) AS sapropdi_id, COALESCE(s.sapropdi_name, 'Tanpa nama barang') AS sapropdi_name,
+              MAX(COALESCE(un.unit_name, s.unit)) AS unit_name,
+              SUM(d.quantity) AS qty, SUM(d.total_amount) AS amount, COUNT(*) AS line_count
+         ${FROM}
+        -- By name and unit, case aside: "Kg" and "kg" of the same item are one line;
+        -- Bambu in Batang and in Pcs are not.
+        GROUP BY group_id, commodity_id, commodity_name, sapropdi_name, LOWER(COALESCE(un.unit_name, s.unit, ''))`, args);
+    // One row per group: who / where, how many separate issues, first and last.
+    const [heads] = await pool.query(
+      `SELECT ${key} AS group_id,
+              MAX(f.farmer_name) AS farmer_name, MAX(p.plot_name) AS plot_name, MAX(c.commodities_name) AS commodity_name,
+              GROUP_CONCAT(DISTINCT ent.entities_name SEPARATOR '|') AS entity_names,
+              COUNT(DISTINCT d.stock_out_id) AS doc_count, COUNT(DISTINCT d.farmer_id) AS farmer_count,
+              MIN(so.stock_out_date) AS first_date, MAX(so.stock_out_date) AS last_date,
+              GROUP_CONCAT(DISTINCT d.plot_id) AS plot_ids,
+              GROUP_CONCAT(DISTINCT f.farmer_name ORDER BY f.farmer_name SEPARATOR '|') AS farmer_names
+         ${FROM}
+        GROUP BY group_id`, args);
+
+    // What grows on the plots involved.
+    const plotIds = [...new Set((heads as any[]).flatMap((h) => String(h.plot_ids || '').split(',').filter(Boolean).map(Number)))];
+    const crops = new Map<number, string[]>();
+    const plotName = new Map<number, string>();
+    if (plotIds.length) {
+      const [pc] = await pool.query(
+        `SELECT pc.plot_id, c.commodities_name, pc.plants FROM plot_commodities pc
+           JOIN commodities c ON c.id = pc.commodities_id
+          WHERE pc.plot_id IN (?) ORDER BY pc.plot_id, pc.plants IS NULL, pc.plants DESC`, [plotIds]);
+      for (const r of pc as any[]) crops.set(r.plot_id, [...(crops.get(r.plot_id) || []), r.commodities_name]);
+      const [pn] = await pool.query('SELECT id, plot_name FROM plot WHERE id IN (?)', [plotIds]);
+      for (const r of pn as any[]) plotName.set(r.id, r.plot_name);
+    }
+
+    const byGroup = new Map<string, any[]>();
+    for (const l of lines as any[]) byGroup.set(String(l.group_id), [...(byGroup.get(String(l.group_id)) || []), l]);
+    const round = (n: number) => Math.round(n * 100) / 100;
+    const data = (heads as any[]).map((h) => {
+      const ls = byGroup.get(String(h.group_id)) || [];
+      const ids = String(h.plot_ids || '').split(',').filter(Boolean).map(Number);
+      // Items under the commodity they were issued for.
+      const perCom = new Map<string, any>();
+      for (const l of ls) {
+        const k = String(l.commodity_id);
+        if (!perCom.has(k)) perCom.set(k, { commodity_id: l.commodity_id || null, commodity_name: l.commodity_name, amount: 0, items: [] });
+        const g = perCom.get(k);
+        g.amount += Number(l.amount || 0);
+        g.items.push({ sapropdi_id: l.sapropdi_id, sapropdi_name: l.sapropdi_name, unit_name: l.unit_name,
+          qty: Number(l.qty || 0), amount: round(Number(l.amount || 0)), line_count: Number(l.line_count || 0) });
+      }
+      const by_commodity = [...perCom.values()]
+        .map((g) => ({ ...g, amount: round(g.amount), items: g.items.sort((a: any, b: any) => b.amount - a.amount) }))
+        .sort((a, b) => b.amount - a.amount);
+      const name = group === 'farmer' ? (h.farmer_name || '—')
+        : group === 'plot' ? (h.plot_name || 'Tanpa lahan') : (h.commodity_name || 'Tanpa komoditas');
+      return {
+        id: h.group_id || null, name, entity_names: String(h.entity_names || '').split('|').filter(Boolean),
+        farmer_name: group === 'plot' ? h.farmer_name : undefined,
+        amount: round(ls.reduce((s, l) => s + Number(l.amount || 0), 0)),
+        line_count: ls.reduce((s, l) => s + Number(l.line_count || 0), 0),
+        doc_count: Number(h.doc_count || 0), farmer_count: Number(h.farmer_count || 0),
+        first_date: h.first_date, last_date: h.last_date,
+        plots: ids.map((id) => ({ id, plot_name: plotName.get(id) || `#${id}`, planted: crops.get(id) || [] })),
+        farmers: group === 'commodity' ? String(h.farmer_names || '').split('|').filter(Boolean) : undefined,
+        item_count: ls.length,
+        by_commodity,
+      };
+    }).sort((a, b) => b.amount - a.amount);
+    const total = round(data.reduce((s, g) => s + g.amount, 0));
+    return res.json({ data, summary: { group, groups: data.length, total } });
+  } catch (err: any) { return res.status(500).json({ message: 'Server error', error: err.message }); }
+});
+
 // GET /api/stock-out/:id
 router.get('/:id', authenticate, async (req: Request, res: Response) => {
   try {

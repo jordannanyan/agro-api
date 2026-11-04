@@ -515,6 +515,24 @@ CREATE TABLE `tree_monitoring` (
   CONSTRAINT `fk_treemon_kth`  FOREIGN KEY (`recorded_by_kth_id`) REFERENCES `kth`(`id`) ON DELETE SET NULL
 ) ENGINE=InnoDB;
 
+-- What grows on a plot — one plot often carries several (GW016004: banana, coffee
+-- and mango). Built from the evidence there is, and every row says which:
+-- planting records, the farmer vegetation survey, the loans and harvests booked on
+-- the plot, the trees registered on it. `plants` is the count where a source gives
+-- one. A subplot's own commodity (plot.commodities_id) is listed here too.
+CREATE TABLE `plot_commodities` (
+  `id`             INT AUTO_INCREMENT PRIMARY KEY,
+  `plot_id`        INT NOT NULL,
+  `commodities_id` INT NOT NULL,
+  `plants`         INT NULL,
+  `sources`        VARCHAR(255) NULL,
+  `created_at`     DATETIME NULL,
+  `updated_at`     DATETIME NULL,
+  UNIQUE KEY `uq_plot_commodity` (`plot_id`, `commodities_id`),
+  CONSTRAINT `fk_pc_plot`      FOREIGN KEY (`plot_id`)        REFERENCES `plot`(`id`) ON DELETE CASCADE,
+  CONSTRAINT `fk_pc_commodity` FOREIGN KEY (`commodities_id`) REFERENCES `commodities`(`id`) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
 CREATE TABLE `plot_polygon_points` (
   `id`          INT AUTO_INCREMENT PRIMARY KEY,
   `plot_id`     INT NOT NULL,
