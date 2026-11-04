@@ -21,9 +21,10 @@
 // difference, so the debt here equals the ledger to the rupiah.
 //
 // Written
-//   pre_finance_distributions  type Saprodi, counts_as_debt = 1, no warehouse
-//     and no sapropdi_id: these goods never passed through a warehouse in this
-//     system and must not move any stock card. Plot = the farmer's planted plot
+//   pre_finance_distributions  type Saprodi, counts_as_debt = 1, warehouse
+//     Sumber Jaya but no sapropdi_id: the stock only counts lines naming their
+//     item, and these goods must not move any stock card (2026-11-04: warehouse
+//     filled in, see fillImportedLoanWarehouse2026-11.js). Plot = the farmer's planted plot
 //     (S0…/N0…), else the cocoa purchasing plot (SJ00…).
 //   pre_finance_installments   each ledger repayment; tied to the purchasing row
 //     with the same farmer, date and kilos when there is exactly one, otherwise a
@@ -175,6 +176,7 @@ async function readFarmers() {
 
     const [[saprodi]] = await c.query("SELECT id FROM pre_finance_types WHERE type_name = 'Saprodi'");
     const [[cocoa]] = await c.query("SELECT id FROM commodities WHERE commodities_name LIKE 'Cocoa%' LIMIT 1");
+    const [[wh]] = await c.query("SELECT id FROM warehouse WHERE warehouse_name = 'Sumber Jaya'");
     const [farmers] = await c.query(
       `SELECT f.id, f.farmer_name FROM farmers f JOIN kth k ON k.id = f.kth_id JOIN entities e ON e.id = k.entities_id
        WHERE e.entities_name LIKE '%SNBS%'`);
@@ -258,8 +260,8 @@ async function readFarmers() {
       `INSERT INTO pre_finance_distributions
          (pre_finance_type_id, date, farmer_id, plot_id, commodities_id, sapropdi_id, warehouse_id, stock_out_id,
           quantity, price_per_unit, total_amount, counts_as_debt, description, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, 1, ?, NOW(), NOW())`,
-      [saprodi.id, date, p.farmer.id, p.plot.id, cocoa?.id ?? null, qty || null,
+       VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?, 1, ?, NOW(), NOW())`,
+      [saprodi.id, date, p.farmer.id, p.plot.id, cocoa?.id ?? null, wh?.id ?? null, qty || null,
        qty ? round2(value / qty) : null, value, `Pinjaman kakao SNBS · ${item}${qty ? ` ${qty} ${unit}` : ''}${extra} ${TAG}`]);
     for (const p of plan) {
       for (const l of p.lines) await ins(p, l.date || SNAPSHOT, l.item, l.qty, l.unit, l.value, ` · ${l.part} (Sumber Jaya Farmers Data)`);

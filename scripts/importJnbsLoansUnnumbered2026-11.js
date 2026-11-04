@@ -10,8 +10,9 @@
 //
 // Written: one pre_finance_distributions row each — type Saprodi, counts_as_debt
 // = 1, plot + farmer from `Plot ID`, commodity from `Type of Commodity`, quantity
-// and price from the sheet. NO warehouse and NO sapropdi_id: the goods did leave
-// KTH AML, but that stock was already set by the counts — the 29 Sep 2026 opname
+// and price from the sheet. Warehouse KTH AML (where the goods left from) but NO
+// sapropdi_id — the stock only counts lines naming their item, and that stock was
+// already set by the counts — the 29 Sep 2026 opname
 // (applied) for everything before it, the 28 Oct one (awaiting the PM) for what
 // came after, whose adjustment is taken when it is approved. Booking these as
 // stock-outs too would take the same goods off the shelf twice.
@@ -105,6 +106,8 @@ async function readSheet() {
     if (off.length) { off.slice(0, 20).forEach((r) => log(`  ! no. ${r.no} baris ${r.row}: sheet ${rp(r.total)}, sistem ${byNo.has(r.no) ? rp(byNo.get(r.no)) : '—'}`)); throw new Error('Baris bernomor tidak sama dengan sistem — berhenti'); }
 
     const [[saprodi]] = await c.query("SELECT id FROM pre_finance_types WHERE type_name = 'Saprodi'");
+    const [[wh]] = await c.query("SELECT id FROM warehouse WHERE warehouse_name = 'KTH AML'");
+    if (!wh) throw new Error('Gudang KTH AML tidak ada');
     const [plots] = await c.query(
       `SELECT pl.id, pl.plot_name, pl.farmer_id FROM plot pl JOIN farmers f ON f.id = pl.farmer_id JOIN kth k ON k.id = f.kth_id
         WHERE k.entities_id = ?`, [ENTITY_JNBS]);
@@ -145,8 +148,8 @@ async function readSheet() {
         `INSERT INTO pre_finance_distributions
            (pre_finance_type_id, date, farmer_id, plot_id, commodities_id, sapropdi_id, warehouse_id, stock_out_id,
             quantity, price_per_unit, total_amount, counts_as_debt, description, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, 1, ?, NOW(), NOW())`,
-        [saprodi.id, p.date, p.plot.farmer_id, p.plot.id, p.commodity_id, p.qty, p.price || (p.total / p.qty), p.total,
+         VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?, 1, ?, NOW(), NOW())`,
+        [saprodi.id, p.date, p.plot.farmer_id, p.plot.id, p.commodity_id, wh.id, p.qty, p.price || (p.total / p.qty), p.total,
          `Pinjaman saprodi (tanpa no., baris ${p.row}) - ${p.item} ${p.qty} ${p.unit}${p.note} ${TAG}`]);
     }
     await c.commit();
