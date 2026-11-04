@@ -483,6 +483,115 @@ outstandingRouter.get('/', authenticate, async (req: Request, res: Response) => 
   return res.json({ data: rows });
 });
 
+// -----------------------------------------------------------------------------
+// GET /api/pre-finance/outstanding/overview?commodity_id=&from=&to=&search=
+//
+// The JNBS "Farmer Loan Overview - Banana / Mango / Coffee" sheets, from the
+// system's own rows: one line per farmer × plot × commodity with
+//   Jumlah Hutang Saprodi / Tenaga Kerja   distributions booked PreFinance
+//   Cicilan Saprodi / Tenaga Kerja         deductions on that plot's deliveries
+//   Sisa                                   the difference
+// and, beside it, what the plot received under profit sharing — cost of the
+// season, not debt, so it is never added to the Sisa.
+// Repayments recorded without a delivery (the TK ledger's cash instalments)
+// cannot be put on a plot; they come as the farmer's own line, plot empty.
+// -----------------------------------------------------------------------------
+outstandingRouter.get('/overview', authenticate, async (req: Request, res: Response) => {
+  try {
+    const dw: string[] = ['d.counts_as_debt = 1']; const da: any[] = [];
+    const pw: string[] = []; const pa: any[] = [];
+    if (req.query.from) { dw.push('d.date >= ?'); da.push(req.query.from); pw.push('i.date >= ?'); pa.push(req.query.from); }
+    if (req.query.to)   { dw.push('d.date <= ?'); da.push(req.query.to);   pw.push('i.date <= ?'); pa.push(req.query.to); }
+    const scope = entityScope(req);
+    if (scope != null) {
+      dw.push(farmerEntityPredicate('d.farmer_id')); da.push(scope);
+      pw.push(farmerEntityPredicate('i.farmer_id')); pa.push(scope);
+    }
+    const [dist] = await pool.query(
+      `SELECT d.farmer_id, d.plot_id, d.commodities_id,
+              SUM(IF(t.type_name = 'Saprodi' AND COALESCE(d.scheme, '') <> 'ProfitSharing', d.total_amount, 0)) AS saprodi_pf,
+              SUM(IF(t.type_name = 'Labor'   AND COALESCE(d.scheme, '') <> 'ProfitSharing', d.total_amount, 0)) AS labour_pf,
+              SUM(IF(t.type_name NOT IN ('Saprodi', 'Labor') AND COALESCE(d.scheme, '') <> 'ProfitSharing', d.total_amount, 0)) AS other_pf,
+              SUM(IF(t.type_name = 'Saprodi' AND d.scheme = 'ProfitSharing', d.total_amount, 0)) AS saprodi_ps,
+              SUM(IF(t.type_name <> 'Saprodi' AND d.scheme = 'ProfitSharing', d.total_amount, 0)) AS labour_ps,
+              COUNT(*) AS line_count
+         FROM pre_finance_distributions d JOIN pre_finance_types t ON t.id = d.pre_finance_type_id
+        WHERE ${dw.join(' AND ')}
+        GROUP BY d.farmer_id, d.plot_id, d.commodities_id`, da);
+    const [paid] = await pool.query(
+      `SELECT i.farmer_id, pu.plot_id, pu.commodities_id,
+              SUM(IF(t.type_name = 'Saprodi', det.amount, 0)) AS paid_saprodi,
+              SUM(IF(t.type_name = 'Labor', det.amount, 0))   AS paid_labour,
+              SUM(IF(t.type_name NOT IN ('Saprodi', 'Labor'), det.amount, 0)) AS paid_other
+         FROM pre_finance_installments i
+         JOIN pre_finance_installment_details det ON det.installment_id = i.id
+         JOIN pre_finance_types t ON t.id = det.pre_finance_type_id
+         LEFT JOIN purchasing pu ON pu.id = i.purchasing_id
+        ${pw.length ? `WHERE ${pw.join(' AND ')}` : ''}
+        GROUP BY i.farmer_id, pu.plot_id, pu.commodities_id`, pa);
+
+    const rows = new Map<string, any>();
+    const at = (f: any, p: any, c: any) => {
+      const k = `${f}|${p ?? ''}|${c ?? ''}`;
+      if (!rows.has(k)) rows.set(k, { farmer_id: f, plot_id: p ?? null, commodities_id: c ?? null,
+        saprodi_pf: 0, labour_pf: 0, other_pf: 0, saprodi_ps: 0, labour_ps: 0, paid_saprodi: 0, paid_labour: 0, paid_other: 0, line_count: 0 });
+      return rows.get(k);
+    };
+    for (const r of dist as any[]) {
+      const o = at(r.farmer_id, r.plot_id, r.commodities_id);
+      for (const k of ['saprodi_pf', 'labour_pf', 'other_pf', 'saprodi_ps', 'labour_ps', 'line_count']) o[k] += Number(r[k] || 0);
+    }
+    for (const r of paid as any[]) {
+      const o = at(r.farmer_id, r.plot_id, r.commodities_id);
+      for (const k of ['paid_saprodi', 'paid_labour', 'paid_other']) o[k] += Number(r[k] || 0);
+    }
+
+    const list = [...rows.values()];
+    const ids = (k: string) => [...new Set(list.map((r) => r[k]).filter((v) => v != null))];
+    const names = async (sql: string, v: any[]) =>
+      (v.length ? new Map(((await pool.query(sql, [v]))[0] as any[]).map((x) => [x.id, x])) : new Map<any, any>());
+    const farmers = await names(
+      `SELECT f.id, f.farmer_name, e.entities_name FROM farmers f LEFT JOIN kth k ON k.id = f.kth_id
+         LEFT JOIN entities e ON e.id = k.entities_id WHERE f.id IN (?)`, ids('farmer_id'));
+    const plots = await names('SELECT id, plot_name, scheme FROM plot WHERE id IN (?)', ids('plot_id'));
+    const coms = await names('SELECT id, commodities_name FROM commodities WHERE id IN (?)', ids('commodities_id'));
+    const round = (n: number) => Math.round(n * 100) / 100;
+    const q = String(req.query.search || '').toLowerCase();
+    const com = req.query.commodity_id ? Number(req.query.commodity_id) : null;
+    const data = list.map((r) => {
+      const debt = r.saprodi_pf + r.labour_pf + r.other_pf;
+      const paidTotal = r.paid_saprodi + r.paid_labour + r.paid_other;
+      return {
+        ...r,
+        farmer_name: farmers.get(r.farmer_id)?.farmer_name ?? `#${r.farmer_id}`,
+        entity_name: farmers.get(r.farmer_id)?.entities_name ?? null,
+        plot_name: r.plot_id != null ? plots.get(r.plot_id)?.plot_name ?? `#${r.plot_id}` : null,
+        plot_scheme: r.plot_id != null ? plots.get(r.plot_id)?.scheme ?? null : null,
+        commodity_name: r.commodities_id != null ? coms.get(r.commodities_id)?.commodities_name ?? null : null,
+        saprodi_pf: round(r.saprodi_pf), labour_pf: round(r.labour_pf), other_pf: round(r.other_pf),
+        saprodi_ps: round(r.saprodi_ps), labour_ps: round(r.labour_ps),
+        paid_saprodi: round(r.paid_saprodi), paid_labour: round(r.paid_labour), paid_other: round(r.paid_other),
+        debt_total: round(debt), paid_total: round(paidTotal), remaining: round(debt - paidTotal),
+        ps_total: round(r.saprodi_ps + r.labour_ps),
+      };
+    })
+      // A farmer-level repayment has no commodity; it stays visible under any
+      // commodity filter, since it pays down the farmer's debt as a whole.
+      .filter((r) => com == null || r.commodities_id === com || (r.plot_id == null && r.commodities_id == null))
+      .filter((r) => !q || [r.farmer_name, r.plot_name, r.commodity_name].some((v) => String(v || '').toLowerCase().includes(q)))
+      .filter((r) => r.debt_total || r.paid_total || r.ps_total)
+      .sort((a, b) => a.farmer_name.localeCompare(b.farmer_name)
+        || String(a.plot_name ?? '~').localeCompare(String(b.plot_name ?? '~'))
+        || String(a.commodity_name ?? '').localeCompare(String(b.commodity_name ?? '')));
+    const sum = (k: string) => round(data.reduce((s, r: any) => s + Number(r[k] || 0), 0));
+    const keys = ['saprodi_pf', 'labour_pf', 'other_pf', 'debt_total', 'paid_saprodi', 'paid_labour', 'paid_other',
+      'paid_total', 'remaining', 'saprodi_ps', 'labour_ps', 'ps_total'];
+    return res.json({ data, totals: Object.fromEntries(keys.map((k) => [k, sum(k)])) });
+  } catch (err: any) {
+    return res.status(500).json({ message: 'Server error', error: err.message });
+  }
+});
+
 // Summary per farmer (all types combined).
 outstandingRouter.get('/summary', authenticate, async (req: Request, res: Response) => {
   const scope = entityScope(req);

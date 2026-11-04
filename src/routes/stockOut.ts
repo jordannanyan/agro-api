@@ -33,7 +33,9 @@ const SELECT = `
          ent.id AS entity_id, ent.entities_name AS entity_name,
          (SELECT COUNT(*) FROM pre_finance_distributions d WHERE d.stock_out_id = so.id) AS line_count,
          (SELECT COALESCE(SUM(d.quantity), 0) FROM pre_finance_distributions d WHERE d.stock_out_id = so.id) AS total_qty,
-         (SELECT COALESCE(SUM(d.total_amount), 0) FROM pre_finance_distributions d WHERE d.stock_out_id = so.id) AS total_amount
+         (SELECT COALESCE(SUM(d.total_amount), 0) FROM pre_finance_distributions d WHERE d.stock_out_id = so.id) AS total_amount,
+         (SELECT COALESCE(SUM(d.total_amount), 0) FROM pre_finance_distributions d
+           WHERE d.stock_out_id = so.id AND d.scheme = 'ProfitSharing') AS amount_ps
   FROM stock_out so
   LEFT JOIN warehouse w ON w.id = so.warehouse_id
   LEFT JOIN kth wk      ON wk.id = w.kth_id
@@ -70,6 +72,10 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
     const args: any[] = [];
     if (req.query.warehouse_id) { where.push('so.warehouse_id = ?'); args.push(req.query.warehouse_id); }
     if (req.query.search)       { where.push('so.stock_out_number LIKE ?'); args.push(`%${req.query.search}%`); }
+    if (req.query.scheme) {
+      where.push("EXISTS (SELECT 1 FROM pre_finance_distributions d WHERE d.stock_out_id = so.id AND COALESCE(d.scheme, 'BeliPutus') = ?)");
+      args.push(req.query.scheme);
+    }
     // Narrow to one plot. The plot lives on the LINES, not the header — a stock-out
     // can be split across several — so this asks whether any line went to it rather
     // than joining, which would duplicate the header row once per matching line.
@@ -105,6 +111,9 @@ router.get('/summary', authenticate, async (req: Request, res: Response) => {
     if (req.query.warehouse_id) { where.push('so.warehouse_id = ?'); args.push(req.query.warehouse_id); }
     if (req.query.from) { where.push("DATE_FORMAT(so.stock_out_date, '%Y-%m') >= ?"); args.push(String(req.query.from).slice(0, 7)); }
     if (req.query.to) { where.push("DATE_FORMAT(so.stock_out_date, '%Y-%m') <= ?"); args.push(String(req.query.to).slice(0, 7)); }
+    // What the goods were for: Pre-Finance (farmer debt) or Profit Sharing (cost
+    // of the plot's season) — the line's own scheme, see schema.sql.
+    if (req.query.scheme) { where.push("COALESCE(d.scheme, 'BeliPutus') = ?"); args.push(req.query.scheme); }
     if (req.query.search) {
       where.push('(f.farmer_name LIKE ? OR p.plot_name LIKE ? OR s.sapropdi_name LIKE ? OR c.commodities_name LIKE ?)');
       const q = `%${req.query.search}%`; args.push(q, q, q, q);
@@ -129,7 +138,7 @@ router.get('/summary', authenticate, async (req: Request, res: Response) => {
 
     // One row per (group, commodity, item).
     const [lines] = await pool.query(
-      `SELECT ${key} AS group_id,
+      `SELECT ${key} AS group_id, COALESCE(d.scheme, 'BeliPutus') AS scheme,
               COALESCE(d.commodities_id, 0) AS commodity_id, COALESCE(c.commodities_name, 'Tanpa komoditas') AS commodity_name,
               MIN(d.sapropdi_id) AS sapropdi_id, COALESCE(s.sapropdi_name, 'Tanpa nama barang') AS sapropdi_name,
               MAX(COALESCE(un.unit_name, s.unit)) AS unit_name,
@@ -137,7 +146,7 @@ router.get('/summary', authenticate, async (req: Request, res: Response) => {
          ${FROM}
         -- By name and unit, case aside: "Kg" and "kg" of the same item are one line;
         -- Bambu in Batang and in Pcs are not.
-        GROUP BY group_id, commodity_id, commodity_name, sapropdi_name, LOWER(COALESCE(un.unit_name, s.unit, ''))`, args);
+        GROUP BY group_id, scheme, commodity_id, commodity_name, sapropdi_name, LOWER(COALESCE(un.unit_name, s.unit, ''))`, args);
     // One row per group: who / where, how many separate issues, first and last.
     const [heads] = await pool.query(
       `SELECT ${key} AS group_id,
@@ -170,11 +179,14 @@ router.get('/summary', authenticate, async (req: Request, res: Response) => {
     const data = (heads as any[]).map((h) => {
       const ls = byGroup.get(String(h.group_id)) || [];
       const ids = String(h.plot_ids || '').split(',').filter(Boolean).map(Number);
-      // Items under the commodity they were issued for.
+      // Items under the commodity they were issued for, and under what scheme —
+      // one plot can take goods as Pre-Finance debt and as profit-sharing cost.
       const perCom = new Map<string, any>();
+      const byScheme: Record<string, number> = {};
       for (const l of ls) {
-        const k = String(l.commodity_id);
-        if (!perCom.has(k)) perCom.set(k, { commodity_id: l.commodity_id || null, commodity_name: l.commodity_name, amount: 0, items: [] });
+        byScheme[l.scheme] = round((byScheme[l.scheme] || 0) + Number(l.amount || 0));
+        const k = `${l.commodity_id}|${l.scheme}`;
+        if (!perCom.has(k)) perCom.set(k, { commodity_id: l.commodity_id || null, commodity_name: l.commodity_name, scheme: l.scheme, amount: 0, items: [] });
         const g = perCom.get(k);
         g.amount += Number(l.amount || 0);
         g.items.push({ sapropdi_id: l.sapropdi_id, sapropdi_name: l.sapropdi_name, unit_name: l.unit_name,
@@ -195,6 +207,7 @@ router.get('/summary', authenticate, async (req: Request, res: Response) => {
         plots: ids.map((id) => ({ id, plot_name: plotName.get(id) || `#${id}`, planted: crops.get(id) || [] })),
         farmers: group === 'commodity' ? String(h.farmer_names || '').split('|').filter(Boolean) : undefined,
         item_count: ls.length,
+        by_scheme: byScheme,
         by_commodity,
       };
     }).sort((a, b) => b.amount - a.amount);
