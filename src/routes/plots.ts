@@ -20,6 +20,11 @@ const SELECT = `
             FROM plot_commodities pc JOIN commodities pcc ON pcc.id = pc.commodities_id
            WHERE pc.plot_id = p.id) AS planted,
          ST_AsText(p.polygon) AS polygon_wkt,
+         -- For the land list and its Excel export: where the plot belongs, and how
+         -- much of it is mapped (boundary vertices recorded in the field, trees).
+         k.kth_name AS kth_name, (SELECT e.entities_name FROM entities e WHERE e.id = k.entities_id) AS entity_name,
+         (SELECT COUNT(*) FROM plot_polygon_points pts WHERE pts.plot_id = p.id) AS polygon_point_count,
+         (SELECT COUNT(*) FROM trees tr WHERE tr.plot_id = p.id) AS tree_count,
          f.farmer_name AS farmer__farmer_name, f.kth_id AS farmer__kth_id
   FROM plot p
   LEFT JOIN farmers f     ON f.id = p.farmer_id
