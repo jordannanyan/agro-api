@@ -1321,6 +1321,10 @@ CREATE TABLE `pre_finance_distributions` (
 CREATE TABLE `pre_finance_installments` (
   `id`                INT AUTO_INCREMENT PRIMARY KEY,
   `purchasing_id`     INT NULL,
+  -- A repayment taken out of the farmer's profit share: the settlement row it was
+  -- deducted from (see profit_sharing.pf_deduction). Goes with that row, so a
+  -- settlement deleted to be recomputed takes its deduction with it.
+  `profit_sharing_id` INT NULL,
   `farmer_id`         INT NOT NULL,
   `date`              DATE NOT NULL,
   `payment_method_id` INT NULL,
@@ -1339,7 +1343,9 @@ CREATE TABLE `pre_finance_installments` (
   -- goes with the delivery: a deleted delivery was never paid out, so nothing was
   -- deducted from it either. NULL is a cash repayment made outside a delivery.
   UNIQUE KEY `uq_pfi_purchasing` (`purchasing_id`),
+  UNIQUE KEY `uq_pfi_profit_sharing` (`profit_sharing_id`),
   CONSTRAINT `fk_pfi_purchasing` FOREIGN KEY (`purchasing_id`)     REFERENCES `purchasing`(`id`) ON DELETE CASCADE,
+  CONSTRAINT `fk_pfi_profit_sharing` FOREIGN KEY (`profit_sharing_id`) REFERENCES `profit_sharing`(`id`) ON DELETE CASCADE,
   CONSTRAINT `fk_pfi_farmer`     FOREIGN KEY (`farmer_id`)         REFERENCES `farmers`(`id`) ON DELETE CASCADE,
   CONSTRAINT `fk_pfi_method`     FOREIGN KEY (`payment_method_id`) REFERENCES `payment_methods`(`id`) ON DELETE SET NULL
 ) ENGINE=InnoDB;
@@ -1452,6 +1458,12 @@ CREATE TABLE `profit_sharing` (
   `cum_farmer`     DECIMAL(18,2) NOT NULL DEFAULT 0,
   `cum_company`    DECIMAL(18,2) NOT NULL DEFAULT 0,
   `cum_kth`        DECIMAL(18,2) NOT NULL DEFAULT 0,
+  -- Of what could be paid to the farmer at this settlement, the part kept back to
+  -- pay down the farmer's remaining Pre-Finance debt (the business rule of
+  -- 2026-11-05: a plot that moved from Pre-Finance to profit sharing settles the
+  -- old loan out of its share). Booked as a pre_finance_installments row with
+  -- profit_sharing_id = this row.
+  `pf_deduction`   DECIMAL(18,2) NOT NULL DEFAULT 0,
   `status`         VARCHAR(40) NOT NULL DEFAULT 'Draft',
   `created_at`     DATETIME NULL,
   `updated_at`     DATETIME NULL,

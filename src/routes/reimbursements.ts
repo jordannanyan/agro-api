@@ -184,7 +184,8 @@ router.get('/claims', authenticate, async (req: Request, res: Response) => {
  *
  * This is the half that makes the farmer lines worth recording. It is deliberately
  * *reporting only* — nothing in the profit-sharing calculation reads it yet, and
- * `alreadyPaidToFarmer()` in profitSharing.ts is still a stub returning 0. Wiring
+ * `alreadyPaidToFarmer()` in profitSharing.ts counts only the share kept back for
+ * Pre-Finance debt (profit_sharing.pf_deduction), not these payments. Wiring
  * the two together changes what the system says is payable, which is a decision
  * about money rather than a piece of plumbing; see docs/reimbursement.md.
  */
