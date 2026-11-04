@@ -51,6 +51,12 @@ distributionsRouter.get('/', authenticate, async (req: Request, res: Response) =
   if (req.query.warehouse_id)        { where.push('d.warehouse_id = ?'); args.push(req.query.warehouse_id); }
   if (req.query.plot_id)             { where.push('d.plot_id = ?'); args.push(req.query.plot_id); }
   if (req.query.scheme)              { where.push("COALESCE(d.scheme, 'BeliPutus') = ?"); args.push(req.query.scheme); }
+  // The two screens built on this list: Pre-Finance → Rincian Utang Saprodi (what
+  // the farmer owes: every line not booked under profit sharing) and Profit
+  // Sharing → Biaya Saprodi & TK (the profit-sharing season's cost).
+  if (req.query.kind === 'debt')     where.push("COALESCE(d.scheme, '') <> 'ProfitSharing'");
+  // counts_as_debt = 0: SNBS goods whose cost is already in Operational Investment.
+  if (req.query.kind === 'ps')       where.push("d.scheme = 'ProfitSharing' AND d.counts_as_debt = 1");
   // "Riwayat Barang Keluar" is farmer debt and a warehouse movement at once, so it
   // follows the same PT rule as both: the farmer's PT, or the issuing warehouse's
   // when no farmer is named.
@@ -516,6 +522,10 @@ outstandingRouter.get('/overview', authenticate, async (req: Request, res: Respo
     }
     const [dist] = await pool.query(
       `SELECT d.farmer_id, d.plot_id, d.commodities_id,
+              -- One line per scheme: a plot that moved from Pre-Finance to profit
+              -- sharing shows its old loan and its season's cost as two rows.
+              IF(d.scheme = 'ProfitSharing', 'ProfitSharing', 'PreFinance') AS row_scheme,
+              MIN(d.date) AS first_date, MAX(d.date) AS last_date,
               SUM(IF(t.type_name = 'Saprodi' AND COALESCE(d.scheme, '') <> 'ProfitSharing', d.total_amount, 0)) AS saprodi_pf,
               SUM(IF(t.type_name = 'Labor'   AND COALESCE(d.scheme, '') <> 'ProfitSharing', d.total_amount, 0)) AS labour_pf,
               SUM(IF(t.type_name NOT IN ('Saprodi', 'Labor') AND COALESCE(d.scheme, '') <> 'ProfitSharing', d.total_amount, 0)) AS other_pf,
@@ -524,7 +534,7 @@ outstandingRouter.get('/overview', authenticate, async (req: Request, res: Respo
               COUNT(*) AS line_count
          FROM pre_finance_distributions d JOIN pre_finance_types t ON t.id = d.pre_finance_type_id
         WHERE ${dw.join(' AND ')}
-        GROUP BY d.farmer_id, d.plot_id, d.commodities_id`, da);
+        GROUP BY d.farmer_id, d.plot_id, d.commodities_id, row_scheme`, da);
     const [paid] = await pool.query(
       `SELECT i.farmer_id, pu.plot_id, pu.commodities_id,
               SUM(IF(t.type_name = 'Saprodi', det.amount, 0)) AS paid_saprodi,
@@ -538,18 +548,21 @@ outstandingRouter.get('/overview', authenticate, async (req: Request, res: Respo
         GROUP BY i.farmer_id, pu.plot_id, pu.commodities_id`, pa);
 
     const rows = new Map<string, any>();
-    const at = (f: any, p: any, c: any) => {
-      const k = `${f}|${p ?? ''}|${c ?? ''}`;
-      if (!rows.has(k)) rows.set(k, { farmer_id: f, plot_id: p ?? null, commodities_id: c ?? null,
+    const at = (f: any, p: any, c: any, sch: string) => {
+      const k = `${f}|${p ?? ''}|${c ?? ''}|${sch}`;
+      if (!rows.has(k)) rows.set(k, { farmer_id: f, plot_id: p ?? null, commodities_id: c ?? null, row_scheme: sch,
+        first_date: null, last_date: null,
         saprodi_pf: 0, labour_pf: 0, other_pf: 0, saprodi_ps: 0, labour_ps: 0, paid_saprodi: 0, paid_labour: 0, paid_other: 0, line_count: 0 });
       return rows.get(k);
     };
     for (const r of dist as any[]) {
-      const o = at(r.farmer_id, r.plot_id, r.commodities_id);
+      const o = at(r.farmer_id, r.plot_id, r.commodities_id, r.row_scheme);
+      o.first_date = r.first_date; o.last_date = r.last_date;
       for (const k of ['saprodi_pf', 'labour_pf', 'other_pf', 'saprodi_ps', 'labour_ps', 'line_count']) o[k] += Number(r[k] || 0);
     }
+    // Repayments always pay down the Pre-Finance loan.
     for (const r of paid as any[]) {
-      const o = at(r.farmer_id, r.plot_id, r.commodities_id);
+      const o = at(r.farmer_id, r.plot_id, r.commodities_id, 'PreFinance');
       for (const k of ['paid_saprodi', 'paid_labour', 'paid_other']) o[k] += Number(r[k] || 0);
     }
 
@@ -589,7 +602,8 @@ outstandingRouter.get('/overview', authenticate, async (req: Request, res: Respo
       .filter((r) => r.debt_total || r.paid_total || r.ps_total)
       .sort((a, b) => a.farmer_name.localeCompare(b.farmer_name)
         || String(a.plot_name ?? '~').localeCompare(String(b.plot_name ?? '~'))
-        || String(a.commodity_name ?? '').localeCompare(String(b.commodity_name ?? '')));
+        || String(a.commodity_name ?? '').localeCompare(String(b.commodity_name ?? ''))
+        || (a.row_scheme === 'PreFinance' ? -1 : 1));
     const sum = (k: string) => round(data.reduce((s, r: any) => s + Number(r[k] || 0), 0));
     const keys = ['saprodi_pf', 'labour_pf', 'other_pf', 'debt_total', 'paid_saprodi', 'paid_labour', 'paid_other',
       'paid_total', 'remaining', 'saprodi_ps', 'labour_ps', 'ps_total'];
