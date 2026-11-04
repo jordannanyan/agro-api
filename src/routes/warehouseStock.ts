@@ -40,7 +40,14 @@ router.get('/inventory', authenticate, async (req: Request, res: Response) => {
             -- or rejected): what the shelf held that day, beside what the system said.
             po.opname_id AS pending_opname_id, po.opname_number AS pending_opname_number,
             po.opname_date AS pending_opname_date, po.approval_status AS pending_opname_status,
-            po.counted_qty AS pending_counted_qty, po.system_qty AS pending_system_qty
+            po.counted_qty AS pending_counted_qty, po.system_qty AS pending_system_qty,
+            -- The latest count of this item in this warehouse, whatever became of
+            -- it: what the shelf held, what the records said that day, and whether
+            -- the difference is already in the figure (applied) or not yet.
+            lo.opname_id AS last_opname_id, lo.opname_number AS last_opname_number,
+            lo.opname_date AS last_opname_date, lo.approval_status AS last_opname_status,
+            lo.applied_at AS last_opname_applied_at,
+            lo.counted_qty AS last_counted_qty, lo.system_qty AS last_system_qty
        FROM v_saprodi_stock v
        LEFT JOIN (
          SELECT o.id AS opname_id, o.opname_number, o.opname_date, o.approval_status, o.warehouse_id,
@@ -52,6 +59,14 @@ router.get('/inventory', authenticate, async (req: Request, res: Response) => {
                            AND o2.applied_at IS NULL
                          ORDER BY o2.opname_date DESC, o2.id DESC LIMIT 1)
        ) po ON po.warehouse_id = v.warehouse_id AND po.sapropdi_id = v.sapropdi_id
+       LEFT JOIN (
+         SELECT o.id AS opname_id, o.opname_number, o.opname_date, o.approval_status, o.applied_at, o.warehouse_id,
+                oi.sapropdi_id, oi.counted_qty, oi.system_qty
+           FROM stock_opname o JOIN stock_opname_items oi ON oi.stock_opname_id = o.id
+          WHERE o.id = (SELECT o2.id FROM stock_opname o2 JOIN stock_opname_items i2 ON i2.stock_opname_id = o2.id
+                         WHERE o2.warehouse_id = o.warehouse_id AND i2.sapropdi_id = oi.sapropdi_id
+                         ORDER BY o2.opname_date DESC, o2.id DESC LIMIT 1)
+       ) lo ON lo.warehouse_id = v.warehouse_id AND lo.sapropdi_id = v.sapropdi_id
        ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
       ORDER BY v.warehouse_name, v.sapropdi_name`, args);
   return res.json({ data: rows });
