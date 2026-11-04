@@ -135,6 +135,58 @@ INSERT INTO `budget_codes` (id, code, name, main_account, sub_account, sort_orde
 (49, '08-Tax Expenditures - Income Tax Article 21', 'Income Tax Article 21', 'Tax Expenditures', 'Income Tax Article 21', 49, 1),
 (50, '08-Tax Expenditures - Income Tax Article 23', 'Income Tax Article 23', 'Tax Expenditures', 'Income Tax Article 23', 50, 1),
 (51, '08-Tax Expenditures - Income Tax Article 4 (2)', 'Income Tax Article 4 (2)', 'Tax Expenditures', 'Income Tax Article 4 (2)', 51, 1);
+-- Who may use each code — the COA sheet's `Role` column.
+UPDATE `budget_codes` SET roles = 'PPIC' WHERE code = '01-Operational Expenditures - Commission-Offtake';
+UPDATE `budget_codes` SET roles = 'PPIC' WHERE code = '01-Operational Expenditures - Delivery Costs-Non-Offtake';
+UPDATE `budget_codes` SET roles = 'PPIC' WHERE code = '01-Operational Expenditures - Delivery Costs-Offtake';
+UPDATE `budget_codes` SET roles = 'PPIC' WHERE code = '01-Operational Expenditures - Labour-Non Offtake';
+UPDATE `budget_codes` SET roles = 'PPIC' WHERE code = '01-Operational Expenditures - Labour-Offtake';
+UPDATE `budget_codes` SET roles = 'PPIC' WHERE code = '01-Operational Expenditures - Maintenance';
+UPDATE `budget_codes` SET roles = 'PPIC' WHERE code = '01-Operational Expenditures - Material-Non-Offtake';
+UPDATE `budget_codes` SET roles = 'PPIC' WHERE code = '01-Operational Expenditures - Material-Offtake';
+UPDATE `budget_codes` SET roles = 'PPIC' WHERE code = '01-Operational Expenditures - Profit Sharing';
+UPDATE `budget_codes` SET roles = 'PPIC' WHERE code = '01-Operational Expenditures - Purchase-Offtake';
+UPDATE `budget_codes` SET roles = 'PPIC' WHERE code = '01-Operational Expenditures - Rental Expenses - Building';
+UPDATE `budget_codes` SET roles = 'PPIC' WHERE code = '01-Operational Expenditures - Socialisation Cost';
+UPDATE `budget_codes` SET roles = 'Finance' WHERE code = '02-Investment Expenditures - Building Costs';
+UPDATE `budget_codes` SET roles = 'Finance' WHERE code = '02-Investment Expenditures - Fixed Asset - Office Equipment';
+UPDATE `budget_codes` SET roles = 'Finance' WHERE code = '02-Investment Expenditures - Fixed Asset - PP&E';
+UPDATE `budget_codes` SET roles = 'Finance' WHERE code = '02-Investment Expenditures - Fixed Asset - Vehicle';
+UPDATE `budget_codes` SET roles = 'Finance' WHERE code = '03-Financing Expenditures - Injection - Capital';
+UPDATE `budget_codes` SET roles = 'Finance' WHERE code = '03-Financing Expenditures - Injection - Equity';
+UPDATE `budget_codes` SET roles = 'Finance' WHERE code = '03-Financing Expenditures - Injection - Loan';
+UPDATE `budget_codes` SET roles = 'HRD' WHERE code = '04-Personnel Expenditures - Compensation';
+UPDATE `budget_codes` SET roles = 'HRD' WHERE code = '04-Personnel Expenditures - Net Salary';
+UPDATE `budget_codes` SET roles = 'HRD' WHERE code = '04-Personnel Expenditures - Religious Allowance';
+UPDATE `budget_codes` SET roles = 'HRD' WHERE code = '04-Personnel Expenditures - Social Security';
+UPDATE `budget_codes` SET roles = 'PPIC,Finance,HRD' WHERE code = '05-Travel Expenditures - Rental Expenses - Car/Bike Rental';
+UPDATE `budget_codes` SET roles = 'PPIC,Finance,HRD' WHERE code = '05-Travel Expenditures - Travel Expenses - Accommodation';
+UPDATE `budget_codes` SET roles = 'PPIC,Finance,HRD' WHERE code = '05-Travel Expenditures - Travel Expenses - Bus/Travel Ticket';
+UPDATE `budget_codes` SET roles = 'PPIC,Finance,HRD' WHERE code = '05-Travel Expenditures - Travel Expenses - Flight Ticket';
+UPDATE `budget_codes` SET roles = 'PPIC,Finance,HRD' WHERE code = '05-Travel Expenditures - Travel Expenses - Food/Drink Consumption With External';
+UPDATE `budget_codes` SET roles = 'PPIC,Finance,HRD' WHERE code = '05-Travel Expenditures - Travel Expenses - Gasoline';
+UPDATE `budget_codes` SET roles = 'PPIC,Finance,HRD' WHERE code = '05-Travel Expenditures - Travel Expenses - Per Diem';
+UPDATE `budget_codes` SET roles = 'PPIC,Finance,HRD' WHERE code = '05-Travel Expenditures - Travel Expenses - Travel-Related Cost';
+UPDATE `budget_codes` SET roles = 'Finance,HRD' WHERE code = '06-Administrative Expenditures - Bank Fee/Charge';
+UPDATE `budget_codes` SET roles = 'Finance' WHERE code = '06-Administrative Expenditures - Internal Cash Out';
+UPDATE `budget_codes` SET roles = 'Finance' WHERE code = '06-Administrative Expenditures - License';
+UPDATE `budget_codes` SET roles = 'Finance,HRD' WHERE code = '06-Administrative Expenditures - Medical Support';
+UPDATE `budget_codes` SET roles = 'Finance,HRD' WHERE code = '06-Administrative Expenditures - Office Expenses - Cleaning Service';
+UPDATE `budget_codes` SET roles = 'Finance,HRD' WHERE code = '06-Administrative Expenditures - Office Expenses - Equipments';
+UPDATE `budget_codes` SET roles = 'Finance,HRD' WHERE code = '06-Administrative Expenditures - Office Expenses - Supplies';
+UPDATE `budget_codes` SET roles = 'Finance,HRD' WHERE code = '06-Administrative Expenditures - Office Expenses - Utilities';
+UPDATE `budget_codes` SET roles = 'Finance,HRD' WHERE code = '06-Administrative Expenditures - Other G&A';
+UPDATE `budget_codes` SET roles = 'Finance,HRD' WHERE code = '06-Administrative Expenditures - Team Events';
+UPDATE `budget_codes` SET roles = 'PPIC,Finance,HRD' WHERE code = '06-Administrative Expenditures - Training';
+UPDATE `budget_codes` SET roles = 'Finance,HRD' WHERE code = '06-Administrative Expenditures - Vehicle Administration';
+UPDATE `budget_codes` SET roles = 'Finance,HRD' WHERE code = '07-External Services - Audit';
+UPDATE `budget_codes` SET roles = 'Finance,HRD' WHERE code = '07-External Services - Consulting';
+UPDATE `budget_codes` SET roles = 'Finance,HRD' WHERE code = '07-External Services - Service Fee Affiliate Companies';
+UPDATE `budget_codes` SET roles = 'Finance,HRD' WHERE code = '07-External Services - Tax/Legal Advise';
+UPDATE `budget_codes` SET roles = 'Finance,HRD' WHERE code = '08-Tax Expenditures - Income Tax - Expenses';
+UPDATE `budget_codes` SET roles = 'Finance,HRD' WHERE code = '08-Tax Expenditures - Income Tax Article 21';
+UPDATE `budget_codes` SET roles = 'Finance,HRD' WHERE code = '08-Tax Expenditures - Income Tax Article 23';
+UPDATE `budget_codes` SET roles = 'Finance,HRD' WHERE code = '08-Tax Expenditures - Income Tax Article 4 (2)';
 
 INSERT INTO `finance_dimensions` (dim_type, name, sort_order, is_active) VALUES
 ('cash_flow_type', 'Cash Inflow', 1, 1),

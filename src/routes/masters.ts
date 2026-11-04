@@ -112,7 +112,7 @@ export const banksRouter = crudRouter({
 // sheet's own order; the legacy 1_… 9_… codes sort after as inactive rows.
 export const budgetCodesRouter = crudRouter({
   table: 'budget_codes',
-  columns: ['code', 'name', 'main_account', 'sub_account', 'sort_order', 'is_active'],
+  columns: ['code', 'name', 'main_account', 'sub_account', 'roles', 'sort_order', 'is_active'],
   required: ['code'],
   numeric: ['sort_order'],
   boolean: ['is_active'],

@@ -182,6 +182,9 @@ CREATE TABLE `budget_codes` (
   `name`         VARCHAR(150) NULL,
   `main_account` VARCHAR(80) NULL,
   `sub_account`  VARCHAR(120) NULL,
+  -- Who may use the code, from the COA sheet's `Role` column: "PPIC", "Finance",
+  -- "HRD", comma-separated. NULL = everyone (the retired 1_… 9_… codes).
+  `roles`        VARCHAR(60) NULL,
   `sort_order`   INT NOT NULL DEFAULT 0,
   `is_active`    TINYINT(1) NOT NULL DEFAULT 1,
   `created_at`   DATETIME NULL,
