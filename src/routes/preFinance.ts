@@ -56,9 +56,11 @@ distributionsRouter.get('/', authenticate, async (req: Request, res: Response) =
   if (scope != null) { where.push(distributionEntityPredicate('d')); args.push(scope); }
   // The screen searches by farmer; with paging that has to happen in the query.
   if (req.query.search) {
-    where.push('(f.farmer_name LIKE ? OR s.sapropdi_name LIKE ? OR p.plot_name LIKE ?)');
+    // Loans imported from the ledgers carry their item in the description and no
+    // sapropdi_id (they must not move stock), so the item is searched there too.
+    where.push('(f.farmer_name LIKE ? OR s.sapropdi_name LIKE ? OR p.plot_name LIKE ? OR d.description LIKE ?)');
     const q = `%${req.query.search}%`;
-    args.push(q, q, q);
+    args.push(q, q, q, q);
   }
   const sql = DIST_SELECT + (where.length ? ` WHERE ${where.join(' AND ')}` : '') + ' ORDER BY d.date DESC, d.id DESC';
   return respondList(req, res, sql, args, undefined,
