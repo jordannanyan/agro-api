@@ -286,9 +286,12 @@ router.get('/pl', authenticate, async (req: Request, res: Response) => {
        -- carried between settlements, so the same shortfall appears on every one
        -- of a plot's rows; adding them up would count it once per sale. The
        -- company's true position is net_profit in this same row.
+       -- What has actually been paid out to the farmer (Pre-Finance deduction
+       -- included) — the end-of-season payouts, not the per-sale shares, which
+       -- only build the balance.
        LEFT JOIN (
-         SELECT plot_id, SUM(value_farmer) AS settled_farmer
-         FROM profit_sharing WHERE plot_id IS NOT NULL GROUP BY plot_id
+         SELECT plot_id, SUM(share_amount) AS settled_farmer
+         FROM profit_sharing_payouts GROUP BY plot_id
        ) st ON st.plot_id = pl.id
        ${farmerRefScope('pl')}
        WHERE ${where.join(' AND ')}
@@ -354,8 +357,8 @@ SELECT a.plot_id, pl.plot_name, pl.farmer_id, f.farmer_name,
        COALESCE(prev.cum_farmer, 0)  AS prev_cum_farmer,
        COALESCE(prev.cum_company, 0) AS prev_cum_company,
        COALESCE(prev.cum_kth, 0)     AS prev_cum_kth,
-       COALESCE(ch.pf_deducted, 0)   AS pf_deducted,
-       done.id AS settled_id, COALESCE(done.pf_deduction, 0) AS settled_pf_deduction
+       COALESCE(po.paid_out, 0)      AS paid_out,
+       done.id AS settled_id
 FROM alloc a
 JOIN plot pl        ON pl.id = a.plot_id
 LEFT JOIN farmers f ON f.id = pl.farmer_id
@@ -373,7 +376,7 @@ LEFT JOIN (
   WHERE plot_id IS NOT NULL AND period <= DATE_FORMAT(?, '%Y-%m') GROUP BY plot_id
 ) land ON land.plot_id = pl.id
 LEFT JOIN (
-  SELECT plot_id, SUM(cost_saprodi) AS saprodi, SUM(cost_land) AS land, SUM(pf_deduction) AS pf_deducted
+  SELECT plot_id, SUM(cost_saprodi) AS saprodi, SUM(cost_land) AS land
   FROM profit_sharing x
   -- Only settlements BEFORE this sale's own row: re-opening a settled sale must
   -- show it as it stood when it was written, not counted against itself.
@@ -393,6 +396,9 @@ LEFT JOIN (
         GROUP BY plot_id) last
     ON last.id = p.id
 ) prev ON prev.plot_id = pl.id
+LEFT JOIN (
+  SELECT plot_id, SUM(share_amount) AS paid_out FROM profit_sharing_payouts GROUP BY plot_id
+) po ON po.plot_id = pl.id
 LEFT JOIN profit_sharing done ON done.selling_id = a.selling_id AND done.plot_id = a.plot_id
 WHERE a.selling_id = ? AND pl.scheme = 'ProfitSharing'
 ORDER BY pl.plot_name`;
@@ -400,11 +406,9 @@ ORDER BY pl.plot_name`;
 const money = (n: number) => Math.round(n * 100) / 100;
 
 // What has already gone to the farmer out of this plot's standing share — the
-// ledgers' `Total Historic Profit Share`. Cash payouts are not recorded yet; what
-// IS recorded is the share kept back at earlier settlements to pay down the
-// farmer's Pre-Finance debt (profit_sharing.pf_deduction), which the farmer has
-// received as surely as cash. When payout recording arrives it adds here.
-const alreadyPaidToFarmer = (r: any) => money(Number(r.pf_deducted || 0));
+// ledgers' `Total Historic Profit Share`: the payouts (profit_sharing_payouts),
+// Pre-Finance deduction included, since that too was the farmer's money.
+const alreadyPaidToFarmer = (r: any) => money(Number(r.paid_out || 0));
 
 /**
  * What may actually be handed to the farmer today.
@@ -531,11 +535,10 @@ async function buildSettlement(sellingId: number) {
       // settlement — that is `debt_saprodi` + `debt_land` above.
       debt_total: money(Number(r.saprodi_total) + Number(r.land_total)),
       payout_rule: payoutRule,
-      // What could actually be handed over today, per this PT's ledger.
-      // What the gate releases, before the Pre-Finance debt is taken out of it.
-      // Earlier settlements' deductions are subtracted after the rule is applied,
-      // since they are rupiah of the farmer's share, not of the plot's margin.
-      payable_gross: money(Math.max(0, payoutFarmer(
+      // What the payout rule would release if the plot were closed after this
+      // sale — information only. Nothing is paid per sale: the farmer is paid
+      // once, at the end, through POST /payouts.
+      payable_farmer: money(Math.max(0, payoutFarmer(
         payoutRule,
         money(cumFarmer + cumKth + cumCompany),
         money(Number(r.saprodi_total) + Number(r.land_total)),
@@ -543,58 +546,11 @@ async function buildSettlement(sellingId: number) {
         0,
         pct,
       ) - alreadyPaidToFarmer(r))),
-      settled_pf_deduction: r.settled_id ? money(Number(r.settled_pf_deduction || 0)) : null,
       already_settled_id: r.settled_id ?? null,
     };
   });
+  return { sale, pct, pctKth, lines };
 
-  // The farmer's remaining Pre-Finance debt comes out of what may be paid —
-  // per type, in proportion to what is still owed of each. One farmer can have
-  // several plots in the same sale, so the debt is drawn down across them in turn.
-  const farmerIds = [...new Set(lines.map((l) => l.farmer_id).filter(Boolean))];
-  const owed = new Map<number, { pre_finance_type_id: number; type_name: string; outstanding: number }[]>();
-  if (farmerIds.length) {
-    const [o] = await pool.query(
-      `SELECT farmer_id, pre_finance_type_id, type_name, outstanding FROM v_pre_finance_outstanding
-        WHERE farmer_id IN (?) AND outstanding > 0 ORDER BY farmer_id, pre_finance_type_id`, [farmerIds]);
-    for (const r of o as any[]) {
-      owed.set(r.farmer_id, [...(owed.get(r.farmer_id) || []),
-        { pre_finance_type_id: r.pre_finance_type_id, type_name: r.type_name, outstanding: Number(r.outstanding) }]);
-    }
-  }
-  const out = lines.map((l) => {
-    const debt = owed.get(l.farmer_id) || [];
-    const pfOutstanding = money(debt.reduce((s, d) => s + d.outstanding, 0));
-    let take = 0;
-    let parts: { pre_finance_type_id: number; type_name: string; amount: number }[] = [];
-    if (l.already_settled_id) {
-      // Already written: show what was taken then, and do not draw again.
-      take = Number(l.settled_pf_deduction || 0);
-    } else {
-      take = money(Math.min(l.payable_gross, pfOutstanding));
-      if (take > 0) {
-        let left = take;
-        parts = debt.map((d, i) => {
-          const a = i === debt.length - 1 ? money(left) : money(take * (d.outstanding / pfOutstanding));
-          left = money(left - a);
-          return { pre_finance_type_id: d.pre_finance_type_id, type_name: d.type_name, amount: a };
-        }).filter((p) => p.amount > 0);
-        for (const p of parts) {
-          const d = debt.find((x) => x.pre_finance_type_id === p.pre_finance_type_id)!;
-          d.outstanding = money(d.outstanding - p.amount);
-        }
-      }
-    }
-    return {
-      ...l,
-      pf_outstanding: pfOutstanding,
-      pf_deduction: money(take),
-      pf_deduction_lines: parts,
-      // What actually reaches the farmer today.
-      payable_farmer: money(Math.max(0, l.payable_gross - take)),
-    };
-  });
-  return { sale, pct, pctKth, lines: out };
 }
 
 // GET /api/profit-sharing/settlement/:sellingId — preview, nothing is written.
@@ -653,36 +609,22 @@ router.post('/settle', authenticate, async (req: Request, res: Response) => {
     const now = new Date();
     await conn.beginTransaction();
     for (const l of lines) {
-      const [ins] = await conn.query(
+      await conn.query(
         `INSERT INTO profit_sharing
            (period, selling_id, farmer_id, plot_id, commodities_id, volume_share, share_pct,
             total_revenue, cost_purchase, cost_harvest, cost_pnbp,
             cost_saprodi, cost_land,
             total_investment, pct_farmer, pct_company, pct_kth,
             value_farmer, value_company, value_kth, cum_farmer, cum_company, cum_kth,
-            pf_deduction, status, created_at, updated_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            status, created_at, updated_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         [period, sellingId, l.farmer_id, l.plot_id, sale.commodities_id ?? null,
          l.volume_share, l.share_pct, l.total_revenue,
          l.cost_purchase, l.cost_harvest, l.cost_pnbp,
          l.debt_saprodi, l.debt_land, l.total_investment,
          l.pct_farmer, l.pct_company, l.pct_kth,
          l.value_farmer, l.value_company, l.value_kth,
-         l.cum_farmer, l.cum_company, l.cum_kth, l.pf_deduction, 'Draft', now, now]);
-      // The share kept back for the Pre-Finance debt is a repayment of it.
-      if (l.pf_deduction > 0 && l.farmer_id) {
-        const psId = (ins as any).insertId;
-        const [inst] = await conn.query(
-          `INSERT INTO pre_finance_installments (profit_sharing_id, farmer_id, date, reference_no, total_payment, notes, created_at, updated_at)
-           VALUES (?,?,?,?,?,?,?,?)`,
-          [psId, l.farmer_id, String(sale.date).slice(0, 10), `PS-${sellingId}-${l.plot_name}`, l.pf_deduction,
-           `Potongan bagi hasil — penjualan #${sellingId}, lahan ${l.plot_name}`, now, now]);
-        for (const p of l.pf_deduction_lines) {
-          await conn.query(
-            'INSERT INTO pre_finance_installment_details (installment_id, pre_finance_type_id, amount) VALUES (?,?,?)',
-            [(inst as any).insertId, p.pre_finance_type_id, p.amount]);
-        }
-      }
+         l.cum_farmer, l.cum_company, l.cum_kth, 'Draft', now, now]);
     }
     await conn.commit();
     return res.status(201).json({
@@ -694,6 +636,208 @@ router.post('/settle', authenticate, async (req: Request, res: Response) => {
     return res.status(500).json({ message: 'Server error', error: err.message });
   } finally {
     conn.release();
+  }
+});
+
+// -----------------------------------------------------------------------------
+// Paying the profit share out — at the end, per plot.
+//
+// Business rule (2026-11-05): the farmer's share is paid once the plot's
+// harvests are done (JNBS: 2027/2028), and only while the plot stands in
+// profit — its cumulative margin above every profit-sharing cost (saprodi,
+// labour, land). Of what the PT's payout rule then releases, the farmer's
+// remaining Pre-Finance debt is kept back first (the loans from before the plot
+// became profit sharing) and booked as a repayment; the rest is paid.
+//
+//   GET    /payouts/preview?plot_id=&date=   the position, nothing written
+//   POST   /payouts { plot_id, date, notes }
+//   GET    /payouts?plot_id=
+//   DELETE /payouts/:id                       takes its repayment with it
+// -----------------------------------------------------------------------------
+async function payoutPosition(plotId: number, date: string) {
+  const [pRows] = await pool.query(
+    `SELECT pl.id, pl.plot_name, pl.scheme, pl.farmer_id, f.farmer_name, k.entities_id AS entity_id,
+            e.payout_rule, e.profit_share_farmer_pct
+       FROM plot pl LEFT JOIN farmers f ON f.id = pl.farmer_id LEFT JOIN kth k ON k.id = f.kth_id
+       LEFT JOIN entities e ON e.id = k.entities_id WHERE pl.id = ? LIMIT 1`, [plotId]);
+  const plot = (pRows as any[])[0];
+  if (!plot) return { error: 'Plot not found' as const };
+
+  // The balances as the last settlement left them.
+  const [lRows] = await pool.query(
+    `SELECT ps.id, ps.period, s.date AS sale_date, ps.pct_farmer, ps.cum_farmer, ps.cum_company, ps.cum_kth
+       FROM profit_sharing ps LEFT JOIN selling s ON s.id = ps.selling_id
+      WHERE ps.plot_id = ? ORDER BY ps.id DESC LIMIT 1`, [plotId]);
+  const last = (lRows as any[])[0] || null;
+  const [[cnt]] = await pool.query(
+    'SELECT COUNT(*) AS n FROM profit_sharing WHERE plot_id = ?', [plotId]) as any;
+  // Sales of this plot's profit-sharing kilos that were never settled: the
+  // position would be incomplete without them.
+  const [unsettled] = await pool.query(
+    `SELECT DISTINCT s.id, s.date FROM selling s
+       JOIN processing_purchasings pp ON pp.processing_id = s.processing_id
+       JOIN purchasing pu ON pu.id = pp.purchasing_id
+      WHERE pu.plot_id = ? AND pu.scheme = 'ProfitSharing' AND s.date <= ?
+        AND NOT EXISTS (SELECT 1 FROM profit_sharing x WHERE x.selling_id = s.id AND x.plot_id = pu.plot_id)
+      ORDER BY s.date`, [plotId, date]);
+  const [[cost]] = await pool.query(
+    `SELECT
+       (SELECT COALESCE(SUM(total_amount), 0) FROM pre_finance_distributions
+         WHERE plot_id = ? AND counts_as_debt = 1 AND scheme = 'ProfitSharing' AND date <= ?) AS saprodi_labour,
+       (SELECT COALESCE(SUM(amount), 0) FROM profit_sharing_investments
+         WHERE plot_id = ? AND period <= DATE_FORMAT(?, '%Y-%m')) AS land`, [plotId, date, plotId, date]) as any;
+  const [[paid]] = await pool.query(
+    'SELECT COALESCE(SUM(share_amount), 0) AS v FROM profit_sharing_payouts WHERE plot_id = ?', [plotId]) as any;
+
+  const margin = last ? money(Number(last.cum_farmer) + Number(last.cum_company) + Number(last.cum_kth)) : 0;
+  const psCost = money(Number(cost.saprodi_labour) + Number(cost.land));
+  const farmerShare = last ? money(Number(last.cum_farmer)) : 0;
+  const pct = last?.pct_farmer != null ? Number(last.pct_farmer)
+    : plot.profit_share_farmer_pct != null ? Number(plot.profit_share_farmer_pct) : null;
+  const rule = String(plot.payout_rule || 'Gate');
+  const alreadyPaid = money(Number(paid.v));
+  const releasable = money(Math.max(0, payoutFarmer(rule, margin, psCost, farmerShare, 0, pct) - alreadyPaid));
+
+  // The farmer's remaining Pre-Finance debt, per type, comes out first — in
+  // proportion to what is still owed of each.
+  const [o] = await pool.query(
+    `SELECT pre_finance_type_id, type_name, outstanding FROM v_pre_finance_outstanding
+      WHERE farmer_id = ? AND outstanding > 0 ORDER BY pre_finance_type_id`, [plot.farmer_id]);
+  const debt = (o as any[]).map((d) => ({ ...d, outstanding: Number(d.outstanding) }));
+  const pfOutstanding = money(debt.reduce((s, d) => s + d.outstanding, 0));
+  const take = money(Math.min(releasable, pfOutstanding));
+  let left = take;
+  const lines = take > 0 ? debt.map((d, i) => {
+    const a = i === debt.length - 1 ? money(left) : money(take * (d.outstanding / pfOutstanding));
+    left = money(left - a);
+    return { pre_finance_type_id: d.pre_finance_type_id, type_name: d.type_name, outstanding: d.outstanding, amount: a };
+  }).filter((x) => x.amount > 0) : [];
+
+  let blocked: string | null = null;
+  if (plot.scheme !== 'ProfitSharing') blocked = 'Lahan ini bukan lahan Profit Sharing.';
+  else if (!Number(cnt.n)) blocked = 'Belum ada penjualan yang dibagihasilkan untuk lahan ini.';
+  else if ((unsettled as any[]).length) blocked = `Masih ada ${(unsettled as any[]).length} penjualan yang belum dibagihasilkan — hitung dulu di atas.`;
+  else if (margin - psCost <= 0) blocked = `Lahan masih minus: margin ${fmt(margin)} belum melampaui biaya bagi hasil ${fmt(psCost)}.`;
+  else if (releasable <= 0) blocked = alreadyPaid > 0 ? 'Bagian petani lahan ini sudah dibayarkan.' : 'Tidak ada bagian petani yang bisa dibayarkan.';
+
+  return {
+    plot_id: plot.id, plot_name: plot.plot_name, farmer_id: plot.farmer_id, farmer_name: plot.farmer_name,
+    date, payout_rule: rule, pct_farmer: pct,
+    settlements: Number(cnt.n), last_sale_date: last?.sale_date ?? null,
+    unsettled_sales: unsettled,
+    margin_total: margin, ps_cost_total: psCost, position: money(margin - psCost),
+    farmer_share_total: farmerShare, already_paid: alreadyPaid,
+    share_amount: blocked ? 0 : releasable,
+    pf_outstanding: pfOutstanding,
+    pf_deduction: blocked ? 0 : take, pf_deduction_lines: blocked ? [] : lines,
+    paid_amount: blocked ? 0 : money(releasable - take),
+    blocked,
+  };
+}
+const fmt = (n: number) => `Rp ${Number(n || 0).toLocaleString('id-ID', { maximumFractionDigits: 0 })}`;
+
+/** The plot is this caller's to see (same PT rule as the plot lists). */
+async function plotInScope(req: Request, plotId: number) {
+  const scope = entityScope(req);
+  if (scope == null) return true;
+  const [r] = await pool.query(
+    `SELECT 1 FROM plot pl JOIN farmers f ON f.id = pl.farmer_id JOIN kth k ON k.id = f.kth_id
+      WHERE pl.id = ? AND k.entities_id = ? LIMIT 1`, [plotId, scope]);
+  return (r as any[]).length > 0;
+}
+
+router.get('/payouts/preview', authenticate, async (req: Request, res: Response) => {
+  try {
+    const plotId = Number(req.query.plot_id);
+    if (!plotId) return res.status(422).json({ message: 'plot_id is required' });
+    if (!(await plotInScope(req, plotId))) return res.status(404).json({ message: 'Plot not found' });
+    const date = String(req.query.date || new Date().toISOString()).slice(0, 10);
+    const p = await payoutPosition(plotId, date);
+    if ('error' in p) return res.status(404).json({ message: p.error });
+    return res.json({ data: p });
+  } catch (err: any) {
+    return res.status(500).json({ message: 'Server error', error: err.message });
+  }
+});
+
+router.get('/payouts', authenticate, async (req: Request, res: Response) => {
+  try {
+    const where: string[] = []; const args: any[] = [];
+    if (req.query.plot_id) { where.push('po.plot_id = ?'); args.push(Number(req.query.plot_id)); }
+    const scope = entityScope(req);
+    if (scope != null) { where.push('k.entities_id = ?'); args.push(scope); }
+    const [rows] = await pool.query(
+      `SELECT po.*, pl.plot_name, f.farmer_name, u.name AS created_by_name, i.id AS installment_id
+         FROM profit_sharing_payouts po
+         JOIN plot pl ON pl.id = po.plot_id
+         JOIN farmers f ON f.id = po.farmer_id LEFT JOIN kth k ON k.id = f.kth_id
+         LEFT JOIN users u ON u.id = po.created_by_user_id
+         LEFT JOIN pre_finance_installments i ON i.profit_sharing_payout_id = po.id
+        ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+        ORDER BY po.payout_date DESC, po.id DESC`, args);
+    return res.json({ data: rows });
+  } catch (err: any) {
+    return res.status(500).json({ message: 'Server error', error: err.message });
+  }
+});
+
+router.post('/payouts', authenticate, async (req: Request, res: Response) => {
+  const conn = await pool.getConnection();
+  try {
+    const plotId = Number(req.body?.plot_id);
+    if (!plotId) return res.status(422).json({ message: 'plot_id is required' });
+    if (!(await plotInScope(req, plotId))) return res.status(404).json({ message: 'Plot not found' });
+    const date = String(req.body?.date || new Date().toISOString()).slice(0, 10);
+    const p = await payoutPosition(plotId, date);
+    if ('error' in p) return res.status(404).json({ message: p.error });
+    if (p.blocked) return res.status(422).json({ message: p.blocked, data: p });
+
+    const now = new Date();
+    const userId = req.user?.type === 'User' ? req.user.id : null;
+    await conn.beginTransaction();
+    // Two payouts of one plot at once would both release the same share.
+    await conn.query('SELECT id FROM plot WHERE id = ? FOR UPDATE', [plotId]);
+    const [ins] = await conn.query(
+      `INSERT INTO profit_sharing_payouts (plot_id, farmer_id, payout_date, margin_total, ps_cost_total, farmer_share_total,
+         share_amount, pf_deduction, paid_amount, notes, created_by_user_id, created_at, updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [plotId, p.farmer_id, date, p.margin_total, p.ps_cost_total, p.farmer_share_total,
+       p.share_amount, p.pf_deduction, p.paid_amount, req.body?.notes ?? null, userId, now, now]);
+    const payoutId = (ins as any).insertId;
+    if (p.pf_deduction > 0) {
+      const [inst] = await conn.query(
+        `INSERT INTO pre_finance_installments (profit_sharing_payout_id, farmer_id, date, reference_no, total_payment, notes, created_at, updated_at)
+         VALUES (?,?,?,?,?,?,?,?)`,
+        [payoutId, p.farmer_id, date, `PSP-${payoutId}`, p.pf_deduction,
+         `Dipotong dari bagi hasil lahan ${p.plot_name}`, now, now]);
+      for (const l of p.pf_deduction_lines) {
+        await conn.query('INSERT INTO pre_finance_installment_details (installment_id, pre_finance_type_id, amount) VALUES (?,?,?)',
+          [(inst as any).insertId, l.pre_finance_type_id, l.amount]);
+      }
+    }
+    await conn.commit();
+    return res.status(201).json({
+      message: `Bagi hasil ${p.plot_name} dibayarkan: ${fmt(p.paid_amount)} ke petani`
+        + (p.pf_deduction > 0 ? `, ${fmt(p.pf_deduction)} dipotong untuk utang Pre-Finance.` : '.'),
+      data: { id: payoutId, ...p },
+    });
+  } catch (err: any) {
+    await conn.rollback().catch(() => undefined);
+    return res.status(500).json({ message: 'Server error', error: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
+router.delete('/payouts/:id', authenticate, async (req: Request, res: Response) => {
+  try {
+    const [r] = await pool.query('SELECT plot_id FROM profit_sharing_payouts WHERE id = ? LIMIT 1', [req.params.id]);
+    const row = (r as any[])[0];
+    if (!row || !(await plotInScope(req, Number(row.plot_id)))) return res.status(404).json({ message: 'Payout not found' });
+    await pool.query('DELETE FROM profit_sharing_payouts WHERE id = ?', [req.params.id]);
+    return res.json({ message: 'Pembayaran bagi hasil dihapus, beserta potongan utangnya.' });
+  } catch (err: any) {
+    return res.status(500).json({ message: 'Server error', error: err.message });
   }
 });
 

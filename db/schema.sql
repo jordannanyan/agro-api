@@ -1321,10 +1321,10 @@ CREATE TABLE `pre_finance_distributions` (
 CREATE TABLE `pre_finance_installments` (
   `id`                INT AUTO_INCREMENT PRIMARY KEY,
   `purchasing_id`     INT NULL,
-  -- A repayment taken out of the farmer's profit share: the settlement row it was
-  -- deducted from (see profit_sharing.pf_deduction). Goes with that row, so a
-  -- settlement deleted to be recomputed takes its deduction with it.
-  `profit_sharing_id` INT NULL,
+  -- A repayment taken out of the farmer's profit share when it was paid out
+  -- (profit_sharing_payouts.pf_deduction). Goes with that payout, so a payout
+  -- deleted to be redone takes its deduction with it.
+  `profit_sharing_payout_id` INT NULL,
   `farmer_id`         INT NOT NULL,
   `date`              DATE NOT NULL,
   `payment_method_id` INT NULL,
@@ -1343,9 +1343,9 @@ CREATE TABLE `pre_finance_installments` (
   -- goes with the delivery: a deleted delivery was never paid out, so nothing was
   -- deducted from it either. NULL is a cash repayment made outside a delivery.
   UNIQUE KEY `uq_pfi_purchasing` (`purchasing_id`),
-  UNIQUE KEY `uq_pfi_profit_sharing` (`profit_sharing_id`),
+  UNIQUE KEY `uq_pfi_ps_payout` (`profit_sharing_payout_id`),
   CONSTRAINT `fk_pfi_purchasing` FOREIGN KEY (`purchasing_id`)     REFERENCES `purchasing`(`id`) ON DELETE CASCADE,
-  CONSTRAINT `fk_pfi_profit_sharing` FOREIGN KEY (`profit_sharing_id`) REFERENCES `profit_sharing`(`id`) ON DELETE CASCADE,
+  CONSTRAINT `fk_pfi_ps_payout`  FOREIGN KEY (`profit_sharing_payout_id`) REFERENCES `profit_sharing_payouts`(`id`) ON DELETE CASCADE,
   CONSTRAINT `fk_pfi_farmer`     FOREIGN KEY (`farmer_id`)         REFERENCES `farmers`(`id`) ON DELETE CASCADE,
   CONSTRAINT `fk_pfi_method`     FOREIGN KEY (`payment_method_id`) REFERENCES `payment_methods`(`id`) ON DELETE SET NULL
 ) ENGINE=InnoDB;
@@ -1458,12 +1458,6 @@ CREATE TABLE `profit_sharing` (
   `cum_farmer`     DECIMAL(18,2) NOT NULL DEFAULT 0,
   `cum_company`    DECIMAL(18,2) NOT NULL DEFAULT 0,
   `cum_kth`        DECIMAL(18,2) NOT NULL DEFAULT 0,
-  -- Of what could be paid to the farmer at this settlement, the part kept back to
-  -- pay down the farmer's remaining Pre-Finance debt (the business rule of
-  -- 2026-11-05: a plot that moved from Pre-Finance to profit sharing settles the
-  -- old loan out of its share). Booked as a pre_finance_installments row with
-  -- profit_sharing_id = this row.
-  `pf_deduction`   DECIMAL(18,2) NOT NULL DEFAULT 0,
   `status`         VARCHAR(40) NOT NULL DEFAULT 'Draft',
   `created_at`     DATETIME NULL,
   `updated_at`     DATETIME NULL,
@@ -1474,6 +1468,41 @@ CREATE TABLE `profit_sharing` (
   CONSTRAINT `fk_ps_plot`      FOREIGN KEY (`plot_id`)        REFERENCES `plot`(`id`) ON DELETE SET NULL,
   CONSTRAINT `fk_ps_selling`   FOREIGN KEY (`selling_id`)     REFERENCES `selling`(`id`) ON DELETE SET NULL,
   CONSTRAINT `fk_ps_commodity` FOREIGN KEY (`commodities_id`) REFERENCES `commodities`(`id`) ON DELETE SET NULL
+) ENGINE=InnoDB;
+
+-- Paying the farmer's profit share out — once, at the end, after the plot's
+-- harvests are done (JNBS: 2027/2028), and only while the plot stands in profit
+-- (business rule of 2026-11-05). The per-sale `profit_sharing` rows only build
+-- up the balances; nothing is paid or deducted there, because early in a season
+-- the costs have not come in yet and a plot looks profitable that will not be.
+--
+--   share_amount   what the payout rule releases (entities.payout_rule), less
+--                  earlier payouts of the plot
+--   pf_deduction   of that, the farmer's remaining Pre-Finance debt, kept back
+--                  and booked as a pre_finance_installments row (cascade)
+--   paid_amount    share_amount − pf_deduction: what the farmer receives
+-- The position it was decided on is kept beside it.
+CREATE TABLE `profit_sharing_payouts` (
+  `id`                 INT AUTO_INCREMENT PRIMARY KEY,
+  `plot_id`            INT NOT NULL,
+  `farmer_id`          INT NOT NULL,
+  `payout_date`        DATE NOT NULL,
+  `margin_total`       DECIMAL(18,2) NOT NULL DEFAULT 0,
+  `ps_cost_total`      DECIMAL(18,2) NOT NULL DEFAULT 0,
+  `farmer_share_total` DECIMAL(18,2) NOT NULL DEFAULT 0,
+  `share_amount`       DECIMAL(18,2) NOT NULL DEFAULT 0,
+  `pf_deduction`       DECIMAL(18,2) NOT NULL DEFAULT 0,
+  `paid_amount`        DECIMAL(18,2) NOT NULL DEFAULT 0,
+  `notes`              TEXT NULL,
+  `created_by_user_id` INT NULL,
+  `created_at`         DATETIME NULL,
+  `updated_at`         DATETIME NULL,
+  KEY `fk_psp_plot` (`plot_id`),
+  KEY `fk_psp_farmer` (`farmer_id`),
+  KEY `fk_psp_user` (`created_by_user_id`),
+  CONSTRAINT `fk_psp_plot`   FOREIGN KEY (`plot_id`)            REFERENCES `plot`(`id`),
+  CONSTRAINT `fk_psp_farmer` FOREIGN KEY (`farmer_id`)          REFERENCES `farmers`(`id`),
+  CONSTRAINT `fk_psp_user`   FOREIGN KEY (`created_by_user_id`) REFERENCES `users`(`id`) ON DELETE SET NULL
 ) ENGINE=InnoDB;
 
 -- -----------------------------------------------------------------------------
