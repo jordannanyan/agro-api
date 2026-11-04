@@ -11,16 +11,41 @@ import { respondList } from '../utils/pagination';
 
 export const router = Router();
 
+// Where a receipt came from, for reading: the PO's vendor, the ledger import, or
+// nothing on record. Shared by the list and the summary so both name it alike.
+const SOURCE_KEY = `COALESCE(CONCAT('v', v.id), IF(si.stock_in_number LIKE 'SIH-%', 'ledger', 'none'))`;
+const SOURCE_NAME = `COALESCE(v.vendor_name,
+  IF(si.stock_in_number LIKE 'SIH-%', 'Impor buku besar (ADM_Entry Stok Barang)', 'Tanpa PO / pemasok tidak tercatat'))`;
+
 const SELECT = `
   SELECT si.*, w.warehouse_name, po.po_number, u.name AS received_by_name,
-         ent.id AS entity_id, ent.entities_name AS entity_name
+         ent.id AS entity_id, ent.entities_name AS entity_name,
+         ${SOURCE_NAME} AS source_name,
+         (SELECT COUNT(*) FROM stock_in_items x WHERE x.stock_in_id = si.id) AS line_count,
+         (SELECT SUM(x.received_qty * x.unit_price) FROM stock_in_items x WHERE x.stock_in_id = si.id) AS total_value,
+         -- What arrived, in a line: the first items with their quantities.
+         (SELECT GROUP_CONCAT(CONCAT(COALESCE(s2.sapropdi_name, 'Barang'), ' ', TRIM(TRAILING '.' FROM TRIM(TRAILING '0' FROM x.received_qty)),
+                   IF(COALESCE(un2.unit_name, s2.unit) IS NULL, '', CONCAT(' ', COALESCE(un2.unit_name, s2.unit))))
+                   ORDER BY x.id SEPARATOR ' · ')
+            FROM stock_in_items x LEFT JOIN sapropdi s2 ON s2.id = x.sapropdi_id LEFT JOIN units un2 ON un2.id = s2.unit_id
+           WHERE x.stock_in_id = si.id) AS items_text
   FROM stock_in si
   LEFT JOIN warehouse w        ON w.id = si.warehouse_id
   LEFT JOIN kth wk             ON wk.id = w.kth_id
   LEFT JOIN entities ent       ON ent.id = wk.entities_id
   LEFT JOIN purchase_orders po ON po.id = si.purchase_order_id
+  LEFT JOIN vendors v          ON v.id = po.vendor_id
   LEFT JOIN users u            ON u.id = si.received_by_user_id
 `;
+const num = (v: any) => (v != null && v !== '' && isFinite(Number(v)) ? Number(v) : null);
+/** The unit price of a received line: as typed, else the order line's. */
+async function linePrice(db: { query: (s: string, a?: any[]) => Promise<any> }, it: any): Promise<number | null> {
+  if (num(it.unit_price) != null) return num(it.unit_price);
+  if (num(it.po_item_id) == null) return null;
+  const [r] = await db.query('SELECT unit_price FROM purchase_order_items WHERE id = ? LIMIT 1', [num(it.po_item_id)]);
+  return (r as any[])[0]?.unit_price != null ? Number((r as any[])[0].unit_price) : null;
+}
+
 
 async function loadItems(stockInId: number) {
   const [rows] = await pool.query(
@@ -36,12 +61,104 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
   const args: any[] = [];
   if (req.query.warehouse_id) { where.push('si.warehouse_id = ?'); args.push(req.query.warehouse_id); }
   if (req.query.status)       { where.push('si.status = ?'); args.push(req.query.status); }
-  if (req.query.search)       { where.push('si.stock_in_number LIKE ?'); args.push(`%${req.query.search}%`); }
+  if (req.query.search) {
+    // Number, supplier, or any item on it.
+    where.push(`(si.stock_in_number LIKE ? OR v.vendor_name LIKE ? OR si.delivery_note_no LIKE ?
+      OR EXISTS (SELECT 1 FROM stock_in_items x JOIN sapropdi s3 ON s3.id = x.sapropdi_id
+                 WHERE x.stock_in_id = si.id AND s3.sapropdi_name LIKE ?))`);
+    const q = `%${req.query.search}%`; args.push(q, q, q, q);
+  }
+  if (req.query.sapropdi_id) {
+    where.push('EXISTS (SELECT 1 FROM stock_in_items x WHERE x.stock_in_id = si.id AND x.sapropdi_id = ?)');
+    args.push(req.query.sapropdi_id);
+  }
+  if (req.query.from) { where.push("DATE_FORMAT(si.stock_in_date, '%Y-%m') >= ?"); args.push(String(req.query.from).slice(0, 7)); }
+  if (req.query.to)   { where.push("DATE_FORMAT(si.stock_in_date, '%Y-%m') <= ?"); args.push(String(req.query.to).slice(0, 7)); }
   // Same rule as stock out — goods received into a warehouse belong to its PT.
   const scope = entityScope(req);
   if (scope != null) { where.push(warehouseEntityPredicate('si.warehouse_id')); args.push(scope); }
-  const sql = SELECT + (where.length ? ` WHERE ${where.join(' AND ')}` : '') + ' ORDER BY si.id DESC';
+  const sql = SELECT + (where.length ? ` WHERE ${where.join(' AND ')}` : '') + ' ORDER BY si.stock_in_date DESC, si.id DESC';
   return respondList(req, res, sql, args);
+});
+
+// GET /api/stock-in/summary?group=item|source|month&warehouse_id=&from=YYYY-MM&to=YYYY-MM&search=
+//
+// Goods received read the way people ask about them — what came in, from whom,
+// and when — instead of per receipt. Only receipts that count as stock (not
+// Draft), so the figures agree with the inventory.
+router.get('/summary', authenticate, async (req: Request, res: Response) => {
+  try {
+    const group = ['item', 'source', 'month'].includes(String(req.query.group)) ? String(req.query.group) : 'item';
+    const where: string[] = ["COALESCE(si.status, '') <> 'Draft'"];
+    const args: any[] = [];
+    if (req.query.warehouse_id) { where.push('si.warehouse_id = ?'); args.push(req.query.warehouse_id); }
+    if (req.query.from) { where.push("DATE_FORMAT(si.stock_in_date, '%Y-%m') >= ?"); args.push(String(req.query.from).slice(0, 7)); }
+    if (req.query.to)   { where.push("DATE_FORMAT(si.stock_in_date, '%Y-%m') <= ?"); args.push(String(req.query.to).slice(0, 7)); }
+    if (req.query.search) {
+      where.push('(s.sapropdi_name LIKE ? OR v.vendor_name LIKE ? OR si.stock_in_number LIKE ?)');
+      const q = `%${req.query.search}%`; args.push(q, q, q);
+    }
+    const scope = entityScope(req);
+    if (scope != null) { where.push(warehouseEntityPredicate('si.warehouse_id')); args.push(scope); }
+
+    const ITEM_KEY = 'COALESCE(sii.sapropdi_id, 0)';
+    const ITEM_NAME = "COALESCE(s.sapropdi_name, 'Tanpa nama barang')";
+    const MONTH_KEY = "DATE_FORMAT(si.stock_in_date, '%Y-%m')";
+    const KEY: Record<string, [string, string]> = {
+      item: [ITEM_KEY, ITEM_NAME], source: [SOURCE_KEY, SOURCE_NAME], month: [MONTH_KEY, MONTH_KEY],
+    };
+    // Under each group: the items (per supplier / month), or the suppliers (per item).
+    const PART: [string, string] = group === 'item' ? [SOURCE_KEY, SOURCE_NAME] : [ITEM_KEY, ITEM_NAME];
+    const [gk, gn] = KEY[group];
+    const FROM = `
+      FROM stock_in_items sii
+      JOIN stock_in si             ON si.id = sii.stock_in_id
+      LEFT JOIN warehouse w        ON w.id = si.warehouse_id
+      LEFT JOIN kth wk             ON wk.id = w.kth_id
+      LEFT JOIN entities ent       ON ent.id = wk.entities_id
+      LEFT JOIN purchase_orders po ON po.id = si.purchase_order_id
+      LEFT JOIN vendors v          ON v.id = po.vendor_id
+      LEFT JOIN sapropdi s         ON s.id = sii.sapropdi_id
+      LEFT JOIN units un           ON un.id = s.unit_id
+      WHERE ${where.join(' AND ')}`;
+    const unit = 'COALESCE(un.unit_name, s.unit)';
+    const [parts] = await pool.query(
+      `SELECT ${gk} AS group_id, ${PART[0]} AS part_id, MAX(${PART[1]}) AS part_name,
+              MAX(${unit}) AS unit_name, SUM(sii.received_qty) AS qty,
+              SUM(sii.received_qty * sii.unit_price) AS value, SUM(sii.unit_price IS NULL) AS unpriced,
+              COUNT(DISTINCT si.id) AS doc_count, MAX(si.stock_in_date) AS last_date
+         ${FROM}
+        GROUP BY group_id, part_id, LOWER(COALESCE(${unit}, ''))`, args);
+    const [heads] = await pool.query(
+      `SELECT ${gk} AS group_id, MAX(${gn}) AS name,
+              GROUP_CONCAT(DISTINCT ent.entities_name SEPARATOR '|') AS entity_names,
+              GROUP_CONCAT(DISTINCT w.warehouse_name SEPARATOR '|') AS warehouse_names,
+              COUNT(DISTINCT si.id) AS doc_count, COUNT(*) AS line_count,
+              MIN(si.stock_in_date) AS first_date, MAX(si.stock_in_date) AS last_date,
+              SUM(sii.received_qty * sii.unit_price) AS value, SUM(sii.unit_price IS NULL) AS unpriced,
+              MAX(${unit}) AS unit_name, COUNT(DISTINCT LOWER(COALESCE(${unit}, ''))) AS unit_count, SUM(sii.received_qty) AS qty
+         ${FROM}
+        GROUP BY group_id`, args);
+    const round = (n: number) => Math.round(n * 100) / 100;
+    const byGroup = new Map<string, any[]>();
+    for (const p of parts as any[]) byGroup.set(String(p.group_id), [...(byGroup.get(String(p.group_id)) || []), p]);
+    const data = (heads as any[]).map((h) => ({
+      id: h.group_id, name: h.name,
+      entity_names: String(h.entity_names || '').split('|').filter(Boolean),
+      warehouse_names: String(h.warehouse_names || '').split('|').filter(Boolean),
+      doc_count: Number(h.doc_count), line_count: Number(h.line_count),
+      first_date: h.first_date, last_date: h.last_date,
+      value: round(Number(h.value || 0)), unpriced: Number(h.unpriced || 0),
+      // A single total quantity only means something when everything is in one unit.
+      qty: Number(h.unit_count) === 1 ? Number(h.qty) : null, unit_name: Number(h.unit_count) === 1 ? h.unit_name : null,
+      parts: (byGroup.get(String(h.group_id)) || []).map((p) => ({
+        id: p.part_id, name: p.part_name, unit_name: p.unit_name, qty: Number(p.qty), value: round(Number(p.value || 0)),
+        unpriced: Number(p.unpriced || 0), doc_count: Number(p.doc_count), last_date: p.last_date,
+      })).sort((a, b) => b.value - a.value || b.qty - a.qty),
+    })).sort((a, b) => (group === 'month' ? String(b.id).localeCompare(String(a.id)) : b.value - a.value || b.doc_count - a.doc_count));
+    const total = round(data.reduce((s, g) => s + g.value, 0));
+    return res.json({ data, summary: { group, groups: data.length, total } });
+  } catch (err: any) { return res.status(500).json({ message: 'Server error', error: err.message }); }
 });
 
 // GET /api/stock-in/:id
@@ -153,11 +270,11 @@ router.post('/', authenticate, async (req: Request, res: Response) => {
     for (const it of (Array.isArray(b.items) ? b.items : [])) {
       const cond = CONDITIONS.includes(it.item_condition) ? it.item_condition : 'Good';
       await conn.query(
-        `INSERT INTO stock_in_items (stock_in_id, po_item_id, sapropdi_id, received_qty, item_condition, remarks)
-         VALUES (?,?,?,?,?,?)`,
+        `INSERT INTO stock_in_items (stock_in_id, po_item_id, sapropdi_id, received_qty, unit_price, item_condition, remarks)
+         VALUES (?,?,?,?,?,?,?)`,
         [id, it.po_item_id != null && it.po_item_id !== '' ? Number(it.po_item_id) : null,
          it.sapropdi_id != null && it.sapropdi_id !== '' ? Number(it.sapropdi_id) : null,
-         Number(it.received_qty || 0), cond, it.remarks || null]
+         Number(it.received_qty || 0), await linePrice(conn, it), cond, it.remarks || null]
       );
     }
     // A receipt may not be posted with nothing attached — the surat jalan is what
@@ -231,10 +348,10 @@ const update = async (req: Request, res: Response) => {
       for (const it of b.items) {
         const cond = CONDITIONS.includes(it.item_condition) ? it.item_condition : 'Good';
         await conn.query(
-          `INSERT INTO stock_in_items (stock_in_id, po_item_id, sapropdi_id, received_qty, item_condition, remarks) VALUES (?,?,?,?,?,?)`,
+          `INSERT INTO stock_in_items (stock_in_id, po_item_id, sapropdi_id, received_qty, unit_price, item_condition, remarks) VALUES (?,?,?,?,?,?,?)`,
           [id, it.po_item_id != null && it.po_item_id !== '' ? Number(it.po_item_id) : null,
            it.sapropdi_id != null && it.sapropdi_id !== '' ? Number(it.sapropdi_id) : null,
-           Number(it.received_qty || 0), cond, it.remarks || null]
+           Number(it.received_qty || 0), await linePrice(conn, it), cond, it.remarks || null]
         );
       }
     }

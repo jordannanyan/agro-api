@@ -1148,6 +1148,10 @@ CREATE TABLE `stock_in_items` (
   `po_item_id`     INT NULL,
   `sapropdi_id`    INT NULL,
   `received_qty`   DECIMAL(15,3) NOT NULL DEFAULT 0,
+  -- What one unit cost, so a receipt has a value: the order line's price when it
+  -- came through a PO, the nota's when it was entered without one (the ledger
+  -- imports). NULL = not known.
+  `unit_price`     DECIMAL(15,2) NULL,
   `item_condition` ENUM('Good','Damaged','Shortage') NOT NULL DEFAULT 'Good',
   `remarks`        TEXT NULL,
   CONSTRAINT `fk_sii_stockin`  FOREIGN KEY (`stock_in_id`) REFERENCES `stock_in`(`id`) ON DELETE CASCADE,
