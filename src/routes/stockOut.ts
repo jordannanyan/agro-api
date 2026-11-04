@@ -6,6 +6,7 @@ import { nextDocNumber } from '../utils/docNumber';
 import { entityScope } from '../utils/entityScope';
 import { warehouseEntityPredicate } from '../utils/farmScope';
 import { respondList } from '../utils/pagination';
+import { plotScheme } from '../utils/distributionScheme';
 
 // -----------------------------------------------------------------------------
 // Stock Out  /api/stock-out
@@ -44,7 +45,7 @@ const LINE_SELECT = `
   SELECT d.id, d.farmer_id, d.plot_id, d.sapropdi_id, d.unit_id, d.quantity,
          d.price_per_unit, d.total_amount, d.description,
          f.farmer_name, p.plot_name, s.sapropdi_name, un.unit_name,
-         COALESCE(p.scheme, 'BeliPutus') AS scheme
+         COALESCE(d.scheme, 'BeliPutus') AS scheme
   FROM pre_finance_distributions d
   LEFT JOIN farmers f  ON f.id = d.farmer_id
   LEFT JOIN plot p     ON p.id = d.plot_id
@@ -340,10 +341,11 @@ router.post('/', authenticate, stockOutUpload, async (req: Request, res: Respons
       const price = ln.price_per_unit != null && ln.price_per_unit !== '' ? Number(ln.price_per_unit) : null;
       await conn.query(
         `INSERT INTO pre_finance_distributions
-           (pre_finance_type_id, date, farmer_id, plot_id, sapropdi_id, warehouse_id, stock_out_id,
+           (pre_finance_type_id, date, farmer_id, plot_id, scheme, sapropdi_id, warehouse_id, stock_out_id,
             quantity, unit_id, price_per_unit, total_amount, description, created_at, updated_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NOW(),NOW())`,
-        [saprodiTypeId, date, Number(ln.farmer_id), Number(ln.plot_id), Number(ln.sapropdi_id),
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,NOW(),NOW())`,
+        [saprodiTypeId, date, Number(ln.farmer_id), Number(ln.plot_id),
+         await plotScheme(conn, Number(ln.plot_id)), Number(ln.sapropdi_id),
          warehouseId, id, qty,
          ln.unit_id != null && ln.unit_id !== '' ? Number(ln.unit_id) : null,
          price, price != null ? qty * price : 0, ln.description ?? null]

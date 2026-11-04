@@ -95,7 +95,9 @@ CROSS JOIN pre_finance_types t
 LEFT JOIN (
   SELECT farmer_id, pre_finance_type_id, SUM(total_amount) AS dist_total
   FROM pre_finance_distributions
-  WHERE counts_as_debt = 1
+  -- A profit-sharing season's cost is settled from the plot's margin, not repaid
+  -- per kg — see `pre_finance_distributions.scheme` in schema.sql.
+  WHERE counts_as_debt = 1 AND COALESCE(scheme, '') <> 'ProfitSharing'
   GROUP BY farmer_id, pre_finance_type_id
 ) d ON d.farmer_id = f.id AND d.pre_finance_type_id = t.id
 LEFT JOIN (

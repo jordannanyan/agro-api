@@ -65,7 +65,8 @@ export async function outstandingByType(db: Db, farmerId: number, excludePurchas
   const [rows] = await db.query(
     `SELECT t.id AS pre_finance_type_id, t.type_name,
             COALESCE((SELECT SUM(d.total_amount) FROM pre_finance_distributions d
-                      WHERE d.farmer_id = ? AND d.pre_finance_type_id = t.id AND d.counts_as_debt = 1), 0)
+                      WHERE d.farmer_id = ? AND d.pre_finance_type_id = t.id AND d.counts_as_debt = 1
+                        AND COALESCE(d.scheme, '') <> 'ProfitSharing'), 0)
           - COALESCE((SELECT SUM(det.amount) FROM pre_finance_installments i
                       JOIN pre_finance_installment_details det ON det.installment_id = i.id
                       WHERE i.farmer_id = ? AND det.pre_finance_type_id = t.id

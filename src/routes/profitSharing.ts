@@ -253,6 +253,10 @@ router.get('/pl', authenticate, async (req: Request, res: Response) => {
               -- figure 77% too large. Those rows now carry counts_as_debt = 0 and
               -- drop out here while still counting against warehouse stock.
               -- See docs/rekonsiliasi-buku-besar-2026-08.md.
+              --
+              -- Only lines booked under ProfitSharing: a plot that was Pre-Finance
+              -- before it became profit sharing keeps that earlier spend as the
+              -- farmer's per-kg debt, not as a cost of this season.
               COALESCE(sap.amount, 0)         AS debt_saprodi,
               COALESCE(land.amount, 0)        AS debt_land,
               COALESCE(sap.amount, 0) + COALESCE(land.amount, 0) AS debt_total,
@@ -268,7 +272,8 @@ router.get('/pl', authenticate, async (req: Request, res: Response) => {
        LEFT JOIN (
          SELECT plot_id, SUM(total_amount) AS amount
          FROM pre_finance_distributions
-         WHERE plot_id IS NOT NULL AND counts_as_debt = 1 ${sapWhere} GROUP BY plot_id
+         WHERE plot_id IS NOT NULL AND counts_as_debt = 1 AND scheme = 'ProfitSharing' ${sapWhere}
+         GROUP BY plot_id
        ) sap ON sap.plot_id = pl.id
        LEFT JOIN (
          SELECT plot_id, SUM(amount) AS amount
@@ -357,7 +362,8 @@ LEFT JOIN farmers f ON f.id = pl.farmer_id
 -- belonged to read as a huge loss while later ones read as pure profit.
 LEFT JOIN (
   SELECT plot_id, SUM(total_amount) AS amount FROM pre_finance_distributions
-  WHERE plot_id IS NOT NULL AND counts_as_debt = 1 AND date <= ? GROUP BY plot_id
+  WHERE plot_id IS NOT NULL AND counts_as_debt = 1 AND scheme = 'ProfitSharing' AND date <= ?
+  GROUP BY plot_id
 ) sap ON sap.plot_id = pl.id
 LEFT JOIN (
   SELECT plot_id, SUM(amount) AS amount FROM profit_sharing_investments

@@ -1282,6 +1282,17 @@ CREATE TABLE `pre_finance_distributions` (
   -- `Daily Update` material column — counting both made SNBS debt 77% too large.
   -- The rows themselves must stay: `v_saprodi_stock` subtracts them to get stock.
   `counts_as_debt`      TINYINT(1) NOT NULL DEFAULT 1,
+  -- The plot's scheme ON THE DAY of the issue, copied from `plot.scheme` when the
+  -- line is written. It decides who carries the cost:
+  --   PreFinance (and BeliPutus / no plot) — farmer debt, repaid per kg
+  --     (v_pre_finance_outstanding, repayment.ts);
+  --   ProfitSharing — cost of a profit-sharing season, charged against the
+  --     plot's margin at settlement (profitSharing.ts), not owed per kg.
+  -- Stored rather than read from the plot because a plot can change scheme: the
+  -- five JNBS plots of Mustari, Eko Irawan and Yudis were Pre-Finance until
+  -- 28 Aug 2025 and profit sharing after, and what was lent before that day is
+  -- still debt. NULL = no plot to take a scheme from.
+  `scheme`              ENUM('BeliPutus','PreFinance','ProfitSharing') NULL,
   `description`         TEXT NULL,
   `upload_proof`        VARCHAR(255) NULL,
   `shipped_at`          DATETIME NULL,            -- "barang dikirim" (pengganti Stock Out)

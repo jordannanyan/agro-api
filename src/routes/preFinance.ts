@@ -8,21 +8,23 @@ import { entityScope } from '../utils/entityScope';
 import { distributionEntityPredicate, farmerEntityPredicate } from '../utils/farmScope';
 import { respondList } from '../utils/pagination';
 import { outstandingByType, suggestRepayment } from '../utils/repayment';
+import { plotScheme } from '../utils/distributionScheme';
 
 // -----------------------------------------------------------------------------
 // Distributions  /api/pre-finance/distributions
 // -----------------------------------------------------------------------------
 export const distributionsRouter = Router();
 
-// `scheme` is derived from the plot, never stored here — same rule as purchasing.
-// A distribution with no plot cannot be attributed to a scheme, so it reads as
-// BeliPutus, which is the scheme that carries no farmer obligation.
+// `scheme` (in `d.*`) is the plot's scheme on the day of the issue, stored on the
+// line when it is written (utils/distributionScheme.ts, schema.sql) — a plot that
+// changes scheme must not drag its earlier lines along. NULL = no plot; the screen
+// reads that as BeliPutus. Not re-aliased here: respondList wraps this query in a
+// derived table, where a second `scheme` column is a duplicate-name error.
 const DIST_SELECT = `
   SELECT d.*, t.type_name, f.farmer_name, p.plot_name, s.sapropdi_name, u.unit_name,
          w.warehouse_name,
          COALESCE(fk.entities_id, wk.entities_id) AS entity_id,
-         COALESCE(fe.entities_name, we.entities_name) AS entity_name,
-         COALESCE(p.scheme, 'BeliPutus') AS scheme
+         COALESCE(fe.entities_name, we.entities_name) AS entity_name
   FROM pre_finance_distributions d
   LEFT JOIN pre_finance_types t ON t.id = d.pre_finance_type_id
   LEFT JOIN farmers f           ON f.id = d.farmer_id
@@ -48,7 +50,7 @@ distributionsRouter.get('/', authenticate, async (req: Request, res: Response) =
   if (req.query.pre_finance_type_id) { where.push('d.pre_finance_type_id = ?'); args.push(req.query.pre_finance_type_id); }
   if (req.query.warehouse_id)        { where.push('d.warehouse_id = ?'); args.push(req.query.warehouse_id); }
   if (req.query.plot_id)             { where.push('d.plot_id = ?'); args.push(req.query.plot_id); }
-  if (req.query.scheme)              { where.push("COALESCE(p.scheme, 'BeliPutus') = ?"); args.push(req.query.scheme); }
+  if (req.query.scheme)              { where.push("COALESCE(d.scheme, 'BeliPutus') = ?"); args.push(req.query.scheme); }
   // "Riwayat Barang Keluar" is farmer debt and a warehouse movement at once, so it
   // follows the same PT rule as both: the farmer's PT, or the issuing warehouse's
   // when no farmer is named.
@@ -104,11 +106,13 @@ distributionsRouter.post('/', authenticate, distFiles, async (req: Request, res:
       ? Number(b.total_amount)
       : (qty != null && price != null ? qty * price : 0);
 
+    const plotId = b.plot_id != null && b.plot_id !== '' ? Number(b.plot_id) : null;
     const cols: any = {
       pre_finance_type_id: Number(b.pre_finance_type_id),
       date: b.date,
       farmer_id: Number(b.farmer_id),
-      plot_id: b.plot_id != null && b.plot_id !== '' ? Number(b.plot_id) : null,
+      plot_id: plotId,
+      scheme: await plotScheme(pool, plotId),
       commodities_id: b.commodities_id != null && b.commodities_id !== '' ? Number(b.commodities_id) : null,
       sapropdi_id: b.sapropdi_id != null && b.sapropdi_id !== '' ? Number(b.sapropdi_id) : null,
       warehouse_id: warehouseId,
