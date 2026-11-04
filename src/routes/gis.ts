@@ -4,6 +4,7 @@ import { authenticate } from '../middleware/auth';
 import { upload, fileToPath } from '../middleware/upload';
 import { compressImages } from '../services/imageProcessor';
 import { entityScope } from '../utils/entityScope';
+import { wktCorners } from '../utils/polygonShape';
 
 // =============================================================================
 // Land & Tree management (used by app-traceability-fairventures).
@@ -290,7 +291,8 @@ mapRouter.get('/', authenticate, async (req: Request, res: Response) => {
     if (scope != null) { where.push('k.entities_id = ?'); args.push(scope); }
     const [plots] = await pool.query(
       `SELECT p.id, p.plot_name, p.scheme, p.latitude, p.longitude, p.land_area, p.farmer_id,
-              f.farmer_name, f.kth_id, k.entities_id
+              f.farmer_name, f.kth_id, k.entities_id, ST_AsText(p.polygon) AS polygon_wkt,
+              p.polygon_status, p.polygon_note
        FROM plot p LEFT JOIN farmers f ON f.id = p.farmer_id LEFT JOIN kth k ON k.id = f.kth_id
        ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY p.plot_name`, args);
     const list = plots as any[];
@@ -303,6 +305,17 @@ mapRouter.get('/', authenticate, async (req: Request, res: Response) => {
     }
     const byPoints = new Map<number, any[]>(); points.forEach((pt) => { if (!byPoints.has(pt.plot_id)) byPoints.set(pt.plot_id, []); byPoints.get(pt.plot_id)!.push(pt); });
     const byTrees = new Map<number, any[]>(); trees.forEach((t) => { if (!byTrees.has(t.plot_id)) byTrees.set(t.plot_id, []); byTrees.get(t.plot_id)!.push(t); });
-    return res.json({ data: list.map((p) => ({ ...p, polygon: byPoints.get(p.id) || [], trees: byTrees.get(p.id) || [] })) });
+    // The boundary is plot.polygon — the survey import, a tidied or estimated
+    // shape, or the field recording. Reading it from the recorded vertices instead
+    // left every imported boundary (no vertices) off the map. Vertices remain the
+    // fallback for a plot without a stored polygon.
+    return res.json({ data: list.map((p) => {
+      const ring = wktCorners(p.polygon_wkt);
+      const polygon = ring.length >= 3
+        ? ring.map((c, i) => ({ id: null, plot_id: p.id, seq: i + 1, latitude: c.lat, longitude: c.lng }))
+        : (byPoints.get(p.id) || []);
+      delete p.polygon_wkt;
+      return { ...p, polygon, trees: byTrees.get(p.id) || [] };
+    }) });
   } catch (e: any) { return res.status(500).json({ message: 'Server error', error: e.message }); }
 });

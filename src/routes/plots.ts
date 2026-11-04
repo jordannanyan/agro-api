@@ -4,6 +4,7 @@ import { authenticate } from '../middleware/auth';
 import { upload, fileToPath } from '../middleware/upload';
 import { compressImages } from '../services/imageProcessor';
 import { entityScope } from '../utils/entityScope';
+import { judgeBoundary, ringWkt } from '../utils/polygonShape';
 
 export const router = Router();
 
@@ -15,6 +16,7 @@ const SELECT = `
          p.latitude, p.longitude, p.farmer_id, p.scheme, p.created_at, p.updated_at,
          p.parent_plot_id, pp.plot_name AS parent_plot_name,
          p.commodities_id, c.commodities_name AS commodity_name, p.ledger_code,
+         p.polygon_status, p.polygon_note,
          -- What grows on the plot (plot_commodities), most plants first.
          (SELECT GROUP_CONCAT(pcc.commodities_name ORDER BY pc.plants IS NULL, pc.plants DESC SEPARATOR '|')
             FROM plot_commodities pc JOIN commodities pcc ON pcc.id = pc.commodities_id
@@ -117,15 +119,21 @@ router.put('/:id/polygon-points', authenticate, async (req: Request, res: Respon
         ]
       );
     }
-    // Rebuild plot.polygon from the points (closed ring, x=lng y=lat) when there
-    // are at least 3 vertices; otherwise clear it.
+    // Rebuild plot.polygon from the points when there are at least 3 vertices;
+    // otherwise clear it. The rows above keep the order the app sent (photos are
+    // uploaded later by seq); only the outline is put in walking order when the
+    // corners as sent cross each other. A new recording replaces any tidied or
+    // estimated shape, and is judged on its own — see utils/polygonShape.ts.
     if (points.length >= 3) {
-      const ring = points.map((p: any) => `${Number(p.longitude)} ${Number(p.latitude)}`);
-      ring.push(`${Number(points[0].longitude)} ${Number(points[0].latitude)}`);
-      await conn.query('UPDATE plot SET polygon = ST_GeomFromText(?), updated_at = NOW() WHERE id = ?',
-        [`POLYGON((${ring.join(', ')}))`, plotId]);
+      const v = judgeBoundary(points.map((p: any) => ({
+        lat: Number(p.latitude), lng: Number(p.longitude),
+        accuracy: p.accuracy_m != null && p.accuracy_m !== '' ? Number(p.accuracy_m) : null,
+      })));
+      await conn.query(
+        'UPDATE plot SET polygon = ST_GeomFromText(?), polygon_status = ?, polygon_note = ?, updated_at = NOW() WHERE id = ?',
+        [ringWkt(v.ring), v.status, v.note, plotId]);
     } else {
-      await conn.query('UPDATE plot SET polygon = NULL, updated_at = NOW() WHERE id = ?', [plotId]);
+      await conn.query('UPDATE plot SET polygon = NULL, polygon_status = NULL, polygon_note = NULL, updated_at = NOW() WHERE id = ?', [plotId]);
     }
     await conn.commit();
   } catch (e: any) {
@@ -311,10 +319,11 @@ const update = async (req: Request, res: Response) => {
     // Polygon WKT: absent → leave untouched; empty string → clear; else ST_GeomFromText.
     if (b.polygon !== undefined) {
       const wkt = typeof b.polygon === 'string' && b.polygon.trim() ? b.polygon.trim() : null;
+      // A boundary drawn or corrected by hand is taken as it is.
       if (wkt === null) {
-        assignments.push('`polygon` = NULL');
+        assignments.push('`polygon` = NULL', '`polygon_status` = NULL', '`polygon_note` = NULL');
       } else {
-        assignments.push('`polygon` = ST_GeomFromText(?)');
+        assignments.push('`polygon` = ST_GeomFromText(?)', '`polygon_status` = NULL', '`polygon_note` = NULL');
         args.push(wkt);
       }
     }

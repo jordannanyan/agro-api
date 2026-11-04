@@ -355,6 +355,14 @@ CREATE TABLE `plot` (
   -- and commodity ("SJ0015 · Pisang"). The code the ledgers use for it ("SUW 1")
   -- is kept here, for matching ledger rows; it is not shown.
   `ledger_code`      VARCHAR(100) NULL,
+  -- How far the stored boundary (polygon) can be trusted. NULL = as surveyed or
+  -- recorded. 'dirapikan' = an app recording squared into a rectangle of the same
+  -- area; 'perkiraan' = estimated (a square of the recorded area at the recorded
+  -- points' centre) because the recording was unusable; 'ukur_ulang' = needs a new
+  -- walk round the plot. The recorded vertices stay in plot_polygon_points and the
+  -- shape it replaced in plot_polygon_backups.
+  `polygon_status`   VARCHAR(20) NULL,
+  `polygon_note`     VARCHAR(255) NULL,
   `created_at`       DATETIME NULL,
   `updated_at`       DATETIME NULL,
   CONSTRAINT `fk_plot_farmer` FOREIGN KEY (`farmer_id`) REFERENCES `farmers`(`id`) ON DELETE CASCADE,
@@ -534,6 +542,18 @@ CREATE TABLE `plot_commodities` (
   UNIQUE KEY `uq_plot_commodity` (`plot_id`, `commodities_id`),
   CONSTRAINT `fk_pc_plot`      FOREIGN KEY (`plot_id`)        REFERENCES `plot`(`id`) ON DELETE CASCADE,
   CONSTRAINT `fk_pc_commodity` FOREIGN KEY (`commodities_id`) REFERENCES `commodities`(`id`) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+-- A plot's boundary as it was before a script replaced it: the polygon (WKT) and
+-- the recorded vertices (JSON), with why. Restoring is copying them back.
+CREATE TABLE `plot_polygon_backups` (
+  `id`          INT AUTO_INCREMENT PRIMARY KEY,
+  `plot_id`     INT NOT NULL,
+  `polygon_wkt` MEDIUMTEXT NULL,
+  `points_json` MEDIUMTEXT NULL,
+  `reason`      VARCHAR(255) NULL,
+  `created_at`  DATETIME NULL,
+  KEY `idx_ppb_plot` (`plot_id`)
 ) ENGINE=InnoDB;
 
 CREATE TABLE `plot_polygon_points` (
