@@ -841,4 +841,66 @@ router.delete('/payouts/:id', authenticate, async (req: Request, res: Response) 
   }
 });
 
+// -----------------------------------------------------------------------------
+// GET /api/profit-sharing/costs/summary?entity_id=
+//
+// Every cost of a profit-sharing season, per plot, in one place — split by WHAT
+// the cost is, not by which table holds it:
+//   saprodi       distributions of type Saprodi (warehouse issues, JNBS) +
+//                 investments of type Saprodi or "(Cultivation Material)" (the
+//                 SNBS ledger's material column)
+//   tenaga kerja  distributions of type Labor (JNBS labour weeks) +
+//                 investments of type Labor (SNBS maintenance labour, land prep)
+//   operasional   every other investment (transport, ojek, irrigation material…)
+// Their sum is what the plot's margin has to clear before the share is paid out.
+// -----------------------------------------------------------------------------
+router.get('/costs/summary', authenticate, async (req: Request, res: Response) => {
+  try {
+    const args: any[] = [];
+    const where = ["(pl.scheme = 'ProfitSharing' OR d.plot_id IS NOT NULL OR i.plot_id IS NOT NULL)"];
+    const scope = entityScope(req);
+    if (scope != null) { where.push('k.entities_id = ?'); args.push(scope); }
+    const [rows] = await pool.query(
+      `SELECT pl.id AS plot_id, pl.plot_name, pl.scheme, f.farmer_name, e.entities_name AS entity_name,
+              COALESCE(d.saprodi, 0) + COALESCE(i.sap, 0) AS saprodi,
+              COALESCE(d.labour, 0) + COALESCE(i.lab, 0) AS labour,
+              COALESCE(i.ops, 0) AS operasional,
+              -- Where the figures come from, for the reader who wants to check.
+              COALESCE(d.saprodi, 0) + COALESCE(d.labour, 0) AS from_lines, COALESCE(i.inv_total, 0) AS from_investments,
+              COALESCE(d.n, 0) AS line_count, COALESCE(i.n, 0) AS ops_count,
+              COALESCE(d.saprodi, 0) + COALESCE(d.labour, 0) + COALESCE(i.inv_total, 0) AS total,
+              d.first_date, d.last_date, i.first_period, i.last_period
+         FROM plot pl
+         LEFT JOIN farmers f ON f.id = pl.farmer_id
+         LEFT JOIN kth k ON k.id = f.kth_id
+         LEFT JOIN entities e ON e.id = k.entities_id
+         LEFT JOIN (
+           SELECT d.plot_id,
+                  SUM(IF(t.type_name = 'Saprodi', d.total_amount, 0)) AS saprodi,
+                  SUM(IF(t.type_name <> 'Saprodi', d.total_amount, 0)) AS labour,
+                  COUNT(*) AS n, MIN(d.date) AS first_date, MAX(d.date) AS last_date
+             FROM pre_finance_distributions d JOIN pre_finance_types t ON t.id = d.pre_finance_type_id
+            WHERE d.scheme = 'ProfitSharing' AND d.counts_as_debt = 1 AND d.plot_id IS NOT NULL
+            GROUP BY d.plot_id
+         ) d ON d.plot_id = pl.id
+         LEFT JOIN (
+           SELECT i.plot_id,
+                  SUM(IF(t.type_name = 'Saprodi' OR i.description LIKE '%(Cultivation Material)%', i.amount, 0)) AS sap,
+                  SUM(IF(t.type_name = 'Labor', i.amount, 0)) AS lab,
+                  SUM(IF(COALESCE(t.type_name, '') NOT IN ('Saprodi', 'Labor')
+                         AND COALESCE(i.description, '') NOT LIKE '%(Cultivation Material)%', i.amount, 0)) AS ops,
+                  SUM(i.amount) AS inv_total, COUNT(*) AS n, MIN(i.period) AS first_period, MAX(i.period) AS last_period
+             FROM profit_sharing_investments i LEFT JOIN pre_finance_types t ON t.id = i.pre_finance_type_id
+            WHERE i.plot_id IS NOT NULL GROUP BY i.plot_id
+         ) i ON i.plot_id = pl.id
+        WHERE ${where.join(' AND ')}
+        ORDER BY e.entities_name, total DESC, pl.plot_name`, args);
+    const list = (rows as any[]).filter((r) => Number(r.total) > 0 || r.scheme === 'ProfitSharing');
+    const sum = (k: string) => money(list.reduce((s, r) => s + Number(r[k] || 0), 0));
+    return res.json({ data: list, totals: { saprodi: sum('saprodi'), labour: sum('labour'), operasional: sum('operasional'), total: sum('total') } });
+  } catch (err: any) {
+    return res.status(500).json({ message: 'Server error', error: err.message });
+  }
+});
+
 export default router;
