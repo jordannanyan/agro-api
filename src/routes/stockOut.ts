@@ -76,6 +76,10 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
       where.push("EXISTS (SELECT 1 FROM pre_finance_distributions d WHERE d.stock_out_id = so.id AND COALESCE(d.scheme, 'BeliPutus') = ?)");
       args.push(req.query.scheme);
     }
+    if (req.query.commodity_id != null && req.query.commodity_id !== '') {
+      where.push('EXISTS (SELECT 1 FROM pre_finance_distributions d WHERE d.stock_out_id = so.id AND COALESCE(d.commodities_id, 0) = ?)');
+      args.push(Number(req.query.commodity_id));
+    }
     // Narrow to one plot. The plot lives on the LINES, not the header — a stock-out
     // can be split across several — so this asks whether any line went to it rather
     // than joining, which would duplicate the header row once per matching line.
@@ -114,6 +118,8 @@ router.get('/summary', authenticate, async (req: Request, res: Response) => {
     // What the goods were for: Pre-Finance (farmer debt) or Profit Sharing (cost
     // of the plot's season) — the line's own scheme, see schema.sql.
     if (req.query.scheme) { where.push("COALESCE(d.scheme, 'BeliPutus') = ?"); args.push(req.query.scheme); }
+    // One crop at a time — the commodity buttons on the screen (0 = none recorded).
+    if (req.query.commodity_id != null && req.query.commodity_id !== '') { where.push('COALESCE(d.commodities_id, 0) = ?'); args.push(Number(req.query.commodity_id)); }
     if (req.query.search) {
       where.push('(f.farmer_name LIKE ? OR p.plot_name LIKE ? OR s.sapropdi_name LIKE ? OR c.commodities_name LIKE ?)');
       const q = `%${req.query.search}%`; args.push(q, q, q, q);
