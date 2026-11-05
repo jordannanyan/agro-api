@@ -144,7 +144,7 @@ async function readLedger(file) {
     if (!offByName.has(k) || o.entities_id === ENTITY_JNBS) offByName.set(k, o.id);
   }
   const [dbPur] = await conn.query(
-    `SELECT p.id, p.date, UPPER(TRIM(pl.plot_name)) AS plot, p.grade_id, p.quantity, p.price_per_unit, p.receipt_invoice
+    `SELECT p.id, p.date, UPPER(TRIM(pl.plot_name)) AS plot, p.grade_id, p.quantity, p.price_per_unit, p.receipt_invoice, p.scheme
      FROM purchasing p JOIN plot pl ON pl.id = p.plot_id
      WHERE p.receipt_invoice LIKE 'BAN-AML-%' AND p.commodities_id = ? ORDER BY p.id`, [COMM_BANANA]);
   const [dbProc] = await conn.query(
@@ -194,7 +194,13 @@ async function readLedger(file) {
     const d = lp.db;
     const ch = {};
     if (!same(d.quantity, lp.qty, 0.0005)) ch.quantity = lp.qty;
-    if (!same(d.price_per_unit, lp.price, 0.005)) ch.price_per_unit = lp.price;
+    // The five plots that moved to profit sharing (29 Aug 2025) were bought at a
+    // price before that day; the AML ledger lists those deliveries at 0, the
+    // purchasing sheet at Rp 2.850/kg with the loan deducted
+    // (migratePurchasingScheme2026-11.js). A Pre-Finance delivery keeps its price.
+    if (!same(d.price_per_unit, lp.price, 0.005) && !(d.scheme === 'PreFinance' && Number(lp.price) === 0 && Number(d.price_per_unit) > 0)) {
+      ch.price_per_unit = lp.price;
+    }
     if (d.receipt_invoice !== invoice) ch.receipt_invoice = invoice;
     if (Object.keys(ch).length) plan.purUpdate.push({ id: d.id, ch, line: lp.line });
   }
