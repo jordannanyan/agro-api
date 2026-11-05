@@ -18,6 +18,12 @@
 // when the AML ledger reaches these days it takes these rows over (and gives
 // them their DO number) instead of adding them a second time.
 //
+// --rows 172,173 takes those sheet rows instead, whatever their date — for a
+// delivery the AML ledger never had (GK006002, 14 Jun 2025: in the purchasing
+// sheet and in the JNBS "Mustari Outstanding Debt" figures, nowhere else).
+// The five plots that moved to profit sharing are Pre-Finance up to 28 Aug 2025
+// (migratePurchasingScheme2026-11.js), whatever their scheme today.
+//
 // Idempotent (a delivery with the same plot, date and kg is skipped). Dry-run by
 // default (written in a transaction, rolled back).
 //
@@ -32,6 +38,9 @@ const arg = (k) => { const i = process.argv.indexOf(k); return i > 0 ? process.a
 const APPLY = process.argv.includes('--apply');
 const FILE = arg('--file');
 const AFTER = arg('--after') || '2026-10-19';
+const ROWS = arg('--rows') ? new Set(arg('--rows').split(',').map(Number)) : null;
+const SWITCHED = ['SM003002', 'SM019003', 'GK006001', 'GK006002', 'GW006003'];
+const PF_UNTIL = '2025-08-28';
 const DB = process.env.DB_NAME || 'agro_supply';
 const SHEET = 'Data Pembelian & Penjualan Pisa';
 const COMM_BANANA = 2, WH_AML = 2, GRADE_UNCAT = 8, ENTITY_JNBS = 3;
@@ -61,7 +70,8 @@ async function readSheet() {
       const v = []; row.eachCell({ includeEmpty: true }, (c, i) => { v[i - 1] = c.value; });
       const plot = String(cv(v[col('D')]) ?? '').trim().toUpperCase();
       const date = ymd(v[col('BX')]);
-      if (!/^[A-Z]{2}\d{6}$/.test(plot) || !date || date <= AFTER) continue;
+      if (!/^[A-Z]{2}\d{6}$/.test(plot) || !date) continue;
+      if (ROWS ? !ROWS.has(row.number) : date <= AFTER) continue;
       rows.push({ row: row.number, date, plot, farmer: String(cv(v[col('C')]) ?? '').trim(), kg: num(v[col('F')]), buy: num(v[col('G')]),
         sap: num(v[col('J')]), tk: num(v[col('K')]), status: String(cv(v[col('P')]) ?? '').trim().toLowerCase(),
         nota: String(cv(v[col('Q')]) ?? '').replace(/\.pdf$/i, '').trim() });
@@ -72,7 +82,7 @@ async function readSheet() {
 }
 
 (async () => {
-  log(`${APPLY ? 'APPLY' : 'DRY-RUN'} on ${DB} · setoran sesudah ${AFTER}`);
+  log(`${APPLY ? 'APPLY' : 'DRY-RUN'} on ${DB} · ${ROWS ? `baris ${[...ROWS].join(', ')}` : `setoran sesudah ${AFTER}`}`);
   const rows = await readSheet();
   const c = await mysql.createConnection({
     host: process.env.DB_HOST || '127.0.0.1', port: Number(process.env.DB_PORT || 3306),
@@ -91,14 +101,15 @@ async function readSheet() {
       if (!pl) { log(`! baris ${r.row}: plot ${r.plot} bukan plot JNBS — dilewati`); continue; }
       const [dup] = await q('SELECT id FROM purchasing WHERE plot_id = ? AND date = ? AND ABS(quantity - ?) < 0.006 LIMIT 1', [pl.id, r.date, r.kg]);
       if (dup) { skipped++; continue; }
-      const ps = pl.scheme === 'ProfitSharing';
+      const scheme = SWITCHED.includes(r.plot) && r.date <= PF_UNTIL ? 'PreFinance' : pl.scheme;
+      const ps = scheme === 'ProfitSharing';
       const price = ps ? 0 : r2(r.buy / r.kg);
       const invoice = `BAN-AML-${r.nota || `BARIS${r.row}`}`.slice(0, 100);
       const [res] = await c.query(`INSERT INTO purchasing (plot_id, supplier_type, commodities_id, grade_id, warehouse_id, receipt_invoice, date, quantity,
           price_per_unit, scheme, payment_status, is_process, created_at, updated_at) VALUES (?, 'farmer', ?,?,?,?,?,?,?,?,?, 0, NOW(), NOW())`,
-        [pl.id, COMM_BANANA, GRADE_UNCAT, WH_AML, invoice, r.date, r.kg, price, pl.scheme, r.status === 'paid' || ps ? 'paid' : 'unpaid']);
+        [pl.id, COMM_BANANA, GRADE_UNCAT, WH_AML, invoice, r.date, r.kg, price, scheme, r.status === 'paid' || ps ? 'paid' : 'unpaid']);
       const deduction = r2(r.sap + r.tk);
-      if (!ps && pl.scheme === 'PreFinance' && deduction > 0) {
+      if (!ps && scheme === 'PreFinance' && deduction > 0) {
         const [ins] = await c.query(`INSERT INTO pre_finance_installments (purchasing_id, farmer_id, date, reference_no, total_payment, notes, created_at, updated_at)
           VALUES (?,?,?,?,?,?,NOW(),NOW())`, [res.insertId, pl.farmer_id, r.date, invoice, deduction,
           `Potongan setoran — Data Pembelian & Penjualan Pisang baris ${r.row}`]);

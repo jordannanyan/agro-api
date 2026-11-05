@@ -613,6 +613,135 @@ outstandingRouter.get('/overview', authenticate, async (req: Request, res: Respo
   }
 });
 
+// -----------------------------------------------------------------------------
+// GET /api/pre-finance/outstanding/by-commodity?entity_id=
+//
+// Outstanding Petani per commodity (feedback JNBS finance, 2026-11-05): a farmer
+// repays off the deliveries of one crop — banana today; mango, coffee, balsa
+// have not been harvested — so lumping every loan together reads as if the
+// banana deductions were paying the mango debt.
+//
+//   distributed   Pre-Finance lines of that commodity (counts_as_debt, not PS)
+//   paid          deductions off deliveries of that commodity; a repayment with
+//                 no delivery (cash) goes to the commodity the farmer delivers
+//                 most, else to the one with the largest debt
+//
+// Frozen: a farmer × commodity whose plots moved to profit sharing (Mustari, Eko
+// Irawan, Yudis — banana, 29 Aug 2025). Nothing more is deducted per kg; what is
+// left is the frozen debt, settled out of the profit share at the end. Per plot,
+// so it can be read against the JNBS "Mustari Outstanding Debt" sheet.
+// -----------------------------------------------------------------------------
+outstandingRouter.get('/by-commodity', authenticate, async (req: Request, res: Response) => {
+  try {
+    const scope = entityScope(req);
+    const fw = scope != null ? `AND ${farmerEntityPredicate('x.farmer_id')}` : '';
+    const sa = scope != null ? [scope] : [];
+    const [dist] = await pool.query(
+      `SELECT x.farmer_id, x.plot_id, x.commodities_id, SUM(x.total_amount) AS amount
+         FROM pre_finance_distributions x
+        WHERE x.counts_as_debt = 1 AND COALESCE(x.scheme, '') <> 'ProfitSharing' ${fw}
+        GROUP BY x.farmer_id, x.plot_id, x.commodities_id`, sa);
+    const [paid] = await pool.query(
+      `SELECT x.farmer_id, pu.plot_id, pu.commodities_id, psp.plot_id AS payout_plot_id,
+              x.purchasing_id IS NULL AND x.profit_sharing_payout_id IS NULL AS cash, SUM(x.total_payment) AS amount
+         FROM pre_finance_installments x
+         LEFT JOIN purchasing pu ON pu.id = x.purchasing_id
+         LEFT JOIN profit_sharing_payouts psp ON psp.id = x.profit_sharing_payout_id
+        WHERE 1 = 1 ${fw}
+        GROUP BY x.farmer_id, pu.plot_id, pu.commodities_id, psp.plot_id, cash`, sa);
+    // What each farmer delivers most, and what each plot grows most (by kilos).
+    const [deliv] = await pool.query(
+      `SELECT pl.farmer_id, pu.plot_id, pu.commodities_id, SUM(pu.quantity) AS kg
+         FROM purchasing pu JOIN plot pl ON pl.id = pu.plot_id GROUP BY pl.farmer_id, pu.plot_id, pu.commodities_id`);
+    // Plots that changed to profit sharing, and the last day they were Pre-Finance.
+    const [switched] = await pool.query(
+      `SELECT pu.plot_id, MAX(pu.date) AS pf_until FROM purchasing pu JOIN plot pl ON pl.id = pu.plot_id
+        WHERE pl.scheme = 'ProfitSharing' AND pu.scheme = 'PreFinance' GROUP BY pu.plot_id`);
+    const sw = new Map((switched as any[]).map((r) => [r.plot_id, String(r.pf_until).slice(0, 10)]));
+
+    // key → the commodity with the most kilos delivered.
+    const topBy = (rows: any[], key: string) => {
+      const kg = new Map<number, Map<number, number>>();
+      for (const r of rows) {
+        const m = kg.get(r[key]) || new Map<number, number>();
+        m.set(r.commodities_id, (m.get(r.commodities_id) || 0) + Number(r.kg));
+        kg.set(r[key], m);
+      }
+      return new Map([...kg].map(([k, m]) => [k, { c: [...m].sort((x, y) => y[1] - x[1])[0][0] }]));
+    };
+    const farmerCrop = topBy(deliv as any[], 'farmer_id');
+    const plotCrop = topBy(deliv as any[], 'plot_id');
+
+    type Cell = { farmer_id: number; commodities_id: number | null; distributed: number; paid: number; cash_paid: number;
+      plots: Map<number | null, { distributed: number; paid: number }> };
+    const cells = new Map<string, Cell>();
+    const cell = (f: number, c: number | null) => {
+      const k = `${f}|${c ?? ''}`;
+      if (!cells.has(k)) cells.set(k, { farmer_id: f, commodities_id: c, distributed: 0, paid: 0, cash_paid: 0, plots: new Map() });
+      return cells.get(k)!;
+    };
+    const plotLine = (o: Cell, p: number | null) => {
+      if (!o.plots.has(p)) o.plots.set(p, { distributed: 0, paid: 0 });
+      return o.plots.get(p)!;
+    };
+    for (const r of dist as any[]) {
+      const o = cell(r.farmer_id, r.commodities_id);
+      o.distributed += Number(r.amount); plotLine(o, r.plot_id).distributed += Number(r.amount);
+    }
+    const debtTop = new Map<number, number | null>();
+    for (const o of cells.values()) {
+      const cur = debtTop.get(o.farmer_id);
+      if (cur === undefined || o.distributed > (cells.get(`${o.farmer_id}|${cur ?? ''}`)?.distributed ?? 0)) debtTop.set(o.farmer_id, o.commodities_id);
+    }
+    for (const r of paid as any[]) {
+      let c: number | null = r.commodities_id ?? null; let p: number | null = r.plot_id ?? null;
+      if (r.payout_plot_id) { p = r.payout_plot_id; c = plotCrop.get(p!)?.c ?? debtTop.get(r.farmer_id) ?? null; }
+      else if (Number(r.cash)) { c = farmerCrop.get(r.farmer_id)?.c ?? debtTop.get(r.farmer_id) ?? null; p = null; }
+      const o = cell(r.farmer_id, c);
+      o.paid += Number(r.amount); plotLine(o, p).paid += Number(r.amount);
+      if (Number(r.cash)) o.cash_paid += Number(r.amount);
+    }
+
+    const ids = (k: 'farmer_id' | 'commodities_id') => [...new Set([...cells.values()].map((o) => o[k]).filter((v) => v != null))];
+    const names = async (sql: string, v: any[]) =>
+      (v.length ? new Map(((await pool.query(sql, [v]))[0] as any[]).map((x) => [x.id, x])) : new Map<any, any>());
+    const farmers = await names(`SELECT f.id, f.farmer_name, e.entities_name FROM farmers f LEFT JOIN kth k ON k.id = f.kth_id
+      LEFT JOIN entities e ON e.id = k.entities_id WHERE f.id IN (?)`, ids('farmer_id'));
+    const coms = await names('SELECT id, commodities_name FROM commodities WHERE id IN (?)', ids('commodities_id'));
+    const plotIds = [...new Set([...cells.values()].flatMap((o) => [...o.plots.keys()]).filter((v) => v != null))];
+    const plots = await names('SELECT id, plot_name, scheme FROM plot WHERE id IN (?)', plotIds);
+    const round = (n: number) => Math.round(n * 100) / 100;
+
+    const data = [...cells.values()].map((o) => {
+      const plotRows = [...o.plots].map(([pid, v]) => ({
+        plot_id: pid, plot_name: pid != null ? plots.get(pid)?.plot_name ?? `#${pid}` : null,
+        scheme: pid != null ? plots.get(pid)?.scheme ?? null : null,
+        frozen_since: pid != null && sw.has(pid) ? sw.get(pid) : null,
+        distributed: round(v.distributed), paid: round(v.paid), outstanding: round(v.distributed - v.paid),
+      })).sort((a, b) => String(a.plot_name ?? '~').localeCompare(String(b.plot_name ?? '~')));
+      // Frozen is the crop that moved to profit sharing — the one the plot delivers
+      // (banana) — not the mango or coffee planted alongside, still ordinary debt.
+      for (const p of plotRows) if (p.frozen_since && plotCrop.get(p.plot_id!)?.c !== o.commodities_id) p.frozen_since = null;
+      const frozenPlots = plotRows.filter((p) => p.frozen_since);
+      return {
+        farmer_id: o.farmer_id, farmer_name: farmers.get(o.farmer_id)?.farmer_name ?? `#${o.farmer_id}`,
+        entity_name: farmers.get(o.farmer_id)?.entities_name ?? null,
+        commodities_id: o.commodities_id, commodity_name: o.commodities_id != null ? coms.get(o.commodities_id)?.commodities_name ?? null : null,
+        distributed: round(o.distributed), paid: round(o.paid), cash_paid: round(o.cash_paid), outstanding: round(o.distributed - o.paid),
+        frozen: frozenPlots.length > 0,
+        frozen_since: frozenPlots.length ? frozenPlots.map((p) => p.frozen_since).sort().pop() : null,
+        frozen_outstanding: round(frozenPlots.reduce((s, p) => s + p.outstanding, 0)),
+        plots: plotRows,
+      };
+    })
+      .filter((r) => r.distributed || r.paid)
+      .sort((a, b) => a.farmer_name.localeCompare(b.farmer_name) || String(a.commodity_name ?? '').localeCompare(String(b.commodity_name ?? '')));
+    return res.json({ data });
+  } catch (err: any) {
+    return res.status(500).json({ message: 'Server error', error: err.message });
+  }
+});
+
 // Summary per farmer (all types combined).
 outstandingRouter.get('/summary', authenticate, async (req: Request, res: Response) => {
   const scope = entityScope(req);
