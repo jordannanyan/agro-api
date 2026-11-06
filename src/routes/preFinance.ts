@@ -43,9 +43,18 @@ const distFiles = upload.fields([
   { name: 'delivery_proof', maxCount: 1 },
 ]);
 
-distributionsRouter.get('/', authenticate, async (req: Request, res: Response) => {
+// The filters of the two line screens (Rincian Utang Petani, Biaya Lahan Bagi
+// Hasil), the same as Stock Out's: commodity, type, warehouse, month range, PT,
+// search. `withCommodity: false` leaves the commodity out — for the counts on the
+// commodity buttons themselves.
+function distributionWhere(req: Request, withCommodity = true) {
   const where: string[] = [];
   const args: any[] = [];
+  if (withCommodity && req.query.commodity_id != null && req.query.commodity_id !== '') {
+    where.push('COALESCE(d.commodities_id, 0) = ?'); args.push(Number(req.query.commodity_id));
+  }
+  if (req.query.from) { where.push("DATE_FORMAT(d.date, '%Y-%m') >= ?"); args.push(String(req.query.from).slice(0, 7)); }
+  if (req.query.to)   { where.push("DATE_FORMAT(d.date, '%Y-%m') <= ?"); args.push(String(req.query.to).slice(0, 7)); }
   if (req.query.farmer_id)           { where.push('d.farmer_id = ?'); args.push(req.query.farmer_id); }
   if (req.query.pre_finance_type_id) { where.push('d.pre_finance_type_id = ?'); args.push(req.query.pre_finance_type_id); }
   if (req.query.warehouse_id)        { where.push('d.warehouse_id = ?'); args.push(req.query.warehouse_id); }
@@ -70,6 +79,32 @@ distributionsRouter.get('/', authenticate, async (req: Request, res: Response) =
     const q = `%${req.query.search}%`;
     args.push(q, q, q, q);
   }
+  return { where, args };
+}
+
+// GET /api/pre-finance/distributions/by-commodity — the commodity buttons: every
+// crop with lines under the other filters, largest first.
+distributionsRouter.get('/by-commodity', authenticate, async (req: Request, res: Response) => {
+  try {
+    const { where, args } = distributionWhere(req, false);
+    const [rows] = await pool.query(
+      `SELECT COALESCE(d.commodities_id, 0) AS id, MAX(c.commodities_name) AS name, COUNT(*) AS line_count,
+              COALESCE(SUM(d.total_amount), 0) AS amount
+         FROM pre_finance_distributions d
+         LEFT JOIN farmers f     ON f.id = d.farmer_id
+         LEFT JOIN plot p        ON p.id = d.plot_id
+         LEFT JOIN sapropdi s    ON s.id = d.sapropdi_id
+         LEFT JOIN commodities c ON c.id = d.commodities_id
+        ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+        GROUP BY COALESCE(d.commodities_id, 0) ORDER BY amount DESC`, args);
+    return res.json({ data: rows });
+  } catch (err: any) {
+    return res.status(500).json({ message: 'Server error', error: err.message });
+  }
+});
+
+distributionsRouter.get('/', authenticate, async (req: Request, res: Response) => {
+  const { where, args } = distributionWhere(req);
   const sql = DIST_SELECT + (where.length ? ` WHERE ${where.join(' AND ')}` : '') + ' ORDER BY d.date DESC, d.id DESC';
   return respondList(req, res, sql, args, undefined,
     'COALESCE(SUM(total_amount),0) AS total_amount');

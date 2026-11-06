@@ -856,10 +856,26 @@ router.delete('/payouts/:id', authenticate, async (req: Request, res: Response) 
 // -----------------------------------------------------------------------------
 router.get('/costs/summary', authenticate, async (req: Request, res: Response) => {
   try {
-    const args: any[] = [];
-    const where = ["(pl.scheme = 'ProfitSharing' OR d.plot_id IS NOT NULL OR i.plot_id IS NOT NULL)"];
+    // Same filters as the line screens: commodity, month range, PT, search.
+    // A monthly cost record carries no commodity; it follows its plot's crop.
+    const com = req.query.commodity_id != null && req.query.commodity_id !== '' ? Number(req.query.commodity_id) : null;
+    const from = req.query.from ? String(req.query.from).slice(0, 7) : null;
+    const to = req.query.to ? String(req.query.to).slice(0, 7) : null;
+    const PLOT_CROP = `COALESCE((SELECT x.commodities_id FROM plot x WHERE x.id = i.plot_id),
+      (SELECT pu.commodities_id FROM purchasing pu WHERE pu.plot_id = i.plot_id GROUP BY pu.commodities_id ORDER BY SUM(pu.quantity) DESC LIMIT 1),
+      (SELECT pc.commodities_id FROM plot_commodities pc WHERE pc.plot_id = i.plot_id ORDER BY pc.plants IS NULL, pc.plants DESC LIMIT 1), 0)`;
+    const dW: string[] = []; const dA: any[] = [];
+    const iW: string[] = []; const iA: any[] = [];
+    if (from) { dW.push("DATE_FORMAT(d.date, '%Y-%m') >= ?"); dA.push(from); iW.push('i.period >= ?'); iA.push(from); }
+    if (to)   { dW.push("DATE_FORMAT(d.date, '%Y-%m') <= ?"); dA.push(to);   iW.push('i.period <= ?'); iA.push(to); }
+    const dWc = [...dW]; const dAc = [...dA]; const iWc = [...iW]; const iAc = [...iA];
+    if (com != null) { dWc.push('COALESCE(d.commodities_id, 0) = ?'); dAc.push(com); iWc.push(`${PLOT_CROP} = ?`); iAc.push(com); }
+    const args: any[] = [...dAc, ...iAc];
+    const where = ["(d.plot_id IS NOT NULL OR i.plot_id IS NOT NULL OR (pl.scheme = 'ProfitSharing' AND ? = 1))"];
+    args.push(com == null && !from && !to ? 1 : 0);
     const scope = entityScope(req);
     if (scope != null) { where.push('k.entities_id = ?'); args.push(scope); }
+    if (req.query.search) { where.push('(pl.plot_name LIKE ? OR f.farmer_name LIKE ?)'); const q = `%${req.query.search}%`; args.push(q, q); }
     const [rows] = await pool.query(
       `SELECT pl.id AS plot_id, pl.plot_name, pl.scheme, f.farmer_name, e.entities_name AS entity_name,
               COALESCE(d.saprodi, 0) + COALESCE(i.sap, 0) AS saprodi,
@@ -881,7 +897,7 @@ router.get('/costs/summary', authenticate, async (req: Request, res: Response) =
                   SUM(IF(t.type_name NOT IN ('Saprodi', 'Labor'), d.total_amount, 0)) AS ops,
                   COUNT(*) AS n, MIN(d.date) AS first_date, MAX(d.date) AS last_date
              FROM pre_finance_distributions d JOIN pre_finance_types t ON t.id = d.pre_finance_type_id
-            WHERE d.scheme = 'ProfitSharing' AND d.counts_as_debt = 1 AND d.plot_id IS NOT NULL
+            WHERE d.scheme = 'ProfitSharing' AND d.counts_as_debt = 1 AND d.plot_id IS NOT NULL ${dWc.map((w) => `AND ${w}`).join(' ')}
             GROUP BY d.plot_id
          ) d ON d.plot_id = pl.id
          LEFT JOIN (
@@ -892,13 +908,29 @@ router.get('/costs/summary', authenticate, async (req: Request, res: Response) =
                          AND COALESCE(i.description, '') NOT LIKE '%(Cultivation Material)%', i.amount, 0)) AS ops,
                   SUM(i.amount) AS inv_total, COUNT(*) AS n, MIN(i.period) AS first_period, MAX(i.period) AS last_period
              FROM profit_sharing_investments i LEFT JOIN pre_finance_types t ON t.id = i.pre_finance_type_id
-            WHERE i.plot_id IS NOT NULL GROUP BY i.plot_id
+            WHERE i.plot_id IS NOT NULL ${iWc.map((w) => `AND ${w}`).join(' ')} GROUP BY i.plot_id
          ) i ON i.plot_id = pl.id
         WHERE ${where.join(' AND ')}
         ORDER BY e.entities_name, total DESC, pl.plot_name`, args);
-    const list = (rows as any[]).filter((r) => Number(r.total) > 0 || r.scheme === 'ProfitSharing');
+    const list = (rows as any[]).filter((r) => Number(r.total) > 0 || (r.scheme === 'ProfitSharing' && com == null && !from && !to));
     const sum = (k: string) => money(list.reduce((s, r) => s + Number(r[k] || 0), 0));
-    return res.json({ data: list, totals: { saprodi: sum('saprodi'), labour: sum('labour'), operasional: sum('operasional'), total: sum('total') } });
+    // The commodity buttons: each crop's total under the other filters.
+    const scopeSql = scope != null ? 'AND k.entities_id = ?' : '';
+    const [crops] = await pool.query(
+      `SELECT c.id, c.commodities_name AS name, SUM(t.amount) AS amount FROM (
+         SELECT COALESCE(d.commodities_id, 0) AS cid, d.total_amount AS amount, d.farmer_id
+           FROM pre_finance_distributions d
+          WHERE d.scheme = 'ProfitSharing' AND d.counts_as_debt = 1 AND d.plot_id IS NOT NULL ${dW.map((w) => `AND ${w}`).join(' ')}
+         UNION ALL
+         SELECT ${PLOT_CROP} AS cid, i.amount, i.farmer_id
+           FROM profit_sharing_investments i WHERE i.plot_id IS NOT NULL ${iW.map((w) => `AND ${w}`).join(' ')}
+       ) t
+       LEFT JOIN commodities c ON c.id = t.cid
+       LEFT JOIN farmers f ON f.id = t.farmer_id LEFT JOIN kth k ON k.id = f.kth_id
+       WHERE 1 = 1 ${scopeSql}
+       GROUP BY c.id, c.commodities_name ORDER BY amount DESC`, [...dA, ...iA, ...(scope != null ? [scope] : [])]);
+    return res.json({ data: list, totals: { saprodi: sum('saprodi'), labour: sum('labour'), operasional: sum('operasional'), total: sum('total') },
+      commodities: (crops as any[]).map((c) => ({ id: c.id ?? 0, name: c.name, amount: money(Number(c.amount || 0)) })) });
   } catch (err: any) {
     return res.status(500).json({ message: 'Server error', error: err.message });
   }
