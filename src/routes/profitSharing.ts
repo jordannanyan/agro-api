@@ -864,11 +864,11 @@ router.get('/costs/summary', authenticate, async (req: Request, res: Response) =
       `SELECT pl.id AS plot_id, pl.plot_name, pl.scheme, f.farmer_name, e.entities_name AS entity_name,
               COALESCE(d.saprodi, 0) + COALESCE(i.sap, 0) AS saprodi,
               COALESCE(d.labour, 0) + COALESCE(i.lab, 0) AS labour,
-              COALESCE(i.ops, 0) AS operasional,
+              COALESCE(i.ops, 0) + COALESCE(d.ops, 0) AS operasional,
               -- Where the figures come from, for the reader who wants to check.
-              COALESCE(d.saprodi, 0) + COALESCE(d.labour, 0) AS from_lines, COALESCE(i.inv_total, 0) AS from_investments,
+              COALESCE(d.saprodi, 0) + COALESCE(d.labour, 0) + COALESCE(d.ops, 0) AS from_lines, COALESCE(i.inv_total, 0) AS from_investments,
               COALESCE(d.n, 0) AS line_count, COALESCE(i.n, 0) AS ops_count,
-              COALESCE(d.saprodi, 0) + COALESCE(d.labour, 0) + COALESCE(i.inv_total, 0) AS total,
+              COALESCE(d.saprodi, 0) + COALESCE(d.labour, 0) + COALESCE(d.ops, 0) + COALESCE(i.inv_total, 0) AS total,
               d.first_date, d.last_date, i.first_period, i.last_period
          FROM plot pl
          LEFT JOIN farmers f ON f.id = pl.farmer_id
@@ -877,7 +877,8 @@ router.get('/costs/summary', authenticate, async (req: Request, res: Response) =
          LEFT JOIN (
            SELECT d.plot_id,
                   SUM(IF(t.type_name = 'Saprodi', d.total_amount, 0)) AS saprodi,
-                  SUM(IF(t.type_name <> 'Saprodi', d.total_amount, 0)) AS labour,
+                  SUM(IF(t.type_name = 'Labor', d.total_amount, 0)) AS labour,
+                  SUM(IF(t.type_name NOT IN ('Saprodi', 'Labor'), d.total_amount, 0)) AS ops,
                   COUNT(*) AS n, MIN(d.date) AS first_date, MAX(d.date) AS last_date
              FROM pre_finance_distributions d JOIN pre_finance_types t ON t.id = d.pre_finance_type_id
             WHERE d.scheme = 'ProfitSharing' AND d.counts_as_debt = 1 AND d.plot_id IS NOT NULL
