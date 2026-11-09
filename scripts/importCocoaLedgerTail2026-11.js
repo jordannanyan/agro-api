@@ -150,6 +150,20 @@ async function readSheets() {
     let nextNonSj = Number(mx.n || 0) + 1;
     const created = [];
     const newSupplier = async (name) => {
+      // A farmer already registered under exactly this name is that farmer (the
+      // 2026-08 import matched exact names first) — their cocoa purchasing plot.
+      const same = await q(`SELECT f.id FROM farmers f JOIN kth k ON k.id = f.kth_id
+        WHERE k.entities_id = 1 AND LOWER(TRIM(f.farmer_name)) = LOWER(TRIM(?))`, [name]);
+      if (same.length === 1) {
+        const ps = await q('SELECT id, plot_name, scheme FROM plot WHERE farmer_id = ? ORDER BY id', [same[0].id]);
+        const pl = ps.find((p) => /^SJ00\d+$/.test(p.plot_name)) || ps[0];
+        if (pl) {
+          plotScheme.set(pl.id, pl.scheme);
+          nameTo.set(norm(name), new Map([[`${pl.id}|`, 1]]));
+          created.push(`${name} → petani terdaftar, lahan ${pl.plot_name}`);
+          return { plot_id: pl.id, collector_id: null };
+        }
+      }
       const [f] = await c.query('INSERT INTO farmers (farmer_name, kth_id, created_at, updated_at) VALUES (?,?,NOW(),NOW())', [name, nonSj.id]);
       const code = `NONSJ${String(nextNonSj++).padStart(4, '0')}`;
       const [pl] = await c.query("INSERT INTO plot (plot_name, farmer_id, scheme, inside_kth, created_at, updated_at) VALUES (?,?, 'BeliPutus', ?, NOW(), NOW())",
