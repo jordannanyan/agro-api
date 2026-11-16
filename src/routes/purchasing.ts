@@ -7,7 +7,7 @@ import { entityScope } from '../utils/entityScope';
 import { ENTITY_COL, purchasingScope } from '../utils/farmScope';
 import { respondList } from '../utils/pagination';
 import {
-  RepaymentError, parseRepaymentBody, syncPurchasingRepayment, loadPurchasingRepayment, RepaymentResult, findPaybackRate,
+  RepaymentError, parseRepaymentMode, syncPurchasingRepayment, loadPurchasingRepayment, RepaymentResult, findPaybackRate,
 } from '../utils/repayment';
 
 export const router = Router();
@@ -101,8 +101,11 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
 // GET /api/purchasing/price-hints?commodities_id=&plot_id=|collector_id=&date=
 // A starting Rp/kg for each grade — the form fills it in and the admin adjusts it
 // to what was actually paid. In order:
-//   · Pre-Finance plot with a payback rate that names the full price: the final
-//     price that rate gives (full − saprodi − labour per kg) → source 'tarif';
+//   · Pre-Finance plot with a payback rate that names the full price: that full
+//     price → source 'tarif'. The row keeps the full price (AML books 2.850, not
+//     the 1.200 left after the deduction); the loan deduction is booked apart and
+//     net_payment = total − deduction — subtracting it from the price as well
+//     would take it twice;
 //   · else the last price paid for that grade of that commodity under the same
 //     scheme in the same PT, the same supplier first → 'terakhir'.
 router.get('/price-hints', authenticate, async (req: Request, res: Response) => {
@@ -139,7 +142,7 @@ router.get('/price-hints', authenticate, async (req: Request, res: Response) => 
         const rate = await findPaybackRate(pool, plotId, g.id, date);
         if (rate?.full_price != null) {
           const perKg = Number(rate.saprodi_per_kg) + Number(rate.labor_per_kg);
-          hint = { price: Number(rate.full_price) - perKg, source: 'tarif', date: rate.effective_date,
+          hint = { price: Number(rate.full_price), source: 'tarif', date: rate.effective_date,
                    full_price: Number(rate.full_price), deduction_per_kg: perKg };
         }
       }
@@ -223,12 +226,13 @@ router.post('/', authenticate, files, async (req: Request, res: Response) => {
       ? 0
       : (b.price_per_unit != null ? Number(b.price_per_unit) : 0);
 
-    const repaymentMode = parseRepaymentBody(b.repayment);
+    const repaymentMode = parseRepaymentMode(b);
 
     // One nota, several grades: `lines` = [{grade_id, quantity, price_per_unit}]
     // books one purchase per grade, each with its own Rp/kg, in one transaction.
-    // Each line's loan deduction is worked out from its own kilos and grade; a
-    // deduction typed by hand only makes sense for a single line.
+    // Each line's loan deduction is worked out from its own kilos and grade — from
+    // the rate, or from `repayment_per_kg` applied to every line; a deduction
+    // typed in Rupiah only makes sense for a single line.
     let lines: { grade_id: number | null; quantity: number; price_per_unit: number }[] | null = null;
     if (b.lines != null && b.lines !== '') {
       let raw = b.lines;
@@ -243,7 +247,7 @@ router.post('/', authenticate, files, async (req: Request, res: Response) => {
       const gs = lines.map((l) => l.grade_id ?? 0);
       if (new Set(gs).size !== gs.length) return res.status(422).json({ message: 'Grade yang sama muncul dua kali' });
       if (lines.length > 1 && Array.isArray(repaymentMode)) {
-        return res.status(422).json({ message: 'Potongan manual hanya bisa untuk satu grade — simpan grade lain terpisah' });
+        return res.status(422).json({ message: 'Potongan dalam Rupiah hanya bisa untuk satu grade — untuk beberapa grade isi potongan per kg' });
       }
     }
 
@@ -320,8 +324,9 @@ const update = async (req: Request, res: Response) => {
     // Sent explicitly -> exactly that. Not sent -> recomputed from the rate, but only
     // when something the rate depends on changed, so an edit to the invoice number
     // does not overwrite a deduction someone adjusted by hand.
-    const explicitRepayment = b.repayment !== undefined && b.repayment !== '';
-    const repaymentMode = parseRepaymentBody(b.repayment);
+    const explicitRepayment = (b.repayment !== undefined && b.repayment !== '')
+      || (b.repayment_per_kg !== undefined && b.repayment_per_kg !== null && b.repayment_per_kg !== '');
+    const repaymentMode = parseRepaymentMode(b);
     const f = req.files as Record<string, Express.Multer.File[]> | undefined;
     if (b.payment_status && !PAYMENT_STATUSES.includes(b.payment_status)) return res.status(422).json({ message: 'Invalid payment_status' });
 

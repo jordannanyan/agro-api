@@ -120,6 +120,38 @@ export async function suggestRepayment(db: Db, p: {
  *   undefined / '' / 'auto' → compute from the rate
  *   an array (or its JSON) → exactly these amounts; `[]` means "deduct nothing"
  */
+/**
+ * Rp/kg per type, typed on the delivery in place of the plot's rate — the deduction
+ * is then kilos × these, still capped by what is owed. Works for a nota of several
+ * grades too: every line uses the same Rp/kg. A type left out keeps the rate.
+ */
+export interface RepaymentPerKg { perKg: Record<number, number> }
+export type RepaymentMode = 'auto' | RepaymentInput[] | RepaymentPerKg;
+
+/** Read `repayment_per_kg` = [{pre_finance_type_id, per_kg}] (or its JSON). */
+export function parseRepaymentPerKg(v: any): RepaymentPerKg | null {
+  if (v === undefined || v === null || v === '') return null;
+  let arr = v;
+  if (typeof v === 'string') {
+    try { arr = JSON.parse(v); } catch { throw new RepaymentError('repayment_per_kg must be a JSON array'); }
+  }
+  if (!Array.isArray(arr)) throw new RepaymentError('repayment_per_kg must be an array');
+  const perKg: Record<number, number> = {};
+  for (const r of arr) {
+    const id = Number(r?.pre_finance_type_id);
+    const n = Number(r?.per_kg);
+    if (!id) throw new RepaymentError('repayment_per_kg: pre_finance_type_id is required');
+    if (!(n >= 0) || !isFinite(n)) throw new RepaymentError('Potongan per kg tidak boleh negatif');
+    perKg[id] = n;
+  }
+  return { perKg };
+}
+
+/** `repayment_per_kg` wins over `repayment` when both are sent. */
+export function parseRepaymentMode(b: any): RepaymentMode {
+  return parseRepaymentPerKg(b?.repayment_per_kg) ?? parseRepaymentBody(b?.repayment);
+}
+
 export function parseRepaymentBody(v: any): 'auto' | RepaymentInput[] {
   if (v === undefined || v === null || v === '' || v === 'auto') return 'auto';
   let arr = v;
@@ -143,7 +175,7 @@ export interface RepaymentResult {
 }
 
 export async function syncPurchasingRepayment(
-  conn: PoolConnection, purchasingId: number, mode: 'auto' | RepaymentInput[], reason?: string | null,
+  conn: PoolConnection, purchasingId: number, mode: RepaymentMode, reason?: string | null,
 ): Promise<RepaymentResult> {
   const [pRows] = await conn.query(
     `SELECT p.id, p.plot_id, p.grade_id, p.date, p.quantity, p.receipt_invoice, p.supplier_type, p.scheme
@@ -174,15 +206,30 @@ export async function syncPurchasingRepayment(
     quantity: Number(pu.quantity), excludePurchasingId: purchasingId, scheme: pu.scheme,
   });
   if (!s.applies) {
-    if (mode !== 'auto' && mode.some((m) => m.amount > 0)) {
+    const asks = Array.isArray(mode) ? mode.some((m) => m.amount > 0)
+      : mode !== 'auto' && Object.values(mode.perKg).some((n) => n > 0);
+    if (asks) {
       throw new RepaymentError('A loan repayment can only be deducted from a Pre-Finance farmer delivery');
     }
     return removeExisting();
   }
 
   let lines: { pre_finance_type_id: number; amount: number }[];
+  let perKgCapped = false;
   if (mode === 'auto') {
     lines = s.lines;
+  } else if (!Array.isArray(mode)) {
+    // Rp/kg typed on the delivery: kilos × that, capped by the debt like the rate.
+    for (const id of Object.keys(mode.perKg)) {
+      if (!s.lines.some((l) => l.pre_finance_type_id === Number(id))) throw new RepaymentError(`Unknown pre_finance_type_id ${id}`);
+    }
+    lines = s.lines.map((l) => {
+      const per = mode.perKg[l.pre_finance_type_id] ?? l.per_kg;
+      const computed = round2(Number(pu.quantity) * per);
+      const amount = Math.min(computed, Math.max(0, round2(l.outstanding)));
+      if (amount < computed) perKgCapped = true;
+      return { pre_finance_type_id: l.pre_finance_type_id, amount };
+    });
   } else {
     lines = [];
     for (const m of mode) {
@@ -235,7 +282,7 @@ export async function syncPurchasingRepayment(
       'INSERT INTO pre_finance_installment_details (installment_id, pre_finance_type_id, amount) VALUES (?,?,?)',
       [id, l.pre_finance_type_id, l.amount]);
   }
-  return { installment_id: id, total, capped: mode === 'auto' && s.capped, no_rate: false, manual };
+  return { installment_id: id, total, capped: (mode === 'auto' && s.capped) || perKgCapped, no_rate: false, manual };
 }
 
 /** The deduction already booked on a delivery, per type. */
