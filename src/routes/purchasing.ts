@@ -32,12 +32,16 @@ const SELECT = `
          c.commodities_name AS commodity__commodities_name,
          g.grade_name AS grade__grade_name,
          w.warehouse_name AS warehouse__warehouse_name,
-         -- The loan repayment deducted from this delivery (pre-finance only), and
-         -- so what actually reached the farmer.
+         -- The loan repayment deducted from this delivery (pre-finance only).
+         -- A Pre-Finance price is the final price (full − deduction per kg), so
+         -- the value is what reached the farmer and value + repayment is the
+         -- harvest at the full price. (net_payment used to subtract the
+         -- repayment from the value too — taking it twice.)
          COALESCE(ri.total_payment, 0) AS repayment_total,
          ri.id AS installment_id,
          COALESCE(ri.is_manual, 0) AS repayment_manual, ri.manual_reason AS repayment_reason,
-         p.total_value - COALESCE(ri.total_payment, 0) AS net_payment
+         p.total_value AS net_payment,
+         p.total_value + COALESCE(ri.total_payment, 0) AS gross_value
   FROM purchasing p
   LEFT JOIN pre_finance_installments ri ON ri.purchasing_id = p.id
   LEFT JOIN plot pl        ON pl.id = p.plot_id
@@ -101,11 +105,12 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
 // GET /api/purchasing/price-hints?commodities_id=&plot_id=|collector_id=&date=
 // A starting Rp/kg for each grade — the form fills it in and the admin adjusts it
 // to what was actually paid. In order:
-//   · Pre-Finance plot with a payback rate that names the full price: that full
-//     price → source 'tarif'. The row keeps the full price (AML books 2.850, not
-//     the 1.200 left after the deduction); the loan deduction is booked apart and
-//     net_payment = total − deduction — subtracting it from the price as well
-//     would take it twice;
+//   · Pre-Finance plot with a payback rate that names the full price: the final
+//     price that rate gives (full − saprodi − labour per kg) → source 'tarif'.
+//     A Pre-Finance row keeps the final price, as the AML ledger does (GE007002
+//     grade A: 3.300 + 1.500 deducted = 4.800 full); `full_price` and
+//     `deduction_per_kg` come along so the form can re-derive it when the
+//     deduction per kg is typed;
 //   · else the last price paid for that grade of that commodity under the same
 //     scheme in the same PT, the same supplier first → 'terakhir'.
 router.get('/price-hints', authenticate, async (req: Request, res: Response) => {
@@ -142,7 +147,7 @@ router.get('/price-hints', authenticate, async (req: Request, res: Response) => 
         const rate = await findPaybackRate(pool, plotId, g.id, date);
         if (rate?.full_price != null) {
           const perKg = Number(rate.saprodi_per_kg) + Number(rate.labor_per_kg);
-          hint = { price: Number(rate.full_price), source: 'tarif', date: rate.effective_date,
+          hint = { price: Number(rate.full_price) - perKg, source: 'tarif', date: rate.effective_date,
                    full_price: Number(rate.full_price), deduction_per_kg: perKg };
         }
       }
