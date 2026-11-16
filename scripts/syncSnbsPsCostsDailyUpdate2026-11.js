@@ -43,6 +43,10 @@ const PLOT = {
   SJ0011: 'NC', SJ0051: 'SU', NONSJ0275: 'SUM', SJ0015: 'SJ0015%Pisang', SJ0052: 'SUW 2', SJ0053: 'SUW 3',
   SJ0054: 'SUY', SJ0055: 'ZN',
 };
+// The 10 ha expansion (Oct 2026 on) is named by its code in the system
+// (importSnbsExpansionStock2026-11.js); used once those plots exist.
+for (let n = 67; n <= 77; n++) PLOT[`SJ00${n}`] = `SJ00${n}`;
+const OPTIONAL = (land) => /^SJ00(6[7-9]|7\d)$/.test(land);
 
 const cv = (v) => (v && typeof v === 'object' && !(v instanceof Date) ? (v.result ?? v.text ?? (v.richText ? v.richText.map((t) => t.text).join('') : null)) : v);
 const num = (v) => { const x = Number(cv(v)); return isFinite(x) ? x : 0; };
@@ -90,6 +94,7 @@ async function readDailyUpdate() {
     for (const [land, name] of Object.entries(PLOT)) {
       const [p] = await q(`SELECT pl.id, pl.plot_name, pl.farmer_id, pl.scheme FROM plot pl JOIN farmers f ON f.id = pl.farmer_id
         JOIN kth k ON k.id = f.kth_id WHERE k.entities_id = 1 AND pl.plot_name LIKE ?`, [name]);
+      if (!p && OPTIONAL(land)) continue;
       if (!p) throw new Error(`plot ${name} (${land}) tidak ada`);
       if (p.scheme !== 'ProfitSharing') throw new Error(`plot ${p.plot_name} bukan Profit Sharing`);
       plots[land] = p;
