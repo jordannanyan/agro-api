@@ -362,6 +362,15 @@ async function readLedger(file) {
         await conn.query(`UPDATE processing SET ${keys.map((k) => `\`${k}\` = ?`).join(', ')}, updated_at = ? WHERE id = ?`,
           [...keys.map((k) => u.pch[k]), now, u.procId]);
       }
+      // A sale entered from its invoice (grade lines, selling_items) is worth its
+      // invoice — the ledger's single blended price must not overwrite it.
+      if (u.sellId && ('price_per_unit' in u.sch || 'accepted_volume' in u.sch)) {
+        const [[inv]] = await conn.query('SELECT invoice_total FROM selling WHERE id = ?', [u.sellId]);
+        if (inv && inv.invoice_total != null) {
+          delete u.sch.price_per_unit; delete u.sch.accepted_volume;
+          log(`   · penjualan #${u.sellId} sudah diisi per invoice — harga & volume tidak ditimpa buku besar`);
+        }
+      }
       const sk = Object.keys(u.sch);
       if (sk.length) {
         await conn.query(`UPDATE selling SET ${sk.map((k) => `\`${k}\` = ?`).join(', ')}, updated_at = ? WHERE id = ?`,

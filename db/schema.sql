@@ -459,12 +459,20 @@ CREATE TABLE `selling` (
   `processing_id`    INT NOT NULL,
   `offtaker_id`      INT NULL,
   `warehouse_id`     INT NULL,
+  -- The invoice header (see selling_items for its lines).
+  `invoice_number`   VARCHAR(100) NULL,
+  `do_number`        VARCHAR(100) NULL,
+  `vehicle_number`   VARCHAR(30)  NULL,
   `date`             DATE NOT NULL,
   `delivered_volume` DECIMAL(15,3) NOT NULL DEFAULT 0,
   `accepted_volume`  DECIMAL(15,3) NOT NULL DEFAULT 0,
   `rejected_volume`  DECIMAL(15,3) GENERATED ALWAYS AS (`delivered_volume` - `accepted_volume`) STORED,
+  -- With invoice lines: the blended price of the fruit (display only).
   `price_per_unit`   DECIMAL(15,2) NOT NULL DEFAULT 0,
-  `total_revenue`    DECIMAL(18,2) GENERATED ALWAYS AS (`accepted_volume` * `price_per_unit`) STORED,
+  -- The invoice's grand total (grade lines + fee lines), kept by the API from
+  -- selling_items. NULL = a sale entered with one price (all older sales).
+  `invoice_total`    DECIMAL(18,2) NULL,
+  `total_revenue`    DECIMAL(18,2) GENERATED ALWAYS AS (COALESCE(`invoice_total`, `accepted_volume` * `price_per_unit`)) STORED,
   -- Overrides the selling PT's default farmer share for this one sale. NULL =
   -- use `entities.profit_share_farmer_pct`.
   `profit_share_farmer_pct` DECIMAL(5,2) NULL,
@@ -473,6 +481,26 @@ CREATE TABLE `selling` (
   CONSTRAINT `fk_selling_processing` FOREIGN KEY (`processing_id`) REFERENCES `processing`(`id`) ON DELETE CASCADE,
   CONSTRAINT `fk_selling_offtaker`   FOREIGN KEY (`offtaker_id`)   REFERENCES `offtaker`(`id`) ON DELETE SET NULL,
   CONSTRAINT `fk_selling_warehouse`  FOREIGN KEY (`warehouse_id`)  REFERENCES `warehouse`(`id`) ON DELETE SET NULL
+) ENGINE=InnoDB;
+
+-- The lines of a sale's invoice. `product` = one grade of the fruit (its kilos
+-- add up to the accepted volume); `fee` = a charge per kilo on top of the fruit,
+-- e.g. Cleaning and Packing. Their sum is selling.invoice_total.
+CREATE TABLE `selling_items` (
+  `id`             INT AUTO_INCREMENT PRIMARY KEY,
+  `selling_id`     INT NOT NULL,
+  `line_type`      ENUM('product','fee') NOT NULL DEFAULT 'product',
+  `grade_id`       INT NULL,
+  `description`    VARCHAR(255) NULL,
+  `quantity`       DECIMAL(15,3) NOT NULL DEFAULT 0,
+  `price_per_unit` DECIMAL(15,2) NOT NULL DEFAULT 0,
+  `amount`         DECIMAL(18,2) GENERATED ALWAYS AS (`quantity` * `price_per_unit`) STORED,
+  `sort_order`     INT NOT NULL DEFAULT 0,
+  `created_at`     DATETIME NULL,
+  `updated_at`     DATETIME NULL,
+  KEY `idx_sitem_selling` (`selling_id`),
+  CONSTRAINT `fk_sitem_selling` FOREIGN KEY (`selling_id`) REFERENCES `selling`(`id`) ON DELETE CASCADE,
+  CONSTRAINT `fk_sitem_grade`   FOREIGN KEY (`grade_id`)   REFERENCES `grade`(`id`) ON DELETE SET NULL
 ) ENGINE=InnoDB;
 
 -- Costs that belong to one sale — freight, sorting, loading. They are document

@@ -7,7 +7,7 @@ import { entityScope } from '../utils/entityScope';
 import { ENTITY_COL, purchasingScope } from '../utils/farmScope';
 import { respondList } from '../utils/pagination';
 import {
-  RepaymentError, parseRepaymentBody, syncPurchasingRepayment, loadPurchasingRepayment, RepaymentResult,
+  RepaymentError, parseRepaymentBody, syncPurchasingRepayment, loadPurchasingRepayment, RepaymentResult, findPaybackRate,
 } from '../utils/repayment';
 
 export const router = Router();
@@ -98,6 +98,61 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
     + 'COALESCE(SUM(repayment_total),0) AS repayment_total');
 });
 
+// GET /api/purchasing/price-hints?commodities_id=&plot_id=|collector_id=&date=
+// A starting Rp/kg for each grade — the form fills it in and the admin adjusts it
+// to what was actually paid. In order:
+//   · Pre-Finance plot with a payback rate that names the full price: the final
+//     price that rate gives (full − saprodi − labour per kg) → source 'tarif';
+//   · else the last price paid for that grade of that commodity under the same
+//     scheme in the same PT, the same supplier first → 'terakhir'.
+router.get('/price-hints', authenticate, async (req: Request, res: Response) => {
+  try {
+    const commodity = Number(req.query.commodities_id);
+    if (!commodity) return res.status(422).json({ message: 'commodities_id is required' });
+    const plotId = req.query.plot_id ? Number(req.query.plot_id) : null;
+    const collectorId = req.query.collector_id ? Number(req.query.collector_id) : null;
+    const date = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.date || '')) ? String(req.query.date) : new Date().toISOString().slice(0, 10);
+    const scheme = plotId ? await schemeForPlot(plotId) : 'BeliPutus';
+    const [entRows] = await pool.query(plotId
+      ? 'SELECT k.entities_id FROM plot p JOIN farmers f ON f.id = p.farmer_id JOIN kth k ON k.id = f.kth_id WHERE p.id = ?'
+      : 'SELECT k.entities_id FROM collectors c JOIN kth k ON k.id = c.kth_id WHERE c.id = ?', [plotId ?? collectorId ?? 0]);
+    const entity = (entRows as any[])[0]?.entities_id ?? null;
+    const [grades] = await pool.query('SELECT id, grade_name FROM grade ORDER BY id');
+
+    const [last] = await pool.query(
+      `SELECT x.grade_id, x.price_per_unit, x.date, x.same_supplier FROM (
+         SELECT p.grade_id, p.price_per_unit, p.date,
+                (p.plot_id <=> ? AND p.collector_id <=> ?) AS same_supplier,
+                ROW_NUMBER() OVER (PARTITION BY p.grade_id
+                  ORDER BY (p.plot_id <=> ? AND p.collector_id <=> ?) DESC, p.date DESC, p.id DESC) AS rn
+         FROM purchasing p ${purchasingScope('p')}
+         WHERE p.commodities_id = ? AND p.scheme = ? AND p.price_per_unit > 0 AND p.date <= ?
+           ${entity != null ? `AND ${ENTITY_COL} = ?` : ''}
+       ) x WHERE x.rn = 1`,
+      [plotId, collectorId, plotId, collectorId, commodity, scheme, date, ...(entity != null ? [entity] : [])]);
+    const lastBy = new Map((last as any[]).map((r) => [r.grade_id ?? 0, r]));
+
+    const out: any[] = [];
+    for (const g of [{ id: null, grade_name: null }, ...(grades as any[])]) {
+      let hint: any = null;
+      if (scheme === 'PreFinance' && plotId) {
+        const rate = await findPaybackRate(pool, plotId, g.id, date);
+        if (rate?.full_price != null) {
+          const perKg = Number(rate.saprodi_per_kg) + Number(rate.labor_per_kg);
+          hint = { price: Number(rate.full_price) - perKg, source: 'tarif', date: rate.effective_date,
+                   full_price: Number(rate.full_price), deduction_per_kg: perKg };
+        }
+      }
+      const l = lastBy.get(g.id ?? 0);
+      if (!hint && l) hint = { price: Number(l.price_per_unit), source: 'terakhir', date: l.date, same_supplier: !!Number(l.same_supplier) };
+      if (hint) out.push({ grade_id: g.id, grade_name: g.grade_name, ...hint });
+    }
+    return res.json({ data: { scheme, hints: out } });
+  } catch (err: any) {
+    return res.status(500).json({ message: 'Server error', error: err.message });
+  }
+});
+
 // GET /api/purchasing/:id
 router.get('/:id', authenticate, async (req: Request, res: Response) => {
   // Scoped here too: filtering only the list leaves the record one guessed id away.
@@ -170,6 +225,28 @@ router.post('/', authenticate, files, async (req: Request, res: Response) => {
 
     const repaymentMode = parseRepaymentBody(b.repayment);
 
+    // One nota, several grades: `lines` = [{grade_id, quantity, price_per_unit}]
+    // books one purchase per grade, each with its own Rp/kg, in one transaction.
+    // Each line's loan deduction is worked out from its own kilos and grade; a
+    // deduction typed by hand only makes sense for a single line.
+    let lines: { grade_id: number | null; quantity: number; price_per_unit: number }[] | null = null;
+    if (b.lines != null && b.lines !== '') {
+      let raw = b.lines;
+      if (typeof raw === 'string') { try { raw = JSON.parse(raw); } catch { return res.status(422).json({ message: 'lines tidak bisa dibaca' }); } }
+      if (!Array.isArray(raw) || !raw.length) return res.status(422).json({ message: 'lines harus berisi minimal satu grade' });
+      lines = raw.map((l: any) => ({
+        grade_id: l?.grade_id != null && l.grade_id !== '' ? Number(l.grade_id) : null,
+        quantity: Number(l?.quantity) || 0,
+        price_per_unit: scheme === 'ProfitSharing' ? 0 : (Number(l?.price_per_unit) || 0),
+      }));
+      if (lines.some((l) => !(l.quantity > 0))) return res.status(422).json({ message: 'Setiap grade harus punya kuantitas' });
+      const gs = lines.map((l) => l.grade_id ?? 0);
+      if (new Set(gs).size !== gs.length) return res.status(422).json({ message: 'Grade yang sama muncul dua kali' });
+      if (lines.length > 1 && Array.isArray(repaymentMode)) {
+        return res.status(422).json({ message: 'Potongan manual hanya bisa untuk satu grade — simpan grade lain terpisah' });
+      }
+    }
+
     await compressImages([f?.invoice_file?.[0]?.path, f?.payment_proof?.[0]?.path]);
 
     const cols: any = {
@@ -193,19 +270,34 @@ router.post('/', authenticate, files, async (req: Request, res: Response) => {
     };
     const keys = Object.keys(cols);
     // The delivery and the loan repayment deducted from it are one event: both
-    // are written, or neither is.
+    // are written, or neither is. With grade lines, every line is.
     await conn.beginTransaction();
-    const [result] = await conn.query(
-      `INSERT INTO purchasing (${keys.map((k) => `\`${k}\``).join(',')}) VALUES (${keys.map(() => '?').join(',')})`,
-      keys.map((k) => cols[k])
-    );
-    const newId = (result as any).insertId;
-    const rep = await syncPurchasingRepayment(conn, newId, repaymentMode, b.repayment_reason);
+    const ids: number[] = [];
+    let rep: RepaymentResult | null = null;
+    for (const line of lines ?? [null]) {
+      const row = line ? { ...cols, grade_id: line.grade_id, quantity: line.quantity, price_per_unit: line.price_per_unit } : cols;
+      const [result] = await conn.query(
+        `INSERT INTO purchasing (${keys.map((k) => `\`${k}\``).join(',')}) VALUES (${keys.map(() => '?').join(',')})`,
+        keys.map((k) => row[k])
+      );
+      const newId = (result as any).insertId;
+      ids.push(newId);
+      const r = await syncPurchasingRepayment(conn, newId, repaymentMode, b.repayment_reason);
+      if (r && (r.no_rate || r.capped)) rep = r;
+    }
     await conn.commit();
-    const [rows] = await pool.query(SELECT + ' WHERE p.id = ? LIMIT 1', [newId]);
-    const data = shape((rows as any[])[0]);
-    data.repayment = await loadPurchasingRepayment(pool, newId);
-    return res.status(201).json({ message: 'Purchasing created', data, repayment_note: repaymentNote(rep) });
+    const out: any[] = [];
+    for (const newId of ids) {
+      const [rows] = await pool.query(SELECT + ' WHERE p.id = ? LIMIT 1', [newId]);
+      const d = shape((rows as any[])[0]);
+      d.repayment = await loadPurchasingRepayment(pool, newId);
+      out.push(d);
+    }
+    // A single delivery answers with the row as before; grade lines with all of them.
+    return res.status(201).json({
+      message: ids.length > 1 ? `${ids.length} pembelian tercatat` : 'Purchasing created',
+      data: lines ? out : out[0], repayment_note: repaymentNote(rep),
+    });
   } catch (err: any) {
     await conn.rollback().catch(() => {});
     if (err instanceof RepaymentError) return res.status(err.status).json({ message: err.message });
