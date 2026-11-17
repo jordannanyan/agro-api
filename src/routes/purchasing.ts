@@ -208,6 +208,29 @@ async function subplotMismatch(plotId: number | null, commodityId: number | null
   return `${s.commodities_name} dari lahan ini dicatat di subplot ${s.plot_name} (${label[s.scheme] ?? s.scheme}), bukan di ${plot.plot_name}.`;
 }
 
+/**
+ * `full_price_per_unit`: the price before the loan deduction (the AML `Full
+ * Purchase Price`, 2.850), for whoever would rather type that than the final
+ * price. The row still keeps the final price — the ledger's `Purchase Price` —
+ * worked out from the deduction actually booked on it (rate, typed, or capped by
+ * the debt): final = full − deduction / kg. Without a deduction, final = full.
+ */
+function optFull(v: any): number | null {
+  if (v === undefined || v === null || v === '') return null;
+  const n = Number(v);
+  if (!isFinite(n) || n < 0) throw new RepaymentError('Harga penuh tidak valid');
+  return n;
+}
+async function applyFullPrice(conn: any, purchasingId: number, full: number, deduction: number) {
+  const [[p]] = await conn.query('SELECT quantity FROM purchasing WHERE id = ?', [purchasingId]);
+  const kg = Number(p?.quantity) || 0;
+  const final = kg > 0 ? Math.round((full - deduction / kg) * 100) / 100 : full;
+  if (final < 0) {
+    throw new RepaymentError(`Potongan ${Math.round(deduction / kg).toLocaleString('id-ID')}/kg melebihi harga penuh ${full.toLocaleString('id-ID')}/kg`);
+  }
+  await conn.query('UPDATE purchasing SET price_per_unit = ? WHERE id = ?', [final, purchasingId]);
+}
+
 // POST /api/purchasing
 router.post('/', authenticate, files, async (req: Request, res: Response) => {
   const conn = await pool.getConnection();
@@ -232,13 +255,14 @@ router.post('/', authenticate, files, async (req: Request, res: Response) => {
       : (b.price_per_unit != null ? Number(b.price_per_unit) : 0);
 
     const repaymentMode = parseRepaymentMode(b);
+    const full = optFull(b.full_price_per_unit);
 
     // One nota, several grades: `lines` = [{grade_id, quantity, price_per_unit}]
     // books one purchase per grade, each with its own Rp/kg, in one transaction.
     // Each line's loan deduction is worked out from its own kilos and grade — from
     // the rate, or from `repayment_per_kg` applied to every line; a deduction
     // typed in Rupiah only makes sense for a single line.
-    let lines: { grade_id: number | null; quantity: number; price_per_unit: number }[] | null = null;
+    let lines: { grade_id: number | null; quantity: number; price_per_unit: number; full: number | null }[] | null = null;
     if (b.lines != null && b.lines !== '') {
       let raw = b.lines;
       if (typeof raw === 'string') { try { raw = JSON.parse(raw); } catch { return res.status(422).json({ message: 'lines tidak bisa dibaca' }); } }
@@ -247,6 +271,7 @@ router.post('/', authenticate, files, async (req: Request, res: Response) => {
         grade_id: l?.grade_id != null && l.grade_id !== '' ? Number(l.grade_id) : null,
         quantity: Number(l?.quantity) || 0,
         price_per_unit: scheme === 'ProfitSharing' ? 0 : (Number(l?.price_per_unit) || 0),
+        full: optFull(l?.full_price_per_unit),
       }));
       if (lines.some((l) => !(l.quantity > 0))) return res.status(422).json({ message: 'Setiap grade harus punya kuantitas' });
       const gs = lines.map((l) => l.grade_id ?? 0);
@@ -293,6 +318,8 @@ router.post('/', authenticate, files, async (req: Request, res: Response) => {
       ids.push(newId);
       const r = await syncPurchasingRepayment(conn, newId, repaymentMode, b.repayment_reason);
       if (r && (r.no_rate || r.capped)) rep = r;
+      const lineFull = line ? line.full : full;
+      if (lineFull != null && scheme !== 'ProfitSharing') await applyFullPrice(conn, newId, lineFull, r.total);
     }
     await conn.commit();
     const out: any[] = [];
@@ -395,6 +422,12 @@ const update = async (req: Request, res: Response) => {
       await conn.query(
         'UPDATE pre_finance_installments SET reference_no = ?, updated_at = NOW() WHERE purchasing_id = ?',
         [updates.receipt_invoice || null, id]);
+    }
+    const full = optFull(b.full_price_per_unit);
+    if (full != null && effectiveScheme !== 'ProfitSharing') {
+      const [[ded]] = await conn.query(
+        'SELECT COALESCE(SUM(total_payment), 0) AS t FROM pre_finance_installments WHERE purchasing_id = ?', [id]) as any;
+      await applyFullPrice(conn, Number(id), full, Number(ded.t));
     }
     await conn.commit();
     const [rows] = await pool.query(SELECT + ' WHERE p.id = ? LIMIT 1', [id]);
